@@ -1,0 +1,6 @@
+# jsonb_toaster_lite extension
+comment = 'TOAST/storage layer for jsonb (skeleton; storage callbacks not yet implemented)'
+default_version = '1.0'
+module_pathname = '$libdir/jsonb_toaster_lite'
+relocatable = true
+requires = 'toastapi'

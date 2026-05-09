@@ -1,0 +1,141 @@
+--
+-- L14 layout-map regression
+--
+-- Pins the physical-locality classification of the 10 fixed L14
+-- paths against the headline payload (i=100, ~386 KB, 199 chunks,
+-- 50 pages).
+--
+-- This is a debug helper.  No runtime path is exercised here —
+-- jbtl_l14_layout_map walks a fully-detoasted body and only uses
+-- jbtl_count_pages_in_chunk_range as a probe-only secondary scan.
+--
+\set ON_ERROR_STOP on
+\pset null '<NULL>'
+CREATE EXTENSION IF NOT EXISTS toastapi;
+NOTICE:  extension "toastapi" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+NOTICE:  extension "jsonb_toaster_lite" already exists, skipping
+SET jsonb_sort_field_values = on;
+SET jsonb_toaster_lite.compress_chunks = off;
+CREATE TABLE l14_lm (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'l14_lm', 'jb') > 0
+       AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+INSERT INTO l14_lm SELECT 100, jsonb_build_object(
+    'key1', 100,
+    'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
+               FROM generate_series(1, pow(10, 1 + 3.0)::int) s),
+    'key3', 100,
+    'key4', (SELECT jsonb_agg(md5((100*9999 + s)::text))
+               FROM generate_series(1, pow(10, 0 + 3.0)::int) s)
+);
+VACUUM ANALYZE l14_lm;
+-- ============================================================
+-- Layout map: 10 fixed paths
+-- ============================================================
+SELECT path, kind, byte_offset, byte_length,
+       chunk_lo, chunk_hi,
+       distinct_pages, parent_metadata_pages,
+       round(fragmentation_ratio::numeric, 2) AS frag_ratio,
+       class
+FROM l14_lm, jbtl_l14_layout_map(jb)
+ORDER BY byte_offset;
+    path    |  kind  | byte_offset | byte_length | chunk_lo | chunk_hi | distinct_pages | parent_metadata_pages | frag_ratio |     class     
+------------+--------+-------------+-------------+----------+----------+----------------+-----------------------+------------+---------------
+ key1       | scalar |          56 |           8 |        0 |        0 |              1 |                     1 |       1.00 | inline
+ key3       | scalar |          64 |           8 |        0 |        0 |              1 |                     1 |       1.00 | inline
+ key4       | array  |          72 |       36004 |        0 |       18 |              5 |                     1 |       1.00 | needs_staged
+ key4[500]  | scalar |       20076 |          32 |       10 |       10 |              1 |                     1 |       1.00 | compact_range
+ key2       | array  |       36076 |      360004 |       18 |      198 |             46 |                     1 |       1.00 | large_extent
+ key2[0]    | scalar |       76080 |          32 |       38 |       38 |              1 |                    10 |       1.00 | needs_staged
+ key2[31]   | scalar |       77072 |          32 |       38 |       38 |              1 |                    10 |       1.00 | needs_staged
+ key2[32]   | scalar |       77104 |          32 |       38 |       38 |              1 |                    10 |       1.00 | needs_staged
+ key2[5000] | scalar |      236080 |          32 |      118 |      118 |              1 |                    10 |       1.00 | needs_staged
+ key2[9999] | scalar |      396048 |          32 |      198 |      198 |              1 |                    10 |       1.00 | needs_staged
+(10 rows)
+
+-- ============================================================
+-- Per-class group counts
+-- ============================================================
+SELECT class, count(*) AS n
+FROM l14_lm, jbtl_l14_layout_map(jb)
+GROUP BY class
+ORDER BY class;
+     class     | n 
+---------------+---
+ compact_range | 1
+ inline        | 2
+ large_extent  | 1
+ needs_staged  | 6
+(4 rows)
+
+-- ============================================================
+-- Acceptance pins
+-- ============================================================
+-- Pin: top-level small scalars are inline.
+SELECT 'pin_inline_top_scalars' AS what,
+       count(*) FILTER (WHERE class = 'inline'
+                        AND path IN ('key1', 'key3'))    = 2 AS pin_two_inline
+FROM l14_lm, jbtl_l14_layout_map(jb);
+          what          | pin_two_inline 
+------------------------+----------------
+ pin_inline_top_scalars | t
+(1 row)
+
+-- Pin: key2 is a large extent (covers most of the document).
+SELECT 'pin_key2_large_extent' AS what,
+       (SELECT class FROM l14_lm, jbtl_l14_layout_map(jb)
+        WHERE path = 'key2') = 'large_extent' AS pin_large_extent;
+         what          | pin_large_extent 
+-----------------------+------------------
+ pin_key2_large_extent | t
+(1 row)
+
+-- Pin: array elements at boundary indices are compact byte ranges
+-- (each 32-byte md5 string fits in 1 chunk and 1 page) but require
+-- multiple metadata pages -> needs_staged.
+SELECT 'pin_array_elements_need_staged' AS what,
+       count(*) FILTER (WHERE class = 'needs_staged'
+                        AND path LIKE 'key2[%]')         = 5 AS pin_five_staged
+FROM l14_lm, jbtl_l14_layout_map(jb);
+              what              | pin_five_staged 
+--------------------------------+-----------------
+ pin_array_elements_need_staged | t
+(1 row)
+
+-- Pin: JB_OFFSET_STRIDE doesn't change the page count —
+-- key2[31] and key2[32] both resolve to one page each
+-- (the offset cache lives entirely in the prefix metadata
+-- which we count separately under parent_metadata_pages).
+SELECT 'pin_offset_stride_uniform' AS what,
+       (SELECT distinct_pages FROM l14_lm, jbtl_l14_layout_map(jb)
+        WHERE path = 'key2[31]') = 1                        AS pin_31,
+       (SELECT distinct_pages FROM l14_lm, jbtl_l14_layout_map(jb)
+        WHERE path = 'key2[32]') = 1                        AS pin_32,
+       (SELECT distinct_pages FROM l14_lm, jbtl_l14_layout_map(jb)
+        WHERE path = 'key2[5000]') = 1                      AS pin_5000;
+           what            | pin_31 | pin_32 | pin_5000 
+---------------------------+--------+--------+----------
+ pin_offset_stride_uniform | t      | t      | t
+(1 row)
+
+-- Pin: parent_metadata_pages for any key2 element is 10
+-- (K1 sort places key2 at the front of the data area; its header +
+-- 10000 JEntries occupy ~80 KB = ~10 pages).  This is the staging
+-- cost — nested array element needs 10 metadata pages + 1 value page.
+SELECT 'pin_array_staging_cost' AS what,
+       array_agg(DISTINCT parent_metadata_pages
+                 ORDER BY parent_metadata_pages) =
+           ARRAY[10]                                         AS pin_uniform_10
+FROM l14_lm, jbtl_l14_layout_map(jb)
+WHERE path LIKE 'key2[%]';
+          what          | pin_uniform_10 
+------------------------+----------------
+ pin_array_staging_cost | t
+(1 row)
+
+DROP TABLE l14_lm;

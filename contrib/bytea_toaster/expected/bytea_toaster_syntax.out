@@ -1,0 +1,26 @@
+CREATE EXTENSION bytea_toaster;
+CREATE TABLE tst_failed (
+	t jsonb TOASTER bytea_toaster
+);
+ERROR:  syntax error at or near "TOASTER"
+LINE 2:  t jsonb TOASTER bytea_toaster
+                 ^
+CREATE TABLE tst1 (
+	t bytea TOASTER bytea_toaster
+);
+ERROR:  syntax error at or near "TOASTER"
+LINE 2:  t bytea TOASTER bytea_toaster
+                 ^
+DROP TABLE tst_failed;
+ERROR:  table "tst_failed" does not exist
+DROP TABLE tst1;
+ERROR:  table "tst1" does not exist
+SELECT pgpro_toast.get_toaster_id('bytea_toaster') AS bytea_toaster_oid
+\gset
+SELECT pgpro_toast.drop_toaster('bytea_toaster') = :bytea_toaster_oid;
+ ?column? 
+----------
+ t
+(1 row)
+
+DROP EXTENSION bytea_toaster;

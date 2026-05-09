@@ -1,0 +1,6 @@
+# toastapi extension
+comment = 'toastapi - Pluggable TOAST API'
+default_version = '1.1'
+module_pathname = '$libdir/toastapi'
+schema = pgpro_toast
+relocatable = false

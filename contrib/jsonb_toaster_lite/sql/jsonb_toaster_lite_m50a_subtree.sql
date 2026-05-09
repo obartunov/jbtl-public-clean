@@ -1,0 +1,164 @@
+--
+-- M5.0a: subtree-aware reader proof.
+--
+--	Format definitions:
+--	  JBTL_POINTER_SUBTREE custom-pointer mode tag (0x70000000)
+--	  JBTL_JENTRY_ISCONTAINER_PTR (0x60000000) JEntry type bit
+--	  JbtlToastedContainerPointer payload (JEntry header copy + on-disk varatt_external)
+--
+--	Reader implementation in jbtl_detoast: assembles the full body by
+--	fetching each child chain referenced by JBTL_JENTRY_ISCONTAINER_PTR
+--	and splicing it into the parent at the corresponding value-data
+--	position; the JEntry's type is rewritten from ISCONTAINER_PTR to
+--	plain ISCONTAINER, length is updated to the assembled child body
+--	size, and the JBTL_JBC_TOBJECT_TOASTED hint bit is cleared on the
+--	root header.
+--
+--	Test fixture jbtl_test_subtree_spill_key():
+--	  one-shot manual spill that takes a regular jsonb body, picks one
+--	  top-level key (must be a container), writes that value's body as
+--	  a separate toast chain in the relation's toast relation, and
+--	  returns a JBTL_POINTER_SUBTREE custom-pointer wrapping the
+--	  rewritten parent body.
+--
+--	Acceptance pins:
+--	  - parent column inline size is small (only key1, key3, and the
+--	    spilled key2's pointer fit in the parent body)
+--	  - reading every top-level key returns the same content as
+--	    a vanilla baseline that didn't go through subtree spill
+--	  - text round-trip equality vs baseline
+--	  - toast chunk count equals the size of the spilled child only
+--	    (the parent body lives inline in the heap row, not in toast)
+--
+
+\set ON_ERROR_STOP on
+
+-- M5.0a fixture restriction: KVMap-bearing objects are not supported.
+SET jsonb_sort_field_values = off;
+SET jsonb_toaster_lite.compress_chunks = off;
+
+CREATE EXTENSION IF NOT EXISTS toastapi;
+CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+
+CREATE TABLE m50a (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'm50a', 'jb')
+       AS toaster_oid \gset
+
+-- Baseline: same row content stored without any toaster (vanilla path).
+CREATE TABLE m50a_baseline (id int PRIMARY KEY, jb jsonb);
+
+-- Common payload: 3-key object, key2 is a 1000-element md5 array.
+WITH payload AS (
+  SELECT jsonb_build_object(
+           'key1', 100, 'key3', 100,
+           'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
+                      FROM generate_series(1, 1000) s)) AS jb)
+INSERT INTO m50a SELECT 1, jb FROM payload;
+
+WITH payload AS (
+  SELECT jsonb_build_object(
+           'key1', 100, 'key3', 100,
+           'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
+                      FROM generate_series(1, 1000) s)) AS jb)
+INSERT INTO m50a_baseline SELECT 1, jb FROM payload;
+
+-- Apply the test fixture: spill key2 to its own toast chain and
+-- replace the column with a JBTL_POINTER_SUBTREE custom-pointer.
+UPDATE m50a SET jb = jbtl_test_subtree_spill_key(
+  'm50a'::regclass, jb, 'key2', :toaster_oid::oid)
+  WHERE id = 1;
+
+VACUUM ANALYZE m50a, m50a_baseline; CHECKPOINT;
+
+-- =====================================================================
+-- Pin 1: column_size after fixture is small
+-- (parent body inline; the spilled key2 lives in a separate toast chain
+--  and the parent body holds only key1, key3, and a 22-byte
+--  JbtlToastedContainerPointer for key2)
+-- Compared to ~36 KB if the whole body were stored inline.
+-- =====================================================================
+SELECT 'pin_column_size_small' AS what,
+       (SELECT pg_column_size(jb) FROM m50a) <= 200 AS pin;
+
+-- =====================================================================
+-- Pin 2-7: every top-level key reads correctly vs baseline
+-- =====================================================================
+SELECT 'pin_key1_eq' AS what,
+       (SELECT jb->>'key1' FROM m50a) =
+       (SELECT jb->>'key1' FROM m50a_baseline) AS pin;
+
+SELECT 'pin_key3_eq' AS what,
+       (SELECT jb->>'key3' FROM m50a) =
+       (SELECT jb->>'key3' FROM m50a_baseline) AS pin;
+
+SELECT 'pin_key2_type' AS what,
+       jsonb_typeof((SELECT jb->'key2' FROM m50a)) = 'array' AS pin;
+
+SELECT 'pin_key2_len' AS what,
+       jsonb_array_length((SELECT jb->'key2' FROM m50a)) =
+       jsonb_array_length((SELECT jb->'key2' FROM m50a_baseline)) AS pin;
+
+SELECT 'pin_key2_first' AS what,
+       (SELECT jb->'key2'->>0 FROM m50a) =
+       (SELECT jb->'key2'->>0 FROM m50a_baseline) AS pin;
+
+SELECT 'pin_key2_last' AS what,
+       (SELECT jb->'key2'->>999 FROM m50a) =
+       (SELECT jb->'key2'->>999 FROM m50a_baseline) AS pin;
+
+-- =====================================================================
+-- Pin 8: full text-equality round-trip
+-- (assembled jsonb is byte-equal to vanilla after textification)
+-- =====================================================================
+SELECT 'pin_full_text_eq' AS what,
+       (SELECT jb::text FROM m50a) =
+       (SELECT jb::text FROM m50a_baseline) AS pin;
+
+-- =====================================================================
+-- Pin 9: full jsonb-equality round-trip
+-- =====================================================================
+SELECT 'pin_full_jsonb_eq' AS what,
+       (SELECT jb FROM m50a) =
+       (SELECT jb FROM m50a_baseline) AS pin;
+
+-- =====================================================================
+-- Pin 10: toast bookkeeping confirms one child chain present
+-- The fixture writes ONE toast value (the spilled key2 array).
+-- =====================================================================
+DO $$
+DECLARE
+  toast_oid oid;
+  toast_name text;
+  vc bigint;
+  q text;
+BEGIN
+  SELECT reltoastrelid INTO toast_oid FROM pg_class WHERE relname='m50a';
+  SELECT relname INTO toast_name FROM pg_class WHERE oid=toast_oid;
+  q := format('SELECT count(distinct chunk_id) FROM pg_toast.%I', toast_name);
+  EXECUTE q INTO vc;
+  RAISE NOTICE 'pin_one_child_chain: %', (vc = 1);
+END $$;
+
+-- =====================================================================
+-- Pin 11: deletion of the row removes the child chain
+-- (M5.0a delete dispatch walks ISCONTAINER_PTR slots and recursively
+--  deletes children unconditionally — refcount-aware delete is M5.0b)
+-- =====================================================================
+DELETE FROM m50a WHERE id = 1;
+VACUUM m50a; CHECKPOINT;
+
+DO $$
+DECLARE
+  toast_oid oid;
+  toast_name text;
+  cc bigint;
+  q text;
+BEGIN
+  SELECT reltoastrelid INTO toast_oid FROM pg_class WHERE relname='m50a';
+  SELECT relname INTO toast_name FROM pg_class WHERE oid=toast_oid;
+  q := format('SELECT count(*) FROM pg_toast.%I', toast_name);
+  EXECUTE q INTO cc;
+  RAISE NOTICE 'pin_child_deleted: %', (cc = 0);
+END $$;
+
+DROP TABLE m50a, m50a_baseline;

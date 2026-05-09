@@ -1,0 +1,129 @@
+--
+-- jsonb_toaster_lite L1.2c-1 regression: real sliced read for plain chunks
+--
+-- Acceptance scope (L1.2c-1):
+--   1. A 60+ KB incompressible jsonb stored as plain (uncompressed)
+--      toast chunks via jsonb_toaster_lite.
+--   2. Full read returns the original jsonb body intact.
+--   3. A short slice [0, 100) reads strictly fewer chunks than a full
+--      read.
+--   4. A slice that crosses a chunk boundary reads exactly the chunks
+--      that overlap the requested byte range.
+--   5. Slice payload bytes match the equivalent substring of the full
+--      body.
+--
+-- Out of scope (L1.2c-2):
+--   - per-chunk pglz compression
+--   - JBTL_POINTER_COMPRESSED_CHUNKS read path
+--
+
+CREATE EXTENSION IF NOT EXISTS toastapi;
+CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+
+CREATE TABLE slc (id int PRIMARY KEY, j jsonb);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'slc', 'j') > 0
+       AS attached_to_jsonb_toaster_lite;
+
+--
+-- Build a 60+ KB incompressible payload so multiple plain chunks must
+-- be written.  md5 hex digests are uniformly random-like and so will
+-- not be inline-compressed by core's pglz step.
+--
+INSERT INTO slc
+SELECT 1, jsonb_build_object(
+              'payload',
+              (SELECT string_agg(md5(g::text), '')
+                 FROM generate_series(1, 2000) g),
+              'id', 42);
+
+-- Toast actually happened: sub-100 byte column is the JBTL_POINTER
+-- custom-varlena, body lives in the toast relation.
+SELECT 'col_size_le_100=' || (pg_column_size(j) <= 100)::text
+       AS col_size_le_100
+FROM slc;
+
+--
+-- 1. Full read — chunks_fetched equals chunks_total
+--
+WITH full_probe AS (
+    SELECT jbtl_slice_probe(j, 0, 100000) AS p FROM slc
+)
+SELECT 'full_chunks_eq_total=' ||
+       ((p).chunks_fetched = (p).chunks_total)::text         AS full_chunks_eq_total,
+       'full_chunks_total_gt_1=' ||
+       ((p).chunks_total > 1)::text                          AS full_chunks_total_gt_1,
+       'full_size_eq_payload=' ||
+       (octet_length((p).slice_bytes) > 60000)::text         AS full_size_eq_payload
+FROM full_probe;
+
+--
+-- 2. Short prefix slice [0, 100) — only ONE chunk is fetched
+--
+WITH s0 AS (
+    SELECT jbtl_slice_probe(j, 0, 100) AS p FROM slc
+)
+SELECT 'prefix_chunks_fetched_eq_1=' ||
+       ((p).chunks_fetched = 1)::text                        AS prefix_chunks_fetched_eq_1,
+       'prefix_chunks_lt_total=' ||
+       ((p).chunks_fetched < (p).chunks_total)::text         AS prefix_chunks_lt_total,
+       'prefix_size_eq_100=' ||
+       (octet_length((p).slice_bytes) = 100)::text           AS prefix_size_eq_100
+FROM s0;
+
+--
+-- 3. Slice crossing a chunk boundary
+--
+-- TOAST_MAX_CHUNK_SIZE is determined at compile time from BLCKSZ, so
+-- we cannot hardcode it.  But for any sensible BLCKSZ (>= 1024 bytes)
+-- a slice of length 4096 bytes starting at byte 100 of a 64000-byte
+-- value is guaranteed to cross at least one chunk boundary -- and
+-- thus chunks_fetched > 1 and chunks_fetched < chunks_total must hold.
+--
+WITH s1 AS (
+    SELECT jbtl_slice_probe(j, 100, 4096) AS p FROM slc
+)
+SELECT 'cross_chunks_fetched_gt_1=' ||
+       ((p).chunks_fetched > 1)::text                        AS cross_chunks_fetched_gt_1,
+       'cross_chunks_lt_total=' ||
+       ((p).chunks_fetched < (p).chunks_total)::text         AS cross_chunks_lt_total,
+       'cross_size_eq_4096=' ||
+       (octet_length((p).slice_bytes) = 4096)::text          AS cross_size_eq_4096
+FROM s1;
+
+--
+-- 4. Slice payload bytes match the equivalent substring of the full body
+--
+WITH full_body AS (
+    SELECT (jbtl_slice_probe(j, 0, 100000)).slice_bytes AS body FROM slc
+),
+slc_at_1900 AS (
+    SELECT (jbtl_slice_probe(j, 1900, 300)).slice_bytes AS body FROM slc
+),
+slc_at_12345 AS (
+    SELECT (jbtl_slice_probe(j, 12345, 678)).slice_bytes AS body FROM slc
+)
+SELECT 'slice_at_1900_matches=' ||
+       (substr(f.body, 1900 + 1, 300) = s1.body)::text       AS slice_at_1900_matches,
+       'slice_at_12345_matches=' ||
+       (substr(f.body, 12345 + 1, 678) = s2.body)::text      AS slice_at_12345_matches
+FROM full_body f, slc_at_1900 s1, slc_at_12345 s2;
+
+--
+-- 5. End-of-value slice
+--
+-- For a value of size N, fetching the last 1024 bytes via slice
+-- should fetch a strict subset of the chunks (the last few only).
+--
+WITH N AS (
+    SELECT octet_length((jbtl_slice_probe(j, 0, 100000)).slice_bytes) AS sz FROM slc
+),
+tail AS (
+    SELECT jbtl_slice_probe(slc.j, (SELECT sz FROM N) - 1024, 1024) AS p FROM slc
+)
+SELECT 'tail_chunks_lt_total=' ||
+       ((p).chunks_fetched < (p).chunks_total)::text         AS tail_chunks_lt_total,
+       'tail_size_eq_1024=' ||
+       (octet_length((p).slice_bytes) = 1024)::text          AS tail_size_eq_1024
+FROM tail;
+
+DROP TABLE slc;

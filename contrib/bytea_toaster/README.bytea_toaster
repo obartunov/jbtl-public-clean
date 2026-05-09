@@ -1,0 +1,21 @@
+Appendable BYTEA Toaster
+
+I. The Pluggable TOAST
+
+On Pluggable TOAST please check contrib/toastapi/README.toastapi
+
+The Appendable BYTEA Toaster is a part of a Pluggable TOAST extension
+pack for PostgreSQL. Appendable BYTEA Toaster is a Toaster for BYTEA
+data type with implemented APPEND opration ('||'). Modified Toaster
+stores tail of the TOASTed BYTEA value inline inside Toast Pointer,
+and uses it in APPEND. The UPDATE and APPEND operations instead of
+default TOAST mechanics actually update stored value, without
+invalidating existing and creating a new one.
+
+Note:
+BYTEA Toaster modifies PostgreSQL core to alter byteacat function
+to introduce new implemetation of APPEND for BYTEA.
+
+II. Installation
+
+BYTEA Toaster requires TOAST API (toastapi extension) to be installed.

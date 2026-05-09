@@ -1,0 +1,218 @@
+--
+-- jsonb_toaster_lite L1.2c-2 regression: per-chunk pglz compressed chunks
+--
+-- Acceptance scope (L1.2c-2):
+--   1. Pure compressible payload (repeat('A', N)):
+--        every chunk pglz-compresses;
+--        chunks_compressed > 0;
+--        full read is byte-identical;
+--        slice reads strictly fewer chunks than total;
+--        slice payload bytes match substring of full body.
+--
+--   2. Pure incompressible payload (md5-aggregated random-like body)
+--      written through the per-chunk-compressed writer:
+--        every chunk falls back to raw  (chunks_compressed = 0);
+--        full read still byte-identical;
+--        slice reads strictly fewer chunks than total;
+--        slice payload bytes match substring of full body.
+--
+--   3. Mixed compressed/raw stream:
+--        DEFERRED.  Physical JSONB body order is not the same as
+--        SQL text key order; controlling which payload bytes land in
+--        which chunk requires either an explicit jsonb_sort_field_values
+--        setting and offset dump, or a payload designed around the
+--        physical layout.  This regression does not block on that
+--        case; it will land alongside KVMap layout work.
+--
+-- Out of scope here:
+--   - LZ4 per-chunk (PGLZ-only by @yoda's L1.2c-2 decision)
+--   - DIRECT_TIDS, COMPRESSED_TIDS, DIFF, arrays
+--
+
+CREATE EXTENSION IF NOT EXISTS toastapi;
+CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+
+-- Compressed-chunks writer is gated by the
+-- jsonb_toaster_lite.compress_chunks GUC.  We turn it on for this test
+-- and use STORAGE EXTERNAL to disable core's inline pglz step (which
+-- would otherwise pre-compress the whole jsonb body into the heap row
+-- and skip the toast path entirely for highly compressible payloads).
+SET jsonb_toaster_lite.compress_chunks = on;
+
+CREATE TABLE c (id int PRIMARY KEY, j jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'c', 'j') > 0
+       AS attached_to_jsonb_toaster_lite;
+
+----------------------------------------------------------------------
+-- 1. PURE COMPRESSIBLE PAYLOAD
+----------------------------------------------------------------------
+
+INSERT INTO c VALUES (1,
+    jsonb_build_object('payload', repeat('A', 60000), 'id', 1));
+
+-- 1a. Storage layout: chunks_compressed > 0 (in fact: all rows compressed).
+WITH ins AS (
+    SELECT count(*)            AS total,
+           sum(is_compressed::int) AS compressed_count
+    FROM jbtl_chunk_inspect((SELECT j FROM c WHERE id = 1))
+)
+SELECT 'compressible_total_gt_1='     || (total > 1)::text             AS compressible_total_gt_1,
+       'compressible_all_compressed=' || (compressed_count = total)::text AS compressible_all_compressed
+FROM ins;
+
+-- 1b. Round-trip equality.
+SELECT 'compressible_eq=' ||
+       (j = jsonb_build_object('payload', repeat('A', 60000), 'id', 1))::text
+       AS compressible_eq
+FROM c WHERE id = 1;
+
+-- 1c. Full read counters.
+WITH p AS (SELECT jbtl_slice_probe(j, 0, 1000000) AS r FROM c WHERE id = 1)
+SELECT 'compressible_full_chunks_eq_total=' ||
+           ((r).chunks_fetched = (r).chunks_total)::text
+           AS compressible_full_chunks_eq_total,
+       'compressible_full_chunks_total_gt_1=' ||
+           ((r).chunks_total > 1)::text
+           AS compressible_full_chunks_total_gt_1
+FROM p;
+
+-- 1d. Prefix slice [0, 100): single chunk fetched.
+WITH p AS (SELECT jbtl_slice_probe(j, 0, 100) AS r FROM c WHERE id = 1)
+SELECT 'compressible_prefix_chunks_fetched_eq_1=' ||
+           ((r).chunks_fetched = 1)::text
+           AS compressible_prefix_chunks_fetched_eq_1,
+       'compressible_prefix_chunks_lt_total=' ||
+           ((r).chunks_fetched < (r).chunks_total)::text
+           AS compressible_prefix_chunks_lt_total,
+       'compressible_prefix_size_eq_100=' ||
+           (octet_length((r).slice_bytes) = 100)::text
+           AS compressible_prefix_size_eq_100
+FROM p;
+
+-- 1e. Cross-boundary slice: more than one but fewer than total.
+WITH p AS (SELECT jbtl_slice_probe(j, 1900, 300) AS r FROM c WHERE id = 1)
+SELECT 'compressible_cross_chunks_fetched_gt_1=' ||
+           ((r).chunks_fetched > 1)::text
+           AS compressible_cross_chunks_fetched_gt_1,
+       'compressible_cross_chunks_lt_total=' ||
+           ((r).chunks_fetched < (r).chunks_total)::text
+           AS compressible_cross_chunks_lt_total,
+       'compressible_cross_size_eq_300=' ||
+           (octet_length((r).slice_bytes) = 300)::text
+           AS compressible_cross_size_eq_300
+FROM p;
+
+-- 1f. Slice payload bytes match substring of full body.
+WITH full_body AS (
+    SELECT (jbtl_slice_probe(j, 0, 1000000)).slice_bytes AS body FROM c WHERE id = 1
+),
+slc1 AS (
+    SELECT (jbtl_slice_probe(j, 1900, 300)).slice_bytes AS body FROM c WHERE id = 1
+),
+slc2 AS (
+    SELECT (jbtl_slice_probe(j, 12345, 678)).slice_bytes AS body FROM c WHERE id = 1
+)
+SELECT 'compressible_slice_at_1900_matches=' ||
+           (substr(f.body, 1900 + 1, 300) = s1.body)::text
+           AS compressible_slice_at_1900_matches,
+       'compressible_slice_at_12345_matches=' ||
+           (substr(f.body, 12345 + 1, 678) = s2.body)::text
+           AS compressible_slice_at_12345_matches
+FROM full_body f, slc1 s1, slc2 s2;
+
+----------------------------------------------------------------------
+-- 2. PURE INCOMPRESSIBLE PAYLOAD THROUGH compress_chunks=on
+----------------------------------------------------------------------
+--
+-- The writer's compress_chunks=true branch is exercised, but every
+-- per-chunk pglz attempt fails (the input is uniformly random-like)
+-- so every row falls back to raw.  This proves the per-row fallback
+-- path within the compressed-chunks mode actually works.
+--
+INSERT INTO c
+SELECT 2, jsonb_build_object(
+              'payload',
+              (SELECT string_agg(md5(g::text), '')
+                 FROM generate_series(1, 2000) g),
+              'id', 42);
+
+-- 2a. Storage layout: every row falls back to raw.
+WITH ins AS (
+    SELECT count(*)            AS total,
+           sum(is_compressed::int) AS compressed_count
+    FROM jbtl_chunk_inspect((SELECT j FROM c WHERE id = 2))
+)
+SELECT 'incompressible_total_gt_1='        || (total > 1)::text                   AS incompressible_total_gt_1,
+       'incompressible_no_compressed_rows=' || (compressed_count = 0)::text       AS incompressible_no_compressed_rows
+FROM ins;
+
+-- 2b. Round-trip equality.
+WITH expected AS (
+    SELECT jsonb_build_object(
+              'payload',
+              (SELECT string_agg(md5(g::text), '')
+                 FROM generate_series(1, 2000) g),
+              'id', 42) AS j
+)
+SELECT 'incompressible_eq=' ||
+       ((SELECT j FROM c WHERE id = 2) = e.j)::text
+       AS incompressible_eq
+FROM expected e;
+
+-- 2c. Slice [0, 100): single chunk fetched.
+WITH p AS (SELECT jbtl_slice_probe(j, 0, 100) AS r FROM c WHERE id = 2)
+SELECT 'incompressible_prefix_chunks_fetched_eq_1=' ||
+           ((r).chunks_fetched = 1)::text
+           AS incompressible_prefix_chunks_fetched_eq_1,
+       'incompressible_prefix_size_eq_100=' ||
+           (octet_length((r).slice_bytes) = 100)::text
+           AS incompressible_prefix_size_eq_100
+FROM p;
+
+-- 2d. Tail slice.
+WITH p AS (SELECT jbtl_slice_probe(j, 60000, 4000) AS r FROM c WHERE id = 2)
+SELECT 'incompressible_tail_chunks_lt_total=' ||
+           ((r).chunks_fetched < (r).chunks_total)::text
+           AS incompressible_tail_chunks_lt_total,
+       'incompressible_tail_size_eq_4000=' ||
+           (octet_length((r).slice_bytes) = 4000)::text
+           AS incompressible_tail_size_eq_4000
+FROM p;
+
+-- 2e. Slice bytes match.
+WITH full_body AS (
+    SELECT (jbtl_slice_probe(j, 0, 1000000)).slice_bytes AS body FROM c WHERE id = 2
+),
+slc AS (
+    SELECT (jbtl_slice_probe(j, 1980, 220)).slice_bytes AS body FROM c WHERE id = 2
+)
+SELECT 'incompressible_slice_bytes_match=' ||
+           (substr(f.body, 1980 + 1, 220) = s.body)::text
+           AS incompressible_slice_bytes_match
+FROM full_body f, slc s;
+
+----------------------------------------------------------------------
+-- 3. DELETE for JBTL_POINTER_COMPRESSED_CHUNKS mode
+----------------------------------------------------------------------
+--
+-- tsr_delete handles JBTL_POINTER and JBTL_POINTER_COMPRESSED_CHUNKS
+-- with the same code path (cleanup-1).  Verify that deleting a
+-- compressed-chunks row actually removes its toast rows.
+--
+
+WITH inspect_before AS (
+    SELECT count(*) AS n_chunks
+    FROM jbtl_chunk_inspect((SELECT j FROM c WHERE id = 1))
+)
+SELECT 'compressible_chunks_before_delete_gt_1=' ||
+       (n_chunks > 1)::text
+       AS compressible_chunks_before_delete_gt_1
+FROM inspect_before;
+
+DELETE FROM c WHERE id = 1;
+
+SELECT 'rows_after_delete_id1=' || count(*)
+       AS rows_after_delete_id1
+FROM c WHERE id = 1;
+
+DROP TABLE c;

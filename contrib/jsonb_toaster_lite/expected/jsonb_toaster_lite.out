@@ -1,0 +1,59 @@
+--
+-- jsonb_toaster_lite L0.2 regression: registration + validate matrix
+--
+-- Acceptance scope (L0.2 + L1.2c-2 update):
+--   1. CREATE EXTENSION toastapi succeeds
+--   2. CREATE EXTENSION jsonb_toaster_lite succeeds
+--   3. set_toaster rejects 'text' columns
+--   4. set_toaster rejects 'json' columns
+--   5. set_toaster accepts 'jsonb' with EXTENDED storage (default)
+--   6. set_toaster accepts 'jsonb' with EXTERNAL storage
+--      (L1.2c-2 extension: per-chunk-compressed mode tests need
+--       EXTERNAL to disable core's inline pglz step)
+--
+CREATE EXTENSION toastapi;
+CREATE EXTENSION jsonb_toaster_lite;
+--
+-- 1. Reject: text column
+--
+CREATE TABLE tst_text (t text);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'tst_text', 't');
+ERROR:  "jsonb_toaster_lite" supports only type "jsonb" with EXTENDED or EXTERNAL storage
+DROP TABLE tst_text;
+--
+-- 2. Reject: json column (not jsonb)
+--
+CREATE TABLE tst_json (j json);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'tst_json', 'j');
+ERROR:  "jsonb_toaster_lite" supports only type "jsonb" with EXTENDED or EXTERNAL storage
+DROP TABLE tst_json;
+--
+-- Save the toaster OID once for boolean checks below.
+--
+SELECT pgpro_toast.get_toaster_id('jsonb_toaster_lite') AS jsonb_toaster_lite_oid
+\gset
+--
+-- 3. Accept: jsonb with EXTENDED storage (the default for jsonb)
+--
+CREATE TABLE tst_jsonb_extended (j jsonb);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'tst_jsonb_extended', 'j')
+       = :jsonb_toaster_lite_oid AS attached_extended;
+ attached_extended 
+-------------------
+ t
+(1 row)
+
+DROP TABLE tst_jsonb_extended;
+--
+-- 4. Accept: jsonb with EXTERNAL storage
+--
+CREATE TABLE tst_jsonb_external (j jsonb);
+ALTER TABLE tst_jsonb_external ALTER j SET STORAGE external;
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'tst_jsonb_external', 'j')
+       = :jsonb_toaster_lite_oid AS attached_external;
+ attached_external 
+-------------------
+ t
+(1 row)
+
+DROP TABLE tst_jsonb_external;

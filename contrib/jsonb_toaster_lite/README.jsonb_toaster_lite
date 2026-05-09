@@ -1,0 +1,39 @@
+jsonb_toaster_lite — TOAST/storage layer for jsonb
+====================================================
+
+Purpose
+-------
+jsonb_toaster_lite is a TOAST/storage layer for the standard
+PostgreSQL jsonb type.  It uses the Pluggable TOAST API (contrib/toastapi)
+to plug in custom physical storage strategies — sliced detoast,
+compressed chunks, partial rewrite — while leaving jsonb's encoder
+and decoder untouched in core.
+
+Source provenance
+-----------------
+TOAST internals (chunk machinery, pointer constructors, sliced
+detoast iterator, diff applier) are ported from
+postgrespro/postgres@jsonb_toaster (contrib/jsonb_toaster) under
+this extension's own jbtl_* / Jbtl* / JBTL_* symbol namespace.
+Original symbol names from the postgrespro branch are referenced
+only in port-trace comments where useful.
+
+GSON discipline
+---------------
+This extension is GSON-free by construction.  No symbols from the
+postgrespro generic-jsonb dispatch family are introduced here.  All
+jsonb construction, traversal, and equality is handled by the
+standard core API (utils/jsonb.h).  K1's KVMap (value-size sorting)
+is a core feature and not duplicated here.
+
+Status
+------
+L0.1 (this commit): handler skeleton.  tsr_validate accepts
+jsonb columns with EXTENDED storage.  All other callbacks raise
+"not yet implemented".  No storage logic.
+
+Future commits will incrementally add (in order):
+  L1.x   pointer types, custom-varlena constructors,
+         chunk writer, chunk reader, sliced detoast
+  L2     minimal storage round-trip
+  L3     compressed chunks + sliced detoast benchmarking

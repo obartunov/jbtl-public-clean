@@ -1,0 +1,90 @@
+--
+-- Non-default schema install smoke test.
+--
+--	Verifies that with the toastapi qualified-name fix, the full
+--	jsonb_toaster_lite lifecycle works when the extension is
+--	installed in a schema other than `public`.
+--
+--	Predicates exercised end-to-end:
+--	  - CREATE EXTENSION ... SCHEMA myext succeeds (pre-condition)
+--	  - pgpro_toast.set_toaster accepts qualified toaster name
+--	    'myext.jsonb_toaster_lite' (this was the failure case before
+--	    the toastapi fix)
+--	  - INSERT path's spill writes refs into myext.jbtl_subtree_refs
+--	    (refs lookup via get_extension_schema, M5.0b pre-commit Fix #2)
+--	  - Read returns equal content vs the same value via vanilla jsonb
+--	  - DELETE removes the edge and the orphan child chain
+--
+
+\set ON_ERROR_STOP on
+
+DROP EXTENSION IF EXISTS jsonb_toaster_lite CASCADE;
+DROP SCHEMA IF EXISTS m50_nondef_test CASCADE;
+
+-- pg_toaster row may persist across extension drop/create cycles
+-- (separate issue from the qualified-name lookup fix).  Clean it
+-- up explicitly so this test starts from a known state.
+DO $$
+BEGIN
+    PERFORM pgpro_toast.drop_toaster('jsonb_toaster_lite');
+EXCEPTION WHEN OTHERS THEN
+    -- toaster may not exist; ignore
+END $$;
+
+CREATE EXTENSION IF NOT EXISTS toastapi;
+CREATE SCHEMA m50_nondef_test;
+CREATE EXTENSION jsonb_toaster_lite SCHEMA m50_nondef_test;
+
+LOAD 'jsonb_toaster_lite';
+SET jsonb_sort_field_values = off;
+SET jsonb_toaster_lite.enable_subtree_storage = on;
+SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
+
+CREATE TABLE m50_nondef_t (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+
+-- Use SCHEMA-QUALIFIED toaster name explicitly — this is the form
+-- that previously raised "cannot find toaster with name ...".
+SELECT 'pin_set_toaster_qualified_ok' AS what,
+       pgpro_toast.set_toaster('m50_nondef_test.jsonb_toaster_lite',
+                               'm50_nondef_t', 'jb') > 0 AS pin;
+
+-- Insert with spill condition (large key2).
+INSERT INTO m50_nondef_t SELECT 1, jsonb_build_object(
+  'key1', 100,
+  'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
+             FROM generate_series(1, 1000) s));
+
+-- Refs catalog lives in the extension's schema (Fix #2).
+SELECT 'pin_one_edge_in_extension_schema' AS what,
+       (SELECT count(*) FROM m50_nondef_test.jbtl_subtree_refs) = 1 AS pin;
+
+-- Read equality vs vanilla jsonb of the same content.
+SELECT 'pin_read_full_equal' AS what,
+       (SELECT jb FROM m50_nondef_t)
+       =
+       (SELECT jsonb_build_object(
+          'key1', 100,
+          'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
+                     FROM generate_series(1, 1000) s)))
+       AS pin;
+
+SELECT 'pin_read_partial_key2_first' AS what,
+       (SELECT jb->'key2'->>0 FROM m50_nondef_t) =
+       md5(((100*1000 + 1)::text)) AS pin;
+
+-- Delete removes edge.
+DELETE FROM m50_nondef_t WHERE id = 1;
+SELECT 'pin_delete_zero_edges' AS what,
+       (SELECT count(*) FROM m50_nondef_test.jbtl_subtree_refs) = 0 AS pin;
+
+-- refs_check is in the extension schema; must be invoked qualified.
+SELECT 'pin_refs_check_clean' AS what,
+       m50_nondef_test.jbtl_subtree_refs_check() = 0 AS pin;
+
+DROP TABLE m50_nondef_t;
+SELECT pgpro_toast.drop_toaster('jsonb_toaster_lite') > 0 AS dropped;
+DROP EXTENSION jsonb_toaster_lite CASCADE;
+DROP SCHEMA m50_nondef_test CASCADE;
+
+-- Restore default-schema state for any subsequent tests in this DB.
+CREATE EXTENSION jsonb_toaster_lite;
