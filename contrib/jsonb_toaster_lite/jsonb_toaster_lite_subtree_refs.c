@@ -1,37 +1,36 @@
 /*-------------------------------------------------------------------------
  *
  * jsonb_toaster_lite_subtree_refs.c
- *	M5.0b-2: edge catalog for SUBTREE storage.
+ *	Edge catalog for SUBTREE storage.
  *
  *	Schema (created by extension SQL):
- *	  jbtl_subtree_refs (
- *	      parent_toastrelid  oid,
- *	      parent_valueid     oid,
- *	      child_toastrelid   oid,
- *	      child_valueid      oid,
- *	      PRIMARY KEY (parent_toastrelid, parent_valueid,
- *	                   child_toastrelid,  child_valueid));
- *	  INDEX (child_toastrelid, child_valueid);
+ *	 jbtl_subtree_refs (
+ *	 parent_toastrelid oid,
+ *	 parent_valueid oid,
+ *	 child_toastrelid oid,
+ *	 child_valueid oid,
+ *	 PRIMARY KEY (parent_toastrelid, parent_valueid,
+ *	 child_toastrelid, child_valueid));
+ *	 INDEX (child_toastrelid, child_valueid);
  *
  *	C API:
- *	  jbtl_subtree_refs_insert        — add (parent, child) edge
- *	  jbtl_subtree_refs_delete_one    — remove one edge; return
- *	                                    remaining refcount for child
- *	  jbtl_subtree_refs_child_orphan  — true iff no edges remain
- *	  jbtl_subtree_refs_parent_id_in_use — used by allocator probe
- *	  jbtl_alloc_subtree_parent_valueid  — Option 1 loop allocator
+ *	 jbtl_subtree_refs_insert — add (parent, child) edge
+ *	 jbtl_subtree_refs_delete_one — remove one edge; return
+ *	 remaining refcount for child
+ *	 jbtl_subtree_refs_child_orphan — true iff no edges remain
+ *	 jbtl_subtree_refs_parent_id_in_use — used by allocator probe
+ *	 jbtl_alloc_subtree_parent_valueid — Option 1 loop allocator
  *
  *	SQL-callable:
- *	  jbtl_subtree_refs_check  — count dead edges (child gone)
- *	  jbtl_subtree_refs_gc     — drop dead edges
+ *	 jbtl_subtree_refs_check — count dead edges (child gone)
+ *	 jbtl_subtree_refs_gc — drop dead edges
  *
- *	Test helpers (M5.0b-2 acceptance pins use these to exercise the
- *	API without going through tsr_toast, which becomes the production
- *	caller in M5.0b-3):
- *	  jbtl_test_alloc_parent_valueid
- *	  jbtl_test_refs_insert
- *	  jbtl_test_refs_delete_one
- *	  jbtl_test_refs_parent_id_in_use
+ *	Test helpers (used by regression tests to exercise the API
+ *	without going through tsr_toast):
+ *	 jbtl_test_alloc_parent_valueid
+ *	 jbtl_test_refs_insert
+ *	 jbtl_test_refs_delete_one
+ *	 jbtl_test_refs_parent_id_in_use
  *
  *-------------------------------------------------------------------------
  */
@@ -75,7 +74,7 @@
  *	installed via `CREATE EXTENSION ... SCHEMA myschema`.
  *
  *	No cache: we hit pg_extension + pg_namespace + pg_class on
- *	every call.  The simple correctness cost-benefit (per @yoda
+ *	every call. The simple correctness cost-benefit (per @yoda
  *	pre-commit directive): correctness beats micro-optimization.
  *	A cache would need CacheRegisterRelcacheCallback to handle
  *	DROP+CREATE EXTENSION cycles in long-running backends; until
@@ -116,7 +115,7 @@ jbtl_refs_resolve_oids(Oid *out_relid, Oid *out_pkidx, Oid *out_childidx)
 
 /*
  * Probe whether (parent_toastrelid, parent_valueid) already has any
- * edge in the refs table.  Uses SnapshotDirty so in-progress edges
+ * edge in the refs table. Uses SnapshotDirty so in-progress edges
  * from concurrent transactions and from earlier statements in the
  * same transaction are visible (per spec invariant I-3 point 4).
  *
@@ -152,8 +151,8 @@ jbtl_subtree_refs_parent_id_in_use(Oid parent_toastrelid,
 
 	/*
 	 * SnapshotDirty makes the probe see committed-and-in-progress
-	 * rows.  See spec I-3 point 4 (POST-COMMIT addendum): the probe
-	 * is BEST-EFFORT.  The PK constraint on jbtl_subtree_refs is
+	 * rows. See spec I-3 point 4 (POST-COMMIT addendum): the probe
+	 * is BEST-EFFORT. The PK constraint on jbtl_subtree_refs is
 	 * the canonical enforcer of parent_valueid uniqueness; a
 	 * concurrent allocator that races past this probe will hit a
 	 * unique-violation in CatalogTupleInsert and abort txn.
@@ -182,24 +181,24 @@ jbtl_subtree_refs_parent_id_in_use(Oid parent_toastrelid,
  *
  *	Race semantics (per @yoda pre-commit clarification):
  *
- *	  This loop is best-effort uniqueness.  Two concurrent backends
- *	  can both see "cand=42 not in use" (SnapshotDirty probe) and
- *	  both proceed to refs_insert with parent_valueid=42.  Whichever
- *	  CatalogTupleInsert commits first wins; the loser hits
- *	  ERRCODE_UNIQUE_VIOLATION on the refs PK and the loser's txn
- *	  aborts.
+ *	 This loop is best-effort uniqueness. Two concurrent backends
+ *	 can both see "cand=42 not in use" (SnapshotDirty probe) and
+ *	 both proceed to refs_insert with parent_valueid=42. Whichever
+ *	 CatalogTupleInsert commits first wins; the loser hits
+ *	 ERRCODE_UNIQUE_VIOLATION on the refs PK and the loser's txn
+ *	 aborts.
  *
- *	  The CANONICAL ENFORCER of parent_valueid uniqueness is the PK
- *	  constraint on jbtl_subtree_refs.  This probe is an early-out
- *	  to avoid wasted work in the common (non-racing) case.
+ *	 The CANONICAL ENFORCER of parent_valueid uniqueness is the PK
+ *	 constraint on jbtl_subtree_refs. This probe is an early-out
+ *	 to avoid wasted work in the common (non-racing) case.
  *
- *	  M5.0b does NOT retry on race.  A user-facing INSERT that loses
- *	  the race observes a unique-violation error and rolls back.
- *	  This is acceptable for M5.0b proof; M5.0c may add advisory
- *	  locking on parent_toastrelid for the spill operation, or
- *	  implement allocator-level retry.
+ *	 does NOT retry on race. A user-facing INSERT that loses
+ *	 the race observes a unique-violation error and rolls back.
+ *	 This is acceptable; we may add advisory
+ *	 locking on parent_toastrelid for the spill operation, or
+ *	 implement allocator-level retry.
  *
- *	Bounded loop: LITE_OID_LOOP_MAX cap.  Termination follows the
+ *	Bounded loop: LITE_OID_LOOP_MAX cap. Termination follows the
  *	standard GetNewOidWithIndex argument: toast OID space is
  *	sparse compared to the number of edges + chunks per relation.
  */
@@ -224,7 +223,7 @@ jbtl_alloc_subtree_parent_valueid(Relation toastrel, Relation toastidx)
 		 * against toastidx.
 		 *
 		 * Clause (b): cand is not already a parent_valueid in
-		 * jbtl_subtree_refs for this parent_toastrelid.  Probe
+		 * jbtl_subtree_refs for this parent_toastrelid. Probe
 		 * with SnapshotDirty.
 		 */
 		if (!jbtl_subtree_refs_parent_id_in_use(toastrelid, cand))
@@ -239,9 +238,9 @@ jbtl_alloc_subtree_parent_valueid(Relation toastrel, Relation toastidx)
 }
 
 /*
- * Insert a (parent, child) edge.  Caller has already allocated
+ * Insert a (parent, child) edge. Caller has already allocated
  * parent_valueid via jbtl_alloc_subtree_parent_valueid for the
- * parent_toastrelid namespace.  Failure (e.g. PK collision) ereports
+ * parent_toastrelid namespace. Failure (e.g. PK collision) ereports
  * — per spec I-3 point 2, edge insert failure aborts the txn.
  */
 void jbtl_subtree_refs_insert(Oid parent_toastrelid,
@@ -276,7 +275,7 @@ jbtl_subtree_refs_insert(Oid parent_toastrelid,
 
 	/*
 	 * CatalogTupleInsert handles index updates and PK-violation
-	 * ereport.  Hard invariant: any failure here aborts txn.
+	 * ereport. Hard invariant: any failure here aborts txn.
 	 */
 	CatalogTupleInsert(rel, tup);
 
@@ -285,11 +284,11 @@ jbtl_subtree_refs_insert(Oid parent_toastrelid,
 }
 
 /*
- * Delete one (parent, child) edge.  Returns remaining refcount for
+ * Delete one (parent, child) edge. Returns remaining refcount for
  * the child (number of OTHER parents still referencing this child).
  * Caller uses the return value to decide whether to physically
  * delete the child toast chain:
- *	  if remaining == 0:  jbtl_toast_delete_datum(child_external)
+ *	 if remaining == 0: jbtl_toast_delete_datum(child_external)
  *
  * If the row to delete is not found, ereport — production code paths
  * MUST have inserted the edge before reaching delete; absence
@@ -356,10 +355,10 @@ jbtl_subtree_refs_delete_one(Oid parent_toastrelid,
 						child_toastrelid, child_valueid)));
 
 	/*
-	 * Count remaining edges to this child.  Use SnapshotSelf so the
+	 * Count remaining edges to this child. Use SnapshotSelf so the
 	 * scan sees the effect of CatalogTupleDelete above (the row is
 	 * tombstoned with xmax = current xid; SnapshotSelf treats own-
-	 * txn writes as visible-and-applied, MVCC does not).  Without
+	 * txn writes as visible-and-applied, MVCC does not). Without
 	 * this, the count includes the just-deleted row and we'd
 	 * incorrectly leak the child chain.
 	 */
@@ -386,7 +385,7 @@ jbtl_subtree_refs_delete_one(Oid parent_toastrelid,
 
 /*
  * Returns true iff no edges remain referencing (child_toastrelid,
- * child_valueid).  Convenience wrapper over the inverse-index
+ * child_valueid). Convenience wrapper over the inverse-index
  * scan.
  */
 bool jbtl_subtree_refs_child_orphan(Oid child_toastrelid,
@@ -430,8 +429,8 @@ jbtl_subtree_refs_child_orphan(Oid child_toastrelid, Oid child_valueid)
 
 /*
  * Returns count of edges whose child chunk_id no longer exists in
- * pg_toast.<child_toastrelid>.  Probes via syscache miss / catalog
- * scan; for the M5.0b proof a simple per-row check suffices since
+ * pg_toast.<child_toastrelid>. Probes via syscache miss / catalog
+ * scan; a simple per-row check suffices since
  * refs cardinality is small in tests.
  */
 PG_FUNCTION_INFO_V1(jbtl_subtree_refs_check);
@@ -468,7 +467,7 @@ jbtl_subtree_refs_check(PG_FUNCTION_ARGS)
 
 		/*
 		 * Open the child's toast relation and probe its primary
-		 * index for chunk_id == child_vid.  Skip if relation gone
+		 * index for chunk_id == child_vid. Skip if relation gone
 		 * (counts as dead edge).
 		 */
 		toastrel = try_table_open(child_relid, AccessShareLock);
@@ -611,9 +610,9 @@ jbtl_subtree_refs_gc(PG_FUNCTION_ARGS)
 }
 
 /* =======================================================================
- *	M5.0b-2 test helpers.  These expose the internal API to SQL so
+ *	 test helpers. These expose the internal API to SQL so
  *	acceptance pins can exercise it without going through tsr_toast
- *	(which doesn't yet emit edges; that's M5.0b-3).
+ *	(which doesn't yet emit edges; that's ).
  * ======================================================================= */
 
 /*

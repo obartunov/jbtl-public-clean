@@ -7,8 +7,6 @@ OBJS = \
 	jsonb_toaster_lite_chain.o \
 	jsonb_toaster_lite_pointers.o \
 	jsonb_toaster_lite_object_field.o \
-	jsonb_toaster_lite_update_probe.o \
-	jsonb_toaster_lite_layout_map.o \
 	jsonb_toaster_lite_subtree_refs.o
 
 EXTENSION = jsonb_toaster_lite
@@ -16,7 +14,7 @@ DATA = jsonb_toaster_lite--1.0.sql
 PGFILEDESC = "jsonb_toaster_lite - TOAST/storage layer for jsonb"
 
 REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/toastapi/toastapi.conf
-REGRESS = jsonb_toaster_lite jsonb_toaster_lite_roundtrip jsonb_toaster_lite_slice_plain jsonb_toaster_lite_slice_compressed jsonb_toaster_lite_object_field jsonb_toaster_lite_l21_update_probe jsonb_toaster_lite_l14_pages jsonb_toaster_lite_l14_layout_map jsonb_toaster_lite_beta_bridge jsonb_toaster_lite_l21b_diff jsonb_toaster_lite_m50a_subtree jsonb_toaster_lite_m50b1_gucs jsonb_toaster_lite_m50b2_refs jsonb_toaster_lite_m50b3_spill jsonb_toaster_lite_m50b4_delete jsonb_toaster_lite_m50b5_lifecycle jsonb_toaster_lite_nondefault_schema
+REGRESS = jsonb_toaster_lite jsonb_toaster_lite_roundtrip jsonb_toaster_lite_slice_plain jsonb_toaster_lite_slice_compressed jsonb_toaster_lite_object_field jsonb_toaster_lite_nondefault_schema
 EXTRA_INSTALL = contrib/toastapi
 
 ifdef USE_PGXS

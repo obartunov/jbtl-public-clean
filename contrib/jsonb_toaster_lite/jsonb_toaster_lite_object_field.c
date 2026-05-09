@@ -1,29 +1,29 @@
 /*-------------------------------------------------------------------------
  *
  * jsonb_toaster_lite_object_field.c
- *	  L1.4: KVMap-aware top-level object field lookup over sliced TOAST.
+ *	 KVMap-aware top-level object field lookup over sliced TOAST.
  *
- *	  Provides a fast path for `j->'key'` and `j->>'key'` that, instead
- *	  of detoasting the whole jsonb, reads only:
- *	    1. a small prefix of the body (container header + 2N JEntries
- *	       + optional KVMap + key area), then
- *	    2. the byte range that the looked-up value occupies.
+ *	 Provides a fast path for `j->'key'` and `j->>'key'` that, instead
+ *	 of detoasting the whole jsonb, reads only:
+ *	 1. a small prefix of the body (container header + 2N JEntries
+ *	 + optional KVMap + key area), then
+ *	 2. the byte range that the looked-up value occupies.
  *
- *	  The lookup itself mirrors core's getKeyJsonValueFromContainer:
- *	  binary search by length-then-lex on key JEntries, then KVMap
- *	  redirection to the physical value index.
+ *	 The lookup itself mirrors core's getKeyJsonValueFromContainer:
+ *	 binary search by length-then-lex on key JEntries, then KVMap
+ *	 redirection to the physical value index.
  *
- *	  Out of L1.4 scope (caller falls back to core's full-detoast +
- *	  jsonb_object_field path):
- *	    - non-object root containers
- *	    - nested-container values (the fast path returns scalars only)
- *	    - JBTL_PLAIN_JSONB inline mode (already cheap; no slice savings)
- *	    - non-CUSTOM varlenas (default toaster, etc.)
+ *	 Out of scope (caller falls back to core's full-detoast +
+ *	 jsonb_object_field path):
+ *	 - non-object root containers
+ *	 - nested-container values (the fast path returns scalars only)
+ *	 - JBTL_PLAIN_JSONB inline mode (already cheap; no slice savings)
+ *	 - non-CUSTOM varlenas (default toaster, etc.)
  *
  * Copyright (c) 2026, Postgres Professional
  *
  * IDENTIFICATION
- *	  contrib/jsonb_toaster_lite/jsonb_toaster_lite_object_field.c
+ *	 contrib/jsonb_toaster_lite/jsonb_toaster_lite_object_field.c
  *
  *-------------------------------------------------------------------------
  */
@@ -32,6 +32,7 @@
 #include "access/detoast.h"
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
+#include "access/toast_hook.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
@@ -45,10 +46,10 @@
 
 
 /*
- * Initial prefix-fetch size for the lookup.  4 KB covers the
+ * Initial prefix-fetch size for the lookup. 4 KB covers the
  * structural part (container header + JEntries + KVMap + key area)
  * for realistic objects (up to a few hundred fields with sub-100B
- * keys).  Picked as the smaller of this constant and the toast
+ * keys). Picked as the smaller of this constant and the toast
  * extsize.
  *
  *	If the structural part doesn't fit, we issue a second slice for
@@ -57,7 +58,7 @@
  *
  *	1024 covers a typical small/medium realistic object's structure
  *	(header + ~30 JEntries + KVMap + ~200 B keys = ~500 B) plus a
- *	100-200 B value.  Larger objects refetch on first miss; the
+ *	100-200 B value. Larger objects refetch on first miss; the
  *	cost of an extra BT-walk is paid only for those.
  */
 #define JBTL_OF_INITIAL_PREFIX_BYTES		1024
@@ -68,7 +69,7 @@
  *
  *	Same ordering as core's static lengthCompareJsonbString:
  *	shorter strings sort before longer ones; equal-length compares
- *	memcmp.  Reimplemented here because the core symbol is static.
+ *	memcmp. Reimplemented here because the core symbol is static.
  */
 static inline int
 jbtl_compare_jsonb_string(const char *a, int alen,
@@ -83,7 +84,7 @@ jbtl_compare_jsonb_string(const char *a, int alen,
 /*
  * jbtl_kvmap_entry
  *
- *	Read a single KVMap entry by logical index.  Mirrors core's
+ *	Read a single KVMap entry by logical index. Mirrors core's
  *	JSONB_KVMAP_ENTRY macro, but takes the raw (kvmap_ptr, entry_size)
  *	pair instead of a JsonbKVMap descriptor — we don't go through
  *	core's static initKVMap.
@@ -104,7 +105,7 @@ jbtl_kvmap_entry(const void *kvmap_ptr, int entry_size, int index)
 /*
  * jbtl_fetch_slice_dispatch
  *
- *	Dispatch a slice fetch to the right reader based on mode.  Both
+ *	Dispatch a slice fetch to the right reader based on mode. Both
  *	readers return a varlena with VARHDRSZ + slice_payload_len bytes;
  *	out_chunks_total / out_chunks_fetched are populated by the reader.
  *	out_pages_touched is opt-in (probe-only): pass NULL to disable
@@ -152,7 +153,7 @@ jbtl_fetch_slice_dispatch(struct varatt_external *toast_pointer,
  *	Sliced top-level object field lookup.
  *
  *	Top-level meaning: the input jsonb's root container is an object,
- *	and we look up a key directly there (no nested paths).  Caller
+ *	and we look up a key directly there (no nested paths). Caller
  *	is responsible for unwrapping our custom-varlena to a
  *	(toast_pointer, mode) pair.
  *
@@ -172,11 +173,11 @@ jbtl_fetch_slice_dispatch(struct varatt_external *toast_pointer,
  *	The fallback flag is the caller's signal to invoke
  *	jsonb_object_field_text or similar on a fully-detoasted value.
  *
- *	out_pages_touched is opt-in (probe-only).  Pass NULL on
- *	production fast paths.  When non-NULL, after the L1.4 read
+ *	out_pages_touched is opt-in (probe-only). Pass NULL on
+ *	production fast paths. When non-NULL, after the read
  *	completes the function does one additional cheap btree scan
  *	over the chunk range it actually touched and writes the
- *	count of distinct toast pages.  See jbtl_count_pages_in_chunk_range.
+ *	count of distinct toast pages. See jbtl_count_pages_in_chunk_range.
  */
 JsonbValue *
 jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
@@ -197,9 +198,9 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	int32		chunks_fetched_total = 0;
 	/*
 	 * For pages we union across all chunks our prefix/value fetches
-	 * touched.  Tracked as a chunk-index range [pages_lo, pages_hi]
+	 * touched. Tracked as a chunk-index range [pages_lo, pages_hi]
 	 * so we can do one secondary metric scan at the end instead of
-	 * three.  Initialised to "no chunks touched yet."
+	 * three. Initialised to "no chunks touched yet."
 	 */
 	int32		pages_lo = INT32_MAX;
 	int32		pages_hi = -1;
@@ -251,7 +252,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	body_len = VARSIZE(prefix) - VARHDRSZ;
 
 	/*
-	 * Step 2: parse the container header.  4 bytes minimum.  If we
+	 * Step 2: parse the container header. 4 bytes minimum. If we
 	 * don't even have that, give up and fall back.
 	 */
 	if (body_len < (int) sizeof(uint32))
@@ -283,13 +284,13 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	 * KVMap is INTALIGN'd in the on-disk layout (writer pads with
 	 * zeros to ALIGNOF_INT after the raw kvmap_entry_size * N bytes).
 	 * core's initKVMap returns INTALIGN(N * entry_size) past the
-	 * JEntries.  We must do the same when computing where the data
+	 * JEntries. We must do the same when computing where the data
 	 * area starts.
 	 */
 	min_prefix = (int) sizeof(uint32) + 8 * N + INTALIGN(N * kvmap_entry_size);
 
 	/*
-	 * Step 3: ensure prefix covers JEntries + KVMap.  Refetch if not.
+	 * Step 3: ensure prefix covers JEntries + KVMap. Refetch if not.
 	 */
 	if (body_len < min_prefix)
 	{
@@ -333,7 +334,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 
 	/*
 	 * Step 4: ensure prefix covers the key area (sum of key lengths
-	 * starting at the data area).  We can compute this from JEntries.
+	 * starting at the data area). We can compute this from JEntries.
 	 */
 	key_area_end = min_prefix;
 	for (i = 0; i < N; i++)
@@ -422,7 +423,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	if (out_value_byte_length)
 		*out_value_byte_length = value_len;
 
-	/* Step 7: bail on nested values; out of L1.4 scope. */
+	/* Step 7: bail on nested values; out of  scope. */
 	if (JBE_ISCONTAINER(value_jentry))
 	{
 		*out_fallback = true;
@@ -433,15 +434,15 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	 * Step 7b: bail when the value occupies more than ~half the body.
 	 * In that case fetching only the value would still touch most
 	 * chunks; doing it AFTER a structural prefix fetch costs more
-	 * total chunk reads than a single full detoast would.  Pure
-	 * heuristic; tunable.  Reading the whole body via the existing
+	 * total chunk reads than a single full detoast would. Pure
+	 * heuristic; tunable. Reading the whole body via the existing
 	 * full path then doing the lookup in memory is what the caller
 	 * does on fallback, and that's strictly cheaper here.
 	 *
 	 *	The 50 % threshold is conservative — even a 49 %-of-body
 	 *	value would force the value-fetch to overlap the prefix
 	 *	fetch in chunk space, where each overlap pays a duplicate
-	 *	BT-walk row.  If profiling later argues for a tighter
+	 *	BT-walk row. If profiling later argues for a tighter
 	 *	bound (say 70 %), this is the one knob to turn.
 	 */
 	if ((int64) value_len * 2 > (int64) attrsize)
@@ -454,10 +455,10 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	 *
 	 *	Numerics and nested-container values are INTALIGN'd in the data
 	 *	area: the writer pads before them so the actual payload starts
-	 *	at INTALIGN(unpadded_offset).  The pad bytes are NOT counted
-	 *	in JEntry length.  So for any value type we may need to fetch
+	 *	at INTALIGN(unpadded_offset). The pad bytes are NOT counted
+	 *	in JEntry length. So for any value type we may need to fetch
 	 *	an extra `pad` bytes at the front; in the result construction
-	 *	we skip those pad bytes for types that need them.  Strings and
+	 *	we skip those pad bytes for types that need them. Strings and
 	 *	bool/null have pad=0 because no preceding alignment is added
 	 *	for them.
 	 */
@@ -507,8 +508,8 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 		else if (JBE_ISSTRING(value_jentry))
 		{
 			/*
-			 * Strings get no alignment padding; pad is 0 here.  The
-			 * JsonbValue points directly at our fetched bytes.  Caller
+			 * Strings get no alignment padding; pad is 0 here. The
+			 * JsonbValue points directly at our fetched bytes. Caller
 			 * is responsible for materializing into stable memory before
 			 * the prefix/value buffer goes out of scope.
 			 */
@@ -520,7 +521,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 		{
 			/*
 			 * Numerics are INTALIGN'd; skip pad bytes at the front of
-			 * the fetched value buffer.  pad was computed as
+			 * the fetched value buffer. pad was computed as
 			 * INTALIGN(value_offset_in_data) - value_offset_in_data,
 			 * so value_bytes + pad lands exactly on the Numeric struct.
 			 */
@@ -583,11 +584,11 @@ out:
  * jbtl_unwrap_to_toast_pointer
  *
  *	Given a possibly-CUSTOM raw varlena, decide whether we can take
- *	the fast path.  On success, fills *out_mode and *out_ext and
- *	returns true.  On any reason to fall back, returns false; out
+ *	the fast path. On success, fills *out_mode and *out_ext and
+ *	returns true. On any reason to fall back, returns false; out
  *	parameters are not modified.
  *
- *	Exported (non-static) because L2.1's update probe in
+ *	Exported (non-static) because 's update probe in
  *	jsonb_toaster_lite_update_probe.c reuses the same locator step.
  */
 bool
@@ -624,7 +625,7 @@ jbtl_unwrap_to_toast_pointer(struct varlena *raw,
  *	fully-detoasted Jsonb, tolerating a NULL return.
  *	DirectFunctionCall2 cannot be used here because it elog()s on NULL
  *	return, but core returns SQL NULL for missing keys (->) and for
- *	JSON-null / non-scalar values (->>).  We build a local
+ *	JSON-null / non-scalar values (->>). We build a local
  *	FunctionCallInfo, call directly, and propagate the isnull flag.
  */
 static Datum
@@ -654,7 +655,7 @@ jbtl_call_core_object_field(PGFunction core_fn, Jsonb *jb, Datum key_datum,
  *
  *	Equivalent to `jb->key` but with KVMap-aware sliced TOAST fetch
  *	when jb is stored under jsonb_toaster_lite and its root is an
- *	object with scalar value at `key`.  Falls back to core's
+ *	object with scalar value at `key`. Falls back to core's
  *	jsonb_object_field for all other cases (nested values, non-object
  *	roots, default-toaster jsonb, inline jsonb_toaster_lite values).
  */
@@ -715,7 +716,7 @@ jbtl_object_field(PG_FUNCTION_ARGS)
  * jbtl_object_field_text
  *	SQL: jbtl_object_field_text(jb jsonb, key text) RETURNS text
  *
- *	Equivalent to `jb->>key`.  For scalar values via the fast path,
+ *	Equivalent to `jb->>key`. For scalar values via the fast path,
  *	formats them to text directly without round-tripping through
  *	JsonbValueToJsonb.
  */
@@ -801,12 +802,12 @@ jbtl_object_field_text(PG_FUNCTION_ARGS)
 /*
  * jbtl_object_field_probe
  *	SQL: jbtl_object_field_probe(jb jsonb, key text)
- *	     RETURNS (chunks_total int, chunks_fetched int,
- *	              value_byte_offset int, value_byte_length int,
- *	              fallback bool, value_text text)
+ *	 RETURNS (chunks_total int, chunks_fetched int,
+ *	 value_byte_offset int, value_byte_length int,
+ *	 fallback bool, value_text text)
  *
- *	Test/observability helper exposing every counter the L1.4 fast
- *	path produces.  `value_text` is the value formatted to text (same
+ *	Test/observability helper exposing every counter the fast
+ *	path produces. `value_text` is the value formatted to text (same
  *	as ->>) for non-fallback paths; NULL on fallback or key-not-found.
  *	`fallback` distinguishes "key absent" (fallback=false, value_text
  *	NULL) from "fast path declined" (fallback=true).
@@ -860,11 +861,11 @@ jbtl_object_field_probe(PG_FUNCTION_ARGS)
 
 	/*
 	 * For per-chunk-compressed mode, additionally surface decompression
-	 * counts.  We cannot easily get them from the L1.4 fast path
+	 * counts. We cannot easily get them fast path
 	 * (it dispatches through jbtl_fetch_slice_dispatch which threw
-	 * the per-call decompress count away).  Acceptable for now:
+	 * the per-call decompress count away). Acceptable for now:
 	 * report 0 for plain, leave 0 for compressed too — the page count
-	 * is the headline number.  A future pass can plumb decompression
+	 * is the headline number. A future pass can plumb decompression
 	 * counts through if needed.
 	 */
 	(void) chunks_decompressed;
@@ -917,4 +918,63 @@ jbtl_object_field_probe(PG_FUNCTION_ARGS)
 
 	tuple = heap_form_tuple(tupdesc, values, isnull);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+
+/*
+ * jbtl_jsonb_object_field_hook_fn
+ *
+ *	Core dispatch-hook callback for jsonb_object_field on
+ *	CUSTOM-toasted jsonb. Installed by _PG_init into
+ *	Toastapi_jsonb_object_field_hook. Contract: see toast_hook.h.
+ *
+ *	Returns false to let core fall through to its vanilla body in
+ *	the cases we cannot handle without a full detoast (unwrap
+ *	rejection or fast-path-internal fallback signal). The callback
+ *	must NOT call back into jsonb_object_field or any other core
+ *	fallback wrapper: core handles that itself once we return false.
+ */
+bool
+jbtl_jsonb_object_field_hook_fn(Datum raw_jb, text *key,
+								bool *isnull, Datum *result)
+{
+	struct varlena *raw = (struct varlena *) DatumGetPointer(raw_jb);
+	uint32		mode;
+	struct varatt_external ext_ptr;
+	JsonbValue *jbv;
+	bool		fallback = false;
+
+	/*
+	 * Dispatch contract: core's jsonb_object_field gates this callback
+	 * on VARATT_IS_CUSTOM(raw). Assert it here so any future caller
+	 * that bypasses the dispatch site trips a debug build immediately
+	 * rather than relying on jbtl_unwrap_to_toast_pointer's silent
+	 * reject.
+	 */
+	Assert(VARATT_IS_CUSTOM(raw));
+
+	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr))
+		return false;
+
+	jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode,
+										VARDATA_ANY(key),
+										VARSIZE_ANY_EXHDR(key),
+										NULL, NULL, NULL, NULL,
+										&fallback,
+										NULL);
+
+	if (fallback)
+		return false;
+
+	if (jbv == NULL)
+	{
+		*isnull = true;
+		*result = (Datum) 0;
+	}
+	else
+	{
+		*isnull = false;
+		*result = PointerGetDatum(JsonbValueToJsonb(jbv));
+	}
+	return true;
 }

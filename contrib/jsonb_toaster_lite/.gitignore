@@ -1,8 +1,6 @@
 *.o
 *.so
-*.bc
+*.a
 results/
 log/
 tmp_check/
-regression.diffs
-regression.out

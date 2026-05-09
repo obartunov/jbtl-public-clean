@@ -17,6 +17,7 @@
 #include <limits.h>
 
 #include "access/htup_details.h"
+#include "access/toast_hook.h"
 #include "access/tupdesc.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -864,10 +865,46 @@ json_object_field(PG_FUNCTION_ARGS)
 Datum
 jsonb_object_field(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
-	text	   *key = PG_GETARG_TEXT_PP(1);
+	Jsonb	   *jb;
+	text	   *key;
 	JsonbValue *v;
 	JsonbValue	vbuf;
+
+	/*
+	 * Early-dispatch hook for CUSTOM-toasted jsonb fast path.
+	 * Reached only when (1) a fast-path provider extension has installed
+	 * the hook, and (2) the raw input datum is a CUSTOM external varlena
+	 * (cheap inline VARATT_IS_CUSTOM check, no detoast).  Default
+	 * (non-CUSTOM) jsonb skips both the indirect call and any detoast,
+	 * falling straight through to the existing core body below.
+	 */
+	{
+		Toastapi_jsonb_object_field_hook_type hook =
+			Toastapi_jsonb_object_field_hook;
+
+		if (hook != NULL)
+		{
+			Datum		raw = PG_GETARG_DATUM(0);
+
+			if (VARATT_IS_CUSTOM(DatumGetPointer(raw)))
+			{
+				text	   *hkey = PG_GETARG_TEXT_PP(1);
+				bool		isnull = false;
+				Datum		result;
+
+				if (hook(raw, hkey, &isnull, &result))
+				{
+					if (isnull)
+						PG_RETURN_NULL();
+					return result;
+				}
+				/* hook returned not-handled — fall through to core body */
+			}
+		}
+	}
+
+	jb = PG_GETARG_JSONB_P(0);
+	key = PG_GETARG_TEXT_PP(1);
 
 	if (!JB_ROOT_IS_OBJECT(jb))
 		PG_RETURN_NULL();

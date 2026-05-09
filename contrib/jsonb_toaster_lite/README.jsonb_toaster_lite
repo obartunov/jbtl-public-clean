@@ -4,36 +4,87 @@ jsonb_toaster_lite — TOAST/storage layer for jsonb
 Purpose
 -------
 jsonb_toaster_lite is a TOAST/storage layer for the standard
-PostgreSQL jsonb type.  It uses the Pluggable TOAST API (contrib/toastapi)
-to plug in custom physical storage strategies — sliced detoast,
-compressed chunks, partial rewrite — while leaving jsonb's encoder
-and decoder untouched in core.
+PostgreSQL jsonb type.  It uses the Pluggable TOAST API
+(contrib/toastapi) to plug in custom physical storage strategies —
+out-of-line plain chunks and per-chunk compressed chunks — and a
+slice-aware reader so that public `jsonb -> 'key'` does not have to
+detoast the whole value.
+
+Read-side v1 scope
+------------------
+What is exercised in this snapshot:
+
+  - storage modes: JBTL_PLAIN_JSONB (small inline), JBTL_POINTER
+    (out-of-line plain chunks), JBTL_POINTER_COMPRESSED_CHUNKS
+    (per-chunk pglz compressed);
+  - public `jsonb -> 'key'` reaches the JBTL slice fast path through
+    the Toastapi_jsonb_object_field_hook callback, before
+    PG_GETARG_JSONB_P would otherwise force a full detoast;
+  - slice fetch over POINTER and POINTER_COMPRESSED_CHUNKS modes;
+  - full detoast fallback for everything the fast path declines.
+
+The public read path therefore avoids full-detoast for the keys it
+handles.  Correctness is preserved on the values it declines: the
+hook returns false and core falls through to its existing
+jsonb_object_field body.
+
+Out of scope for this snapshot
+------------------------------
+  - writer policy is unchanged from the prior published patch.
+    tsr_toast continues to emit JBTL_PLAIN_JSONB for small values;
+    no writer policy work is bundled with the read-side cleanup;
+  - update / DIFF / SUBTREE behavior (POINTER_DIFF, POINTER_DIFF_COMP,
+    POINTER_SUBTREE) is deferred.  The C code that supports those
+    modes (jbtl_update, jbtl_try_spill_subtree, the DIFF and SUBTREE
+    pointer encoders, the subtree_refs catalog runtime) is carried in
+    the tree and is reachable through tsr_update / tsr_toast, but is
+    NOT validated by the read-side v1 regression suite, and the
+    remaining open boundaries (DIFF-on-DIFF rebase, fallback
+    amplification, rollback model) are still pending focused work;
+  - update counters (jbtl_update_calls, _reset, _diffs_emitted) and
+    SUBTREE maintenance SQL (jbtl_subtree_refs_check, _gc) and SUBTREE
+    test helpers (jbtl_test_*) are kept in the SQL surface as
+    deferred update-side material;
+  - `->>` (jsonb_object_field_text) does NOT yet have its own dispatch
+    hook.  Reads via `->>` go through the existing core path with full
+    detoast.  Adding a `->>` dispatch hook is a separate piece of work;
+  - no file or extension rename has been performed.  The names
+    jsonb_toaster_lite / jbtl_ / JBTL_ are retained.
 
 Source provenance
 -----------------
 TOAST internals (chunk machinery, pointer constructors, sliced
-detoast iterator, diff applier) are ported from
-postgrespro/postgres@jsonb_toaster (contrib/jsonb_toaster) under
-this extension's own jbtl_* / Jbtl* / JBTL_* symbol namespace.
-Original symbol names from the postgrespro branch are referenced
-only in port-trace comments where useful.
+detoast iterator, diff applier) were originally ported from
+postgrespro/postgres@jsonb_toaster (contrib/jsonb_toaster) under this
+extension's own jbtl_* / Jbtl* / JBTL_* symbol namespace.  Original
+symbol names from the postgrespro branch are referenced only in
+port-trace comments where useful.
 
-GSON discipline
----------------
-This extension is GSON-free by construction.  No symbols from the
-postgrespro generic-jsonb dispatch family are introduced here.  All
-jsonb construction, traversal, and equality is handled by the
-standard core API (utils/jsonb.h).  K1's KVMap (value-size sorting)
-is a core feature and not duplicated here.
+This extension does not introduce any symbol from the postgrespro
+generic-jsonb (jsonx_*) dispatch family.  All jsonb construction,
+traversal, and equality is handled by the standard core API
+(utils/jsonb.h).  The KVMap value-size sorting feature lives in core
+src/backend/utils/adt/jsonb_util.c and is consumed via the public
+utils/jsonb.h API only.
 
-Status
-------
-L0.1 (this commit): handler skeleton.  tsr_validate accepts
-jsonb columns with EXTENDED storage.  All other callbacks raise
-"not yet implemented".  No storage logic.
+Read-side v1 regression
+-----------------------
+make installcheck (after CREATE EXTENSION toastapi; CREATE EXTENSION
+jsonb_toaster_lite) runs:
 
-Future commits will incrementally add (in order):
-  L1.x   pointer types, custom-varlena constructors,
-         chunk writer, chunk reader, sliced detoast
-  L2     minimal storage round-trip
-  L3     compressed chunks + sliced detoast benchmarking
+  jsonb_toaster_lite                 basic install + INSERT/SELECT
+  jsonb_toaster_lite_roundtrip       text round-trip correctness
+  jsonb_toaster_lite_slice_plain     slice fetch on POINTER mode
+                                     with chunks_fetched assertions
+  jsonb_toaster_lite_slice_compressed slice fetch on POINTER_COMPRESSED_CHUNKS
+  jsonb_toaster_lite_object_field    public `->` fast path correctness
+                                     plus chunks_fetched / fallback
+                                     assertions
+  jsonb_toaster_lite_nondefault_schema non-default schema install/usage
+
+The probes jbtl_slice_probe and jbtl_object_field_probe are kept as
+temporary validation SQL (alongside jbtl_object_field,
+jbtl_object_field_text, and jbtl_chunk_inspect) because the
+chunks_fetched / fallback assertions distinguish "fast path was
+taken" from mere correctness.  These will be archived once the
+read-side v1 surface ships and a permanent equivalent is in place.

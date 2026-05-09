@@ -28,6 +28,7 @@
  */
 Toastapi_detoast_hook_type Toastapi_detoast_hook = NULL;
 Toastapi_size_hook_type Toastapi_size_hook = NULL;
+Toastapi_jsonb_object_field_hook_type Toastapi_jsonb_object_field_hook = NULL;
 
 static varlena *toast_fetch_datum(varlena *attr);
 static varlena *toast_fetch_datum_slice(varlena *attr,

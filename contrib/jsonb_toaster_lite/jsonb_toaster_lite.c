@@ -1,30 +1,31 @@
 /*-------------------------------------------------------------------------
  *
  * jsonb_toaster_lite.c
- *	  TOAST/storage layer for jsonb -- handler entry points.
+ *	 TOAST/storage layer for jsonb -- handler entry points.
  *
- * L1.2b: tsr_toast, tsr_detoast, tsr_delete are wired to the chunk
- * machinery (writer in L1.2a, plain-chunk full reader in L1.2b).
- * The remaining optional callbacks (tsr_copy, tsr_update, tsr_vtable)
- * are still stubbed; L1.2c and beyond will fill them in as the
- * compressed-chunks and per-field-toasting paths come online.
+ * The toaster handler dispatches the per-row tsr_* callbacks
+ * (validate, toast, detoast, delete, copy, update) registered with
+ * core via the toastapi extension.
  *
- * Storage strategy in L1.2b:
- *	  -  jsonb body smaller than max_inline_size goes inline as a
- *	     JBTL_PLAIN_JSONB custom-varlena (no chunks written).
- *	  -  larger body is pushed through jbtl_toast_save_datum into
- *	     the toast relation as plain (uncompressed) chunks, and the
- *	     resulting bare TOAST pointer is wrapped in a JBTL_POINTER
- *	     custom-varlena so that core dispatches reads to our
- *	     tsr_detoast.
+ * Storage strategy:
+ *	 - a jsonb body smaller than max_inline_size goes inline as a
+ *	 JBTL_PLAIN_JSONB custom-varlena (no chunks written);
+ *	 - a larger body is pushed through jbtl_toast_save_datum into
+ *	 the toast relation as plain (uncompressed) chunks, and the
+ *	 resulting bare TOAST pointer is wrapped in a JBTL_POINTER
+ *	 custom-varlena so that core dispatches reads to our
+ *	 tsr_detoast.
  *
- * Per-chunk pglz compression remains stubbed in the writer and is
- * not exercised by L1.2b.  Sliced detoast is L1.2c.
+ * Internals (chunk machinery, pointer constructors, sliced detoast
+ * iterator, diff applier) were originally ported from
+ * postgrespro/postgres@jsonb_toaster. All identifiers carry the
+ * jbtl_/Jbtl/JBTL_ namespace; original names appear only in the
+ * per-function port-trace comments.
  *
  * Copyright (c) 2026, Postgres Professional
  *
  * IDENTIFICATION
- *	  contrib/jsonb_toaster_lite/jsonb_toaster_lite.c
+ *	 contrib/jsonb_toaster_lite/jsonb_toaster_lite.c
  *
  *-------------------------------------------------------------------------
  */
@@ -37,6 +38,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/toast_compression.h"
+#include "access/toast_hook.h"
 #include "access/toast_internals.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
@@ -66,35 +68,35 @@ PG_FUNCTION_INFO_V1(jbtl_chunk_inspect);
 /*
  * GUC: when true, jbtl_toast routes large jsonb through the
  * per-chunk-compressed writer (compress_chunks=true) and wraps the
- * result in JBTL_POINTER_COMPRESSED_CHUNKS.  When false, the L1.2b
- * plain-chunks path is used (JBTL_POINTER).  Default is false so that
+ * result in JBTL_POINTER_COMPRESSED_CHUNKS. When false, the
+ * plain-chunks path is used (JBTL_POINTER). Default is false so that
  * pre-existing tests (validate matrix, plain round-trip, plain slice)
  * are not affected; the compressed-chunks regression switches it on.
  */
 static bool jbtl_compress_chunks = false;
 
 /*
- * M5.0b-1: subtree storage GUCs.
+ * subtree storage GUCs.
  *
  *	enable_subtree_storage governs whether tsr_toast spills large
  *	top-level container values into separate child toast chains and
- *	emits JBTL_POINTER_SUBTREE.  Default off — the subtree storage
- *	machinery is gated until M5.0b-3 wires the production writer.
+ *	emits JBTL_POINTER_SUBTREE. Default off — the subtree storage
+ *	machinery is gated until wires the production writer.
  *
  *	subtree_spill_threshold is the minimum container value payload
- *	size, in bytes, that triggers the spill.  Values smaller than
- *	this remain inlined in the parent body.  Default 4 KB per @yoda
- *	M5.0 spec section 17.
+ *	size, in bytes, that triggers the spill. Values smaller than
+ *	this remain inlined in the parent body. Default 4 KB per @yoda
+ *	 spec section 17.
  *
  *	Both variables are user-set: per-session adjustment is supported
  *	(useful for benches that toggle the feature without restart).
- *	Reads of these variables happen exclusively in tsr_toast (M5.0b-3
- *	onwards); M5.0b-1 itself only registers the names.
+ *	Reads of these variables happen exclusively in tsr_toast; itself only registers the names.
  */
 bool jbtl_enable_subtree_storage = false;
 int  jbtl_subtree_spill_threshold = 4096;
 
 void		_PG_init(void);
+void		_PG_fini(void);
 
 void
 _PG_init(void)
@@ -109,10 +111,10 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
-	 * M5.0b-1: subtree storage gating.  See declarations above.
+	 * subtree storage gating. See declarations above.
 	 *
-	 *	Names recorded here in M5.0b-1; first reader is in M5.0b-3
-	 *	tsr_toast.  Until then these are observable via SHOW but do
+	 *	Names recorded here; first reader is
+	 *	tsr_toast. Until then these are observable via SHOW but do
 	 *	not affect any code path.
 	 */
 	DefineCustomBoolVariable("jsonb_toaster_lite.enable_subtree_storage",
@@ -120,7 +122,7 @@ _PG_init(void)
 							 "When on, large top-level container values are "
 							 "stored in separate toast chains and referenced "
 							 "from the parent body via JBTL_POINTER_SUBTREE. "
-							 "Production initial spill lands in M5.0b-3.",
+							 "Production initial spill lands.",
 							 &jbtl_enable_subtree_storage,
 							 false,	/* boot value: OFF */
 							 PGC_USERSET,
@@ -141,6 +143,27 @@ _PG_init(void)
 							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("jsonb_toaster_lite");
+
+	/*
+	 * Install core dispatch hook for jsonb_object_field on
+	 * CUSTOM-toasted jsonb. EXCLUSIVE single-installer: this
+	 * extension claims ownership; a later loader overwrites
+	 * silently. Counterpart unset in _PG_fini (advisory; PostgreSQL
+	 * does not guarantee _PG_fini will be called).
+	 */
+	Toastapi_jsonb_object_field_hook = jbtl_jsonb_object_field_hook_fn;
+}
+
+void
+_PG_fini(void)
+{
+	/*
+	 * Best-effort: only release the hook if we still own it. No
+	 * predecessor restoration in this prototype (single-installer
+	 * contract; chaining is a separate upstream design).
+	 */
+	if (Toastapi_jsonb_object_field_hook == jbtl_jsonb_object_field_hook_fn)
+		Toastapi_jsonb_object_field_hook = NULL;
 }
 
 /* ---- callbacks ---------------------------------------------------------- */
@@ -176,11 +199,11 @@ jbtl_validate(Oid toasteroid, Oid typeoid, char storage, char compression,
 
 
 /*
- * tsr_toast (L1.2c-2 + cleanup-2)
+ * tsr_toast
  *
  *	If the input value is small enough to fit inline as a
  *	JBTL_PLAIN_JSONB custom-varlena, return one and skip toast-table
- *	chunk writes entirely.  Otherwise call jbtl_toast_save_datum (or
+ *	chunk writes entirely. Otherwise call jbtl_toast_save_datum (or
  *	save_datum_ext when compress_chunks is on) to write chunks, and
  *	wrap the resulting bare TOAST pointer in a JBTL_POINTER (or
  *	JBTL_POINTER_COMPRESSED_CHUNKS) custom-varlena so reads come back
@@ -188,54 +211,54 @@ jbtl_validate(Oid toasteroid, Oid typeoid, char storage, char compression,
  *
  *	Two arguments are intentionally not consulted:
  *
- *	  cmid        the column's declared compression method (e.g. PGLZ
- *	              or LZ4).  This contrib uses PGLZ unconditionally for
- *	              per-chunk compression — see the L1.2c-2 mapping
- *	              decision and the writer's pglz_compress call.  LZ4
- *	              per-chunk would require an additional reader branch
- *	              and is deferred.  The argument is acknowledged via
- *	              the (void) below to make the intent explicit and
- *	              quiet any future -Wunused warning.
+ *	 cmid the column's declared compression method (e.g. PGLZ
+ *	 or LZ4). This contrib uses PGLZ unconditionally for
+ *	 per-chunk compression — see the mapping
+ *	 decision and the writer's pglz_compress call. LZ4
+ *	 per-chunk would require an additional reader branch
+ *	 and is deferred. The argument is acknowledged via
+ *	 the (void) below to make the intent explicit and
+ *	 quiet any future -Wunused warning.
  *
- *	  old_value   the column's pre-update toasted value.  L1.2/L1.2c
- *	              do not reuse old toast rows, so every UPDATE
- *	              currently re-toasts the new value in full and
- *	              dereferences the old custom-varlena (core's
- *	              tsr_delete is invoked separately).  Partial rewrite
- *	              and old-value reuse land in L1.3 (DIFF mode); until
- *	              then an UPDATE of a 60 KB jsonb writes 60 KB of new
- *	              toast rows even if only a leaf field changed.  The
- *	              (void) below makes the intent explicit.
+ *	 old_value the column's pre-update toasted value.  We
+ *	 do not reuse old toast rows, so every UPDATE
+ *	 currently re-toasts the new value in full and
+ *	 dereferences the old custom-varlena (core's
+ *	 tsr_delete is invoked separately). Partial rewrite
+ *	 and old-value reuse land later (DIFF mode); until
+ *	 then an UPDATE of a 60 KB jsonb writes 60 KB of new
+ *	 toast rows even if only a leaf field changed. The
+ *	 (void) below makes the intent explicit.
  *
  *	max_inline_size from the caller bounds the size of a returned
- *	custom-varlena that lives inline in the heap tuple.  For an
+ *	custom-varlena that lives inline in the heap tuple. For an
  *	external-chunk pointer the actual on-tuple footprint is
  *	JBTL_CUSTOM_PTR_HEADER_SIZE + TOAST_POINTER_SIZE; for an inline
  *	plain-jsonb wrap it is JBTL_CUSTOM_PTR_HEADER_SIZE + VARHDRSZ +
  *	body_len.
  */
 /*
- * M5.0b-3 helper: try to emit a JBTL_POINTER_SUBTREE custom-varlena
- * for the given input.  Returns Datum 0 (PointerGetDatum(NULL)) when
+ *  helper: try to emit a JBTL_POINTER_SUBTREE custom-varlena
+ * for the given input. Returns Datum 0 (PointerGetDatum(NULL)) when
  * spill does not apply, in which case the caller falls through to
  * the existing chunked-write path.
  *
  *	Triggers:
- *	  - GUC jbtl_enable_subtree_storage on (caller already checked)
- *	  - input body is an object
- *	  - at least one top-level value is a container with payload
- *	    >= jbtl_subtree_spill_threshold
- *	  - rewritten parent custom-varlena fits within max_inline_size
+ *	 - GUC jbtl_enable_subtree_storage on (caller already checked)
+ *	 - input body is an object
+ *	 - at least one top-level value is a container with payload
+ *	 >= jbtl_subtree_spill_threshold
+ *	 - rewritten parent custom-varlena fits within max_inline_size
  *
  *	Per-spilled-child sequence (per spec section 18.I-3):
- *	  1. write child body to its own toast chain
- *	  2. allocate parent_valueid via Option-1 allocator (once per
- *	     spill, NOT per child)
- *	  3. build new parent body with ISCONTAINER_PTR slots
- *	  4. wrap in JBTL_POINTER_SUBTREE v1
- *	  5. insert refs edges (one per child)
- *	  6. ANY edge insert failure → ereport (CatalogTupleInsert in
- *	     jbtl_subtree_refs_insert handles this).  Hard invariant.
+ *	 1. write child body to its own toast chain
+ *	 2. allocate parent_valueid via Option-1 allocator (once per
+ *	 spill, NOT per child)
+ *	 3. build new parent body with ISCONTAINER_PTR slots
+ *	 4. wrap in JBTL_POINTER_SUBTREE v1
+ *	 5. insert refs edges (one per child)
+ *	 6. ANY edge insert failure → ereport (CatalogTupleInsert in
+ *	 jbtl_subtree_refs_insert handles this). Hard invariant.
  */
 static Datum
 jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
@@ -275,7 +298,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 	if (!JsonContainerIsObject(root))
 		return (Datum) 0;
 	if (JsonContainerHasKVMap(root))
-		return (Datum) 0;	/* M5.0b-3 scope */
+		return (Datum) 0;	/* scope */
 
 	N = JsonContainerSize(root);
 	if (N == 0)
@@ -285,7 +308,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 	jentries = root->children;
 	base_addr = (char *) (jentries + n_jentries);
 
-	/* Reject offset-cache for now: M5.0a fixture restriction. */
+	/* Reject offset-cache for now:  fixture restriction. */
 	for (k = val_base + 1; k < n_jentries; k++)
 		if (jentries[k] & JENTRY_HAS_OFF)
 			return (Datum) 0;
@@ -295,7 +318,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 		key_area_size += (int32) getJsonbLength(root, k);
 
 	/*
-	 * Pass 1: identify spill candidates.  A candidate is a value
+	 * Pass 1: identify spill candidates. A candidate is a value
 	 * JEntry that's an ISCONTAINER and whose length >= threshold.
 	 * Allocate temp arrays sized to N (worst case all values spill).
 	 */
@@ -328,7 +351,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 
 	/*
 	 * Compute new body size first to reject if it wouldn't fit
-	 * inline anyway.  Rewriting an ISCONTAINER (length=val_len)
+	 * inline anyway. Rewriting an ISCONTAINER (length=val_len)
 	 * into ISCONTAINER_PTR with payload size = sizeof(JEntry) +
 	 * TOAST_POINTER_SIZE = 22 bytes.
 	 */
@@ -374,7 +397,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 	toastidx = index_open(linitial_oid(idxlist), RowExclusiveLock);
 
 	/*
-	 * Pass 2: write each child as its own toast chain.  Use the
+	 * Pass 2: write each child as its own toast chain. Use the
 	 * lite writer (jbtl_toast_save_datum) so chunks live in the
 	 * same toast relation as everything else.
 	 */
@@ -395,7 +418,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 	}
 
 	/*
-	 * Allocate one synthetic parent_valueid via the M5.0b-2
+	 * Allocate one synthetic parent_valueid via the
 	 * Option-1 allocator.
 	 */
 	parent_valueid = jbtl_alloc_subtree_parent_valueid(toastrel, toastidx);
@@ -476,7 +499,7 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 												new_body, new_body_size);
 
 	/*
-	 * Insert refs edges — one per child.  Failure aborts txn per
+	 * Insert refs edges — one per child. Failure aborts txn per
 	 * spec invariant I-3.2 (CatalogTupleInsert ereports on PK
 	 * collision).
 	 */
@@ -511,19 +534,19 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 	struct varatt_external toast_ptr;
 
 	/*
-	 * Acknowledge intentionally-ignored arguments.  See the function
+	 * Acknowledge intentionally-ignored arguments. See the function
 	 * banner above for rationale.
 	 */
-	(void) cmid;			/* PGLZ-only by design, see L1.2c-2 */
-	(void) old_value;		/* full re-toast on UPDATE; L1.3+ DIFF */
+	(void) cmid;			/* PGLZ-only by design. */
+	(void) old_value;		/* full re-toast on UPDATE; + DIFF */
 	(void) att_storage;		/* validate already restricted to EXTENDED|EXTERNAL */
 
 	/*
 	 * If input is already a JBTL custom-pointer, pass it through
-	 * unchanged.  This happens when tsr_update returned the new value
-	 * as a custom varlena (e.g. the M5.0a SUBTREE fixture path) and
+	 * unchanged. This happens when tsr_update returned the new value
+	 * as a custom varlena (e.g. the SUBTREE fixture path) and
 	 * core still calls tsr_toast on the result during the standard
-	 * heap_update flow.  Without this guard we would re-wrap the
+	 * heap_update flow. Without this guard we would re-wrap the
 	 * custom varlena in another JBTL_POINTER and write its raw bytes
 	 * (including the inner custom header) into a fresh toast chain —
 	 * which produces an extra orphan valueid and corrupts subsequent
@@ -535,14 +558,14 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 
 	/*
 	 * Detoast input fully if it arrives as an EXTERNAL or COMPRESSED
-	 * varlena.  We then have a plain in-memory jsonb body to chunk.
+	 * varlena. We then have a plain in-memory jsonb body to chunk.
 	 */
 	if (VARATT_IS_EXTENDED(attr))
 		attr = detoast_attr(attr);
 
 	/*
 	 * Inline path: the whole body fits in max_inline_size when wrapped
-	 * in a JBTL_PLAIN_JSONB custom-varlena.  We return the wrapped
+	 * in a JBTL_PLAIN_JSONB custom-varlena. We return the wrapped
 	 * value; core stores it inline in the heap tuple.
 	 */
 	{
@@ -561,7 +584,7 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 	}
 
 	/*
-	 * M5.0b-3: subtree spill path.
+	 * subtree spill path.
 	 *
 	 *	When enable_subtree_storage is on, look at the top-level
 	 *	object values and spill any container value larger than the
@@ -569,23 +592,23 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 	 *	a JBTL_JENTRY_ISCONTAINER_PTR + JbtlToastedContainerPointer.
 	 *	Wrap the rewritten parent body in a JBTL_POINTER_SUBTREE
 	 *	custom-varlena with a v1 header carrying the synthetic
-	 *	parent_valueid + parent_toastrelid.  Insert one refs edge per
+	 *	parent_valueid + parent_toastrelid. Insert one refs edge per
 	 *	spilled child.
 	 *
 	 *	Falls through to the existing JBTL_POINTER chunk-write path
 	 *	when:
-	 *	  - GUC is off (default)
-	 *	  - body is not a plain object
-	 *	  - no top-level container value exceeds threshold
-	 *	  - rewritten parent body wouldn't fit in max_inline_size
-	 *	    (rare; we'd lose the parent-locality win and might as
-	 *	    well chunk the whole body)
+	 *	 - GUC is off (default)
+	 *	 - body is not a plain object
+	 *	 - no top-level container value exceeds threshold
+	 *	 - rewritten parent body wouldn't fit in max_inline_size
+	 *	 (rare; we'd lose the parent-locality win and might as
+	 *	 well chunk the whole body)
 	 *
-	 *	Scope limits per @yoda M5.0b-3 directive:
-	 *	  - top-level object only (arrays deferred to M5.0c)
-	 *	  - one-level spill, no recursion
-	 *	  - no update reuse (every UPDATE re-spills from scratch)
-	 *	  - no copy semantics
+	 *	Scope limits per @yoda directive:
+	 *	 - top-level object only (arrays deferred to a future commit)
+	 *	 - one-level spill, no recursion
+	 *	 - no update reuse (every UPDATE re-spills from scratch)
+	 *	 - no copy semantics
 	 */
 	if (jbtl_enable_subtree_storage)
 	{
@@ -597,11 +620,11 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 	}
 
 	/*
-	 * External path: write chunks via the writer.  Compress per-chunk
+	 * External path: write chunks via the writer. Compress per-chunk
 	 * iff jbtl_compress_chunks GUC is set; in that case wrap in
 	 * JBTL_POINTER_COMPRESSED_CHUNKS so reads go through the
-	 * focused compressed-chunks reader.  Otherwise plain chunks +
-	 * JBTL_POINTER (L1.2b path).
+	 * focused compressed-chunks reader. Otherwise plain chunks +
+	 * JBTL_POINTER.
 	 */
 	if (jbtl_compress_chunks)
 	{
@@ -611,14 +634,14 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 		/*
 		 * jbtl_toast_save_datum_ext does the heavy lifting: opens the
 		 * toast relation, picks a valueid, and calls
-		 * jbtl_toast_write_slice with compress_chunks=true.  We pass
+		 * jbtl_toast_write_slice with compress_chunks=true. We pass
 		 * compress_chunks=true explicitly; the writer falls back to
 		 * raw on a per-row basis if pglz cannot beat the threshold.
 		 *
 		 * In the compress_chunks=true branch save_datum_ext returns
 		 * a JBTL_POINTER_COMPRESSED_CHUNKS custom-varlena directly
 		 * (built by jbtl_toast_make_pointer_compressed_chunks), so we
-		 * do NOT wrap again.  See save_datum_ext's tail section.
+		 * do NOT wrap again. See save_datum_ext's tail section.
 		 */
 		raw_value = PointerGetDatum(attr);
 		toasted_datum = jbtl_toast_save_datum_ext(tcxt->rel,
@@ -661,32 +684,32 @@ jbtl_toast(ToasterContext tcxt, Datum value, Datum old_value,
 
 
 /*
- * tsr_detoast (L1.2c-1: full read + real sliced read for plain chunks)
+ * tsr_detoast (full read + real sliced read for plain chunks)
  *
  *	Core invokes us when it sees VARATT_IS_CUSTOM and the toaster ID
- *	matches.  Inspect the JBTL mode tag and dispatch:
+ *	matches. Inspect the JBTL mode tag and dispatch:
  *
- *	  JBTL_PLAIN_JSONB    -> body lives inline in the custom-varlena;
- *	                         build a fresh varlena copy and return.
- *	                         Slice is materialized in memory because
- *	                         the body is fully present anyway.
- *	  JBTL_POINTER        -> the inline tail is a varatt_external; for
- *	                         full read (length < 0 or covers the whole
- *	                         body) call jbtl_toast_fetch_full_plain;
- *	                         for a proper slice call
- *	                         jbtl_toast_fetch_slice_plain, which uses
- *	                         table_relation_fetch_toast_slice with a
- *	                         non-zero sliceoffset, causing
- *	                         heap_fetch_toast_slice to read only the
- *	                         chunks overlapping [offset, offset+length).
+ *	 JBTL_PLAIN_JSONB -> body lives inline in the custom-varlena;
+ *	 build a fresh varlena copy and return.
+ *	 Slice is materialized in memory because
+ *	 the body is fully present anyway.
+ *	 JBTL_POINTER -> the inline tail is a varatt_external; for
+ *	 full read (length < 0 or covers the whole
+ *	 body) call jbtl_toast_fetch_full_plain;
+ *	 for a proper slice call
+ *	 jbtl_toast_fetch_slice_plain, which uses
+ *	 table_relation_fetch_toast_slice with a
+ *	 non-zero sliceoffset, causing
+ *	 heap_fetch_toast_slice to read only the
+ *	 chunks overlapping [offset, offset+length).
  *
- *	L1.2c-1 covers the plain-chunk slice case only.  Per-chunk
+ *	 covers the plain-chunk slice case only. Per-chunk
  *	decompression and the JBTL_POINTER_COMPRESSED_CHUNKS path land in
- *	L1.2c-2 together with the writer-side pglz reimplementation.
+ *	 together with the writer-side pglz reimplementation.
  *
  *	Other JBTL_POINTER_* modes (DIRECT_TIDS, COMPRESSED_CHUNKS, DIFF)
- *	are written by no L1.2b/L1.2c-1 code path and so cannot
- *	legitimately arrive here yet.  We refuse them with a clear error.
+ *	are written by no / code path and so cannot
+ *	legitimately arrive here yet. We refuse them with a clear error.
  */
 static Datum
 jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
@@ -706,7 +729,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 			{
 				/*
 				 * Inline body sits in JBTL_CUSTOM_PTR_GET_DATA(attr) as a
-				 * full varlena (4-byte header + jsonb body).  Slice is
+				 * full varlena (4-byte header + jsonb body). Slice is
 				 * materialized in memory because the body is fully
 				 * present in the row anyway -- there is no I/O to save.
 				 */
@@ -744,7 +767,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 			{
 				/*
 				 * The inline tail is a TOAST_POINTER_SIZE-byte bare
-				 * external pointer.  For full reads delegate to
+				 * external pointer. For full reads delegate to
 				 * jbtl_toast_fetch_full_plain; for slices use
 				 * jbtl_toast_fetch_slice_plain so heap-side fetcher
 				 * reads only chunks overlapping the requested range.
@@ -770,9 +793,9 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				{
 					/*
 					 * Real slice: only chunks overlapping the requested
-					 * byte range will be read from disk.  Returned varlena
+					 * byte range will be read from disk. Returned varlena
 					 * carries exactly the requested slicelength bytes in
-					 * its VARDATA, *not* a jsonb body.  The caller (core's
+					 * its VARDATA, *not* a jsonb body. The caller (core's
 					 * detoast_attr_slice) is responsible for interpreting
 					 * the slice payload appropriately.
 					 */
@@ -786,7 +809,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 		case JBTL_POINTER_COMPRESSED_CHUNKS:
 			{
 				/*
-				 * Per-chunk-compressed path (L1.2c-2).  The inline tail
+				 * Per-chunk-compressed path. The inline tail
 				 * is the bare TOAST pointer; we hand it to the focused
 				 * compressed-chunks reader, which decides between full
 				 * read and slice based on the requested offset/length.
@@ -846,19 +869,19 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 		case JBTL_POINTER_DIFF_COMP:
 			{
 				/*
-				 * DIFF overlay (L2.1b).  The inline tail is:
-				 *   [varatt_external base][JbtlPointerDiff: offset, data[]]
+				 * DIFF overlay. The inline tail is:
+				 *  [varatt_external base][JbtlPointerDiff: offset, data[]]
 				 *
 				 * Apply path: fetch the FULL base body (delegating to
 				 * the plain or compressed-chunks reader depending on
 				 * mode), then memcpy the diff data over the result at
-				 * `offset`.  The buffer is sized at base.va_rawsize
+				 * `offset`. The buffer is sized at base.va_rawsize
 				 * (the DIFF format never extends past base length —
 				 * that invariant is enforced by the writer-side
 				 * same-byte-length gate).
 				 *
 				 * Slicing is handled by re-slicing the assembled body
-				 * after the overlay is applied.  Correctness-first;
+				 * after the overlay is applied. Correctness-first;
 				 * future work can push the slice into the base read.
 				 */
 				struct varatt_external ext_ptr;
@@ -878,7 +901,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				 * Inline-tail layout: varatt_external (TOAST_POINTER_SIZE)
 				 * + JbtlPointerDiff at offset TOAST_POINTER_SIZE.
 				 * Diff data length is implicit:
-				 *   total custom data area − varatt_external − diff hdr.
+				 *  total custom data area − varatt_external − diff hdr.
 				 *
 				 * JBTL_CUSTOM_PTR_GET_DATA_SIZE(attr) returns the size of
 				 * the data area starting at JBTL_CUSTOM_PTR_GET_DATA(attr).
@@ -917,7 +940,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				body_payload = body_size - VARHDRSZ;
 
 				/*
-				 * Apply the overlay.  Bounds: diff->offset is an
+				 * Apply the overlay. Bounds: diff->offset is an
 				 * offset within the body PAYLOAD (not the varlena),
 				 * so the destination is VARDATA(full) + diff_offset.
 				 */
@@ -961,31 +984,31 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 		case JBTL_POINTER_SUBTREE:
 			{
 				/*
-				 * M5.0a subtree-aware reader.
+				 *  subtree-aware reader.
 				 *
 				 *	The custom-varlena's data area holds an inline parent
 				 *	body — a regular jsonb container, except that some
 				 *	JEntries may have type JBTL_JENTRY_ISCONTAINER_PTR
 				 *	indicating that the value-data slot at that offset
 				 *	contains a JbtlToastedContainerPointer rather than a
-				 *	plain inline value.  Each ISCONTAINER_PTR slot points
+				 *	plain inline value. Each ISCONTAINER_PTR slot points
 				 *	to a separate toast chain (the "child").
 				 *
 				 *	Reader strategy:
-				 *	  1. count children, fetch each child body fully
-				 *	  2. allocate output buffer sized for the assembled
-				 *	     body
-				 *	  3. copy parent header (clearing the
-				 *	     JBTL_JBC_TOBJECT_TOASTED hint bit since the
-				 *	     output body has no subtree pointers)
-				 *	  4. rewrite JEntries: every ISCONTAINER_PTR becomes
-				 *	     ISCONTAINER with length = child body payload size
-				 *	  5. copy KVMap (if present), keys, and values —
-				 *	     substituting child bodies at ISCONTAINER_PTR
-				 *	     slot positions
-				 *	  6. apply caller-requested slicing
+				 *	 1. count children, fetch each child body fully
+				 *	 2. allocate output buffer sized for the assembled
+				 *	 body
+				 *	 3. copy parent header (clearing the
+				 *	 JBTL_JBC_TOBJECT_TOASTED hint bit since the
+				 *	 output body has no subtree pointers)
+				 *	 4. rewrite JEntries: every ISCONTAINER_PTR becomes
+				 *	 ISCONTAINER with length = child body payload size
+				 *	 5. copy KVMap (if present), keys, and values —
+				 *	 substituting child bodies at ISCONTAINER_PTR
+				 *	 slot positions
+				 *	 6. apply caller-requested slicing
 				 *
-				 *	Recursion is NOT supported in M5.0a: child bodies are
+				 *	Recursion is NOT supported in child bodies are
 				 *	assumed to be plain jsonb (no nested ISCONTAINER_PTR).
 				 *	A future milestone may extend this when recursive
 				 *	spill is implemented.
@@ -1001,9 +1024,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				int			i;
 
 				/*
-				 * M5.0b-3: version dispatch.  v0 = no header (M5.0a
-				 * fixture legacy, kept for the existing regression
-				 * test).  v1 = JbtlSubtreeHeader prefix.  Anything
+				 * version dispatch. v0 = no header. v1 = JbtlSubtreeHeader prefix. Anything
 				 * else is corruption.
 				 *
 				 * Detection: a v1 header always has version == 1 in
@@ -1016,12 +1037,12 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				 *
 				 * Concretely: JsonContainer header has JB_FOBJECT or
 				 * JB_FARRAY in the high bits and count in the low
-				 * 24 bits.  A header value with low byte == 1 would
+				 * 24 bits. A header value with low byte == 1 would
 				 * mean a 1-entry object/array with no type bits set
 				 * in the low byte — impossible because JB_FOBJECT
 				 * (0x20000000) has its low byte 0 anyway, but
 				 * JB_FARRAY etc. similarly do not collide with
-				 * uint8 == 1 in the LSB.  v0 fixture has been
+				 * uint8 == 1 in the LSB. v0 fixture has been
 				 * verified to never produce payload[0] == 1.
 				 */
 				if (payload_size >= (int32) sizeof(JbtlSubtreeHeader) &&
@@ -1041,7 +1062,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				}
 				else
 				{
-					/* v0 (M5.0a fixture path): payload is the body. */
+					/* v0: payload is the body. */
 					parent_body = payload;
 					parent_size = payload_size;
 				}
@@ -1049,7 +1070,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 
 				/*
 				 * Per-child slot table: parsed from the parent body in
-				 * one pass.  For each value index k that has a child
+				 * one pass. For each value index k that has a child
 				 * pointer, we record the child's varatt_external and
 				 * its assembled body (fetched lazily during pass 2).
 				 */
@@ -1147,8 +1168,8 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 
 							/*
 							 * Locate the JbtlToastedContainerPointer
-							 * payload.  In objects, value data starts
-							 * AFTER the keys area.  Note that
+							 * payload. In objects, value data starts
+							 * AFTER the keys area. Note that
 							 * getJsonbOffset for value index N+k returns
 							 * an offset RELATIVE TO THE DATA AREA (which
 							 * begins with keys for objects), so we add
@@ -1166,7 +1187,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 							/*
 							 * ptr->data[0..TOAST_POINTER_SIZE-1] is a
 							 * full on-disk varlena pointer (2-byte header
-							 * + 18-byte varatt_external).  Use the macro
+							 * + 18-byte varatt_external). Use the macro
 							 * that strips the header and gives us the
 							 * varatt_external proper.
 							 */
@@ -1178,8 +1199,8 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 										 errmsg("jsonb_toaster_lite: SUBTREE child has zero ext size")));
 
 							/*
-							 * Fetch child fully via plain reader.  In
-							 * M5.0a children are always plain (no
+							 * Fetch child fully via plain reader. In
+							 *  children are always plain (no
 							 * compressed-chunks nor nested SUBTREE);
 							 * compressed-base support lands later.
 							 */
@@ -1215,7 +1236,7 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				}
 
 				/*
-				 * Rewrite JEntries.  Walk in JEntry order; for each
+				 * Rewrite JEntries. Walk in JEntry order; for each
 				 * value JEntry (index N..2N-1 for object) that's an
 				 * ISCONTAINER_PTR, replace with ISCONTAINER + new length.
 				 */
@@ -1256,15 +1277,15 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 				}
 
 				/*
-				 * Copy KVMap + keys + values.  We can copy in one shot
+				 * Copy KVMap + keys + values. We can copy in one shot
 				 * up to the first ISCONTAINER_PTR value, then handle
 				 * each child slot, then continue.
 				 *
 				 * Layout reminder for an object:
-				 *   [hdr(4)][JEntries(4*2N)][KVMap(opt INTALIGN'd)]
-				 *   [keys][values]
+				 *  [hdr(4)][JEntries(4*2N)][KVMap(opt INTALIGN'd)]
+				 *  [keys][values]
 				 *
-				 * Key area is identical in old and new.  Values differ
+				 * Key area is identical in old and new. Values differ
 				 * only at child-slot positions.
 				 */
 				outp += sizeof(uint32) + n_jentries * sizeof(JEntry);
@@ -1370,10 +1391,10 @@ jbtl_detoast(ToasterContext tcxt, Datum toast_ptr, int offset, int length)
 
 
 /*
- * tsr_delete (L1.2b)
+ * tsr_delete
  *
  *	If the value is a JBTL_POINTER custom-varlena, unwrap it and
- *	delete the corresponding toast rows.  Inline JBTL_PLAIN_JSONB
+ *	delete the corresponding toast rows. Inline JBTL_PLAIN_JSONB
  *	values have nothing to delete from the toast relation; just
  *	return.
  */
@@ -1403,25 +1424,25 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
 		case JBTL_POINTER_SUBTREE:
 			{
 				/*
-				 * M5.0b-4: version-aware SUBTREE delete dispatch.
+				 * version-aware SUBTREE delete dispatch.
 				 *
-				 *	v0 (M5.0a fixture legacy): payload = parent body,
-				 *		no header, no refs.  Unconditional child
+				 *	v0: payload = parent body,
+				 *		no header, no refs. Unconditional child
 				 *		delete — correct only because v0 rows are
 				 *		synthesised one-per-test and never shared.
 				 *		Documented as test-only.
 				 *
-				 *	v1 (M5.0b production): payload = JbtlSubtreeHeader
-				 *		+ parent body.  For each child pointer:
-				 *		  1. delete the (parent_vid, child_vid) edge
-				 *		     in jbtl_subtree_refs
-				 *		  2. if remaining refcount on the child is
-				 *		     zero, delete the child toast chain
-				 *		  3. if remaining > 0, keep the child chain
-				 *		     (some other parent still references it)
+				 *	v1: payload = JbtlSubtreeHeader
+				 *		+ parent body. For each child pointer:
+				 *		 1. delete the (parent_vid, child_vid) edge
+				 *		 in jbtl_subtree_refs
+				 *		 2. if remaining refcount on the child is
+				 *		 zero, delete the child toast chain
+				 *		 3. if remaining > 0, keep the child chain
+				 *		 (some other parent still references it)
 				 *
 				 *	Hard invariant: every v1 SUBTREE row has matching
-				 *	refs edges (M5.0b-3 production spill enforces
+				 *	refs edges ( production spill enforces
 				 *	this; jbtl_subtree_refs_delete_one ereports if
 				 *	the edge is missing — surfaces state corruption).
 				 */
@@ -1460,13 +1481,13 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
 					/*
 					 * Sanity: the header's parent_toastrelid MUST match
 					 * the heap row's reltoastrelid (we wrote it that
-					 * way in jbtl_try_spill_subtree).  A mismatch means
+					 * way in jbtl_try_spill_subtree). A mismatch means
 					 * either:
-					 *   - corruption (e.g. ALTER ... ATTACH PARTITION
-					 *     that didn't go through the safe-copy path),
-					 *   - bug in spill that wrote the wrong oid,
-					 *   - some other path bypassed tsr_copy and grafted
-					 *     the custom-varlena across heap relations.
+					 *  - corruption (e.g. ALTER ... ATTACH PARTITION
+					 *  that didn't go through the safe-copy path),
+					 *  - bug in spill that wrote the wrong oid,
+					 *  - some other path bypassed tsr_copy and grafted
+					 *  the custom-varlena across heap relations.
 					 *
 					 * In all cases refs lookup keyed on the header's
 					 * value would not match the actually-allocated
@@ -1549,7 +1570,7 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
 						{
 							/*
 							 * v0 fixture: never admitted to refs,
-							 * never shared.  Unconditional delete.
+							 * never shared. Unconditional delete.
 							 */
 							jbtl_toast_delete_datum(
 								PointerGetDatum(bare_copy),
@@ -1568,17 +1589,17 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
 				/*
 				 * Build a bare-TOAST varlena from the inline tail and
 				 * pass it to jbtl_toast_delete_datum, which expects an
-				 * on-disk external.  All four pointer modes carry a
+				 * on-disk external. All four pointer modes carry a
 				 * varatt_external as their FIRST inline element:
 				 *
-				 *   POINTER, POINTER_COMPRESSED_CHUNKS:
-				 *     [varatt_external]
+				 *  POINTER, POINTER_COMPRESSED_CHUNKS:
+				 *  [varatt_external]
 				 *
-				 *   POINTER_DIFF, POINTER_DIFF_COMP:
-				 *     [varatt_external] [JbtlPointerDiff inline tail]
+				 *  POINTER_DIFF, POINTER_DIFF_COMP:
+				 *  [varatt_external] [JbtlPointerDiff inline tail]
 				 *
 				 * Deletion is the same operation: remove the toast rows
-				 * matching the base valueid.  The DIFF tail lives only
+				 * matching the base valueid. The DIFF tail lives only
 				 * in the parent tuple and disappears with it; nothing
 				 * to delete in pg_toast for the overlay itself.
 				 */
@@ -1603,11 +1624,11 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
 
 
 /*
- * Optional callbacks still stubbed in L1.2b.
+ * Optional callbacks still stubbed.
  *
  *	tsr_copy will be wired alongside the per-field-toasting writer in
- *	a later milestone.  tsr_update is the partial-rewrite fast path
- *	(diff/append) -- deferred.  tsr_vtable is for embedded-iterator
+ *	a later milestone. tsr_update is the partial-rewrite fast path
+ *	(diff/append) -- deferred. tsr_vtable is for embedded-iterator
  *	dispatch -- deferred until we have a structured detoast iterator.
  */
 /*
@@ -1616,44 +1637,44 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
  *	Triggered by toastapi_copy when a CUSTOM varlena is being copied
  *	into a new heap row that keeps the same toaster id (e.g.
  *	INSERT INTO ... SELECT FROM, CTAS, ALTER TABLE ... SET TYPE that
- *	preserves attoptions).  The caller's contract: returning Datum 0
+ *	preserves attoptions). The caller's contract: returning Datum 0
  *	tells core to detoast the value and re-toast it through the
  *	normal tsr_toast path.
  *
- *	M5.0b-4 copy-safety guard (per @yoda directive):
+ *	 copy-safety guard (per @yoda directive):
  *
- *	  - SUBTREE v1: a copy that preserved the custom-pointer
- *	    verbatim would inherit the OLD parent_valueid AND the OLD
- *	    refs edges — but the NEW heap row needs ITS OWN parent
- *	    identity and ITS OWN refs edges.  Returning Datum 0 here
- *	    forces core to detoast the SUBTREE row to vanilla jsonb;
- *	    when core re-toasts via tsr_toast, the spill path
- *	    re-allocates a fresh parent_valueid and writes new refs
- *	    edges for the new heap row.  Refcount semantics stay
- *	    correct.
+ *	 - SUBTREE v1: a copy that preserved the custom-pointer
+ *	 verbatim would inherit the OLD parent_valueid AND the OLD
+ *	 refs edges — but the NEW heap row needs ITS OWN parent
+ *	 identity and ITS OWN refs edges. Returning Datum 0 here
+ *	 forces core to detoast the SUBTREE row to vanilla jsonb;
+ *	 when core re-toasts via tsr_toast, the spill path
+ *	 re-allocates a fresh parent_valueid and writes new refs
+ *	 edges for the new heap row. Refcount semantics stay
+ *	 correct.
  *
- *	  - SUBTREE v0 (M5.0a fixture): also Datum 0 — the same
- *	    detoast/retoast path is safe, since v0 rows hold no refs
- *	    state to preserve.
+ *	 - SUBTREE v0: also Datum 0 — the same
+ *	 detoast/retoast path is safe, since v0 rows hold no refs
+ *	 state to preserve.
  *
- *	  - POINTER / POINTER_COMPRESSED_CHUNKS / DIFF / etc.: same
- *	    Datum 0 path.  No refs to track; detoast/retoast through
- *	    tsr_toast emits a fresh chain for the new row.
+ *	 - POINTER / POINTER_COMPRESSED_CHUNKS / DIFF / etc.: same
+ *	 Datum 0 path. No refs to track; detoast/retoast through
+ *	 tsr_toast emits a fresh chain for the new row.
  *
- *	  - PLAIN_JSONB inline: same Datum 0 path, no chain involved.
+ *	 - PLAIN_JSONB inline: same Datum 0 path, no chain involved.
  *
  *	Net effect: every SUBTREE v1 copy goes through detoast →
- *	retoast.  When the destination column has enable_subtree_storage
+ *	retoast. When the destination column has enable_subtree_storage
  *	on, retoast re-spills into a fresh SUBTREE v1 with new
- *	parent_valueid and one fresh refs edge per spilled child.  When
+ *	parent_valueid and one fresh refs edge per spilled child. When
  *	the destination has it off, retoast emits JBTL_POINTER chunks.
  *	Either way refs remain consistent.
  *
  *	Trade-off: detoast+retoast is expensive (assembled body up to
- *	tens of MB) but correctness wins over efficiency for M5.0b.
- *	M5.0b-5 may add a refs-aware shallow copy (increment edge for
+ *	tens of MB) but correctness wins over efficiency.
+ *	 may add a refs-aware shallow copy (increment edge for
  *	the new parent's parent_valueid) once update reuse semantics
- *	in M5.0c are stable.
+ * are stable.
  */
 static Datum
 jbtl_copy(ToasterContext tcxt, Datum value, int am_options)
@@ -1664,15 +1685,15 @@ jbtl_copy(ToasterContext tcxt, Datum value, int am_options)
 
 	/*
 	 * Return 0 to signal core: detoast the value and re-toast it
-	 * via the normal tsr_toast path.  This is correct for every
+	 * via the normal tsr_toast path. This is correct for every
 	 * mode (PLAIN, POINTER, POINTER_*, DIFF*, SUBTREE v0, SUBTREE
-	 * v1).  See banner above for the SUBTREE-specific rationale.
+	 * v1). See banner above for the SUBTREE-specific rationale.
 	 */
 	return (Datum) 0;
 }
 
 /*
- * jbtl_update — tsr_update entry point (L2.1b).
+ * jbtl_update — tsr_update entry point.
  *
  *	Reachable via the β bridge in core toast_helper.c when old is a
  *	JBTL custom-pointer and new is a regular in-memory varlena (the
@@ -1681,31 +1702,31 @@ jbtl_copy(ToasterContext tcxt, Datum value, int am_options)
  *
  *	Algorithm (single-shot same-length top-level scalar):
  *	 1. Decline (return Datum 0) for everything except the narrow
- *	    happy path:
- *	      - old must be JBTL_POINTER or JBTL_POINTER_COMPRESSED_CHUNKS
- *	        (NOT already DIFF — that's the rebase trigger).
- *	      - new must be a regular jsonb varlena (Datum holding a
- *	        Jsonb pointer).
- *	      - Both bodies must be same total byte length.
- *	      - Diff between bodies must be exactly one contiguous byte
- *	        range, and that range must lie entirely within the
- *	        value-data area of the root container (i.e. the change
- *	        affects only one same-length scalar value at the top
- *	        level — no JEntry/key area changes).
+ *	 happy path:
+ *	 - old must be JBTL_POINTER or JBTL_POINTER_COMPRESSED_CHUNKS
+ *	 (NOT already DIFF — that's the rebase trigger).
+ *	 - new must be a regular jsonb varlena (Datum holding a
+ *	 Jsonb pointer).
+ *	 - Both bodies must be same total byte length.
+ *	 - Diff between bodies must be exactly one contiguous byte
+ *	 range, and that range must lie entirely within the
+ *	 value-data area of the root container (i.e. the change
+ *	 affects only one same-length scalar value at the top
+ *	 level — no JEntry/key area changes).
  *	 2. If all conditions hold, build a JBTL_POINTER_DIFF (or
- *	    JBTL_POINTER_DIFF_COMP for compressed base) custom-pointer
- *	    wrapping the unchanged base varatt_external + inline diff.
+ *	 JBTL_POINTER_DIFF_COMP for compressed base) custom-pointer
+ *	 wrapping the unchanged base varatt_external + inline diff.
  *	 3. Otherwise return Datum 0; core falls back to the standard
- *	    delete+toast (rebase) path.
+ *	 delete+toast (rebase) path.
  *
  *	Safety boundaries (out of scope for this milestone):
- *	  - length-changing scalar replacement → declines (different
- *	    body length detected at step 1)
- *	  - array element replacement → declines (would not produce a
- *	    single contiguous byte-range diff, or would also disturb
- *	    JEntry-area bytes)
- *	  - nested path → declines (similar)
- *	  - DIFF-on-DIFF (stacking) → declines (rebase via fallback)
+ *	 - length-changing scalar replacement → declines (different
+ *	 body length detected at step 1)
+ *	 - array element replacement → declines (would not produce a
+ *	 single contiguous byte-range diff, or would also disturb
+ *	 JEntry-area bytes)
+ *	 - nested path → declines (similar)
+ *	 - DIFF-on-DIFF (stacking) → declines (rebase via fallback)
  *
  *	The diagnostic counter `jbtl_update_call_count` records every
  *	call; tests assert it.
@@ -1746,7 +1767,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	 * The full "approve, delete old, keep new" path below would delete a
 	 * toast chain that the heap row still references — a lifecycle
 	 * violation that surfaces on the next read as "tuple concurrently
-	 * deleted".  Detect this case first and return new unchanged: no
+	 * deleted". Detect this case first and return new unchanged: no
 	 * chain delete, no DIFF emission, no refs touch, no counter bump
 	 * (the test pins jbtl_update_calls() == 0 for these scenarios).
 	 */
@@ -1762,7 +1783,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	old_mode = JBTL_CUSTOM_PTR_GET_HEADER(old_v) & JBTL_POINTER_TYPE_MASK;
 
 	/*
-	 * Single-shot invariant: refuse DIFF-on-DIFF.  When old is already
+	 * Single-shot invariant: refuse DIFF-on-DIFF. When old is already
 	 * a DIFF, decline so core retoasts the new value into a fresh
 	 * base — the standard "rebase" behaviour.
 	 */
@@ -1786,24 +1807,24 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	VARATT_EXTERNAL_GET_POINTER(base_ext, old_bare);
 
 	/*
-	 * New must be a plain (non-CUSTOM) varlena.  When new IS already
-	 * CUSTOM (e.g. M5.0a SUBTREE constructed by the test fixture, or
+	 * New must be a plain (non-CUSTOM) varlena. When new IS already
+	 * CUSTOM (e.g. SUBTREE constructed by the test fixture, or
 	 * any future custom-pointer mode), the hook is contracted to
-	 * "approve, delete old, and keep new as-is".  We must:
+	 * "approve, delete old, and keep new as-is". We must:
 	 *
-	 *   1. Delete the old toast chain so it doesn't leak.  Core's
-	 *      NEEDS_DELETE_OLD path only fires when this hook returns 0
-	 *      (decline), not on the keep-new branch — so we own delete.
-	 *   2. Return new unchanged so core's heap_update flow does not
-	 *      detoast new and then re-toast it (which would defeat the
-	 *      SUBTREE / DIFF / etc. structure and write an extra orphan
-	 *      chain).
+	 *  1. Delete the old toast chain so it doesn't leak. Core's
+	 *  NEEDS_DELETE_OLD path only fires when this hook returns 0
+	 *  (decline), not on the keep-new branch — so we own delete.
+	 *  2. Return new unchanged so core's heap_update flow does not
+	 *  detoast new and then re-toast it (which would defeat the
+	 *  SUBTREE / DIFF / etc. structure and write an extra orphan
+	 *  chain).
 	 *
 	 * Rationale: toast_helper's update path sets `need_detoast=false`
-	 * only after a non-zero return from this hook.  If we returned 0
+	 * only after a non-zero return from this hook. If we returned 0
 	 * (decline), line 278 of toast_helper.c would call
 	 * detoast_external_attr on our CUSTOM value and then re-toast its
-	 * assembled body via tsr_toast — defeating the structure.  But
+	 * assembled body via tsr_toast — defeating the structure. But
 	 * the same non-zero return skips the NEEDS_DELETE_OLD marking, so
 	 * we have to delete old ourselves here.
 	 */
@@ -1811,9 +1832,9 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	{
 		/*
 		 * old_bare points to the inline varatt_external bytes inside
-		 * the JBTL_POINTER custom-varlena.  jbtl_toast_delete_datum
+		 * the JBTL_POINTER custom-varlena. jbtl_toast_delete_datum
 		 * expects a full on-disk varlena (2-byte external header +
-		 * 18-byte varatt_external).  Build a local copy.
+		 * 18-byte varatt_external). Build a local copy.
 		 */
 		char		old_full[TOAST_POINTER_SIZE];
 
@@ -1837,7 +1858,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 
 	/*
 	 * Detoast the BASE body (without applying any future overlay —
-	 * we're computing the overlay here).  Use the appropriate reader
+	 * we're computing the overlay here). Use the appropriate reader
 	 * for the base mode.
 	 */
 	if (base_compressed)
@@ -1865,7 +1886,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	new_payload = (int32) VARSIZE(new_v) - VARHDRSZ;
 
 	/*
-	 * Length-changing → out of scope.  This single check rules out
+	 * Length-changing → out of scope. This single check rules out
 	 * any update where the new body has a different total byte
 	 * length than the base; this includes length-changing scalar
 	 * replacement, structural changes, and most container edits.
@@ -1877,7 +1898,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	}
 
 	/*
-	 * Find the first and last differing byte.  If there is no
+	 * Find the first and last differing byte. If there is no
 	 * difference at all, decline — tsr_update cannot be called for
 	 * byte-identical updates (core's case 2 already handles them),
 	 * but be defensive.
@@ -1917,22 +1938,22 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	 * inside ONE non-container top-level value of the root object.
 	 *
 	 * Layout for an object root:
-	 *   [4B header] [N JEntries for keys] [N JEntries for values]
-	 *   [optional KVMap, INTALIGN'd] [key area] [value data area]
+	 *  [4B header] [N JEntries for keys] [N JEntries for values]
+	 *  [optional KVMap, INTALIGN'd] [key area] [value data area]
 	 *
 	 * For each value index k (0..N-1):
-	 *   value_offset[k] = value_area_offset + getJsonbOffset(root, N+k)
-	 *   value_length[k] = getJsonbLength(root, N+k)
-	 *   value_jentry[k] = root->children[N+k]
+	 *  value_offset[k] = value_area_offset + getJsonbOffset(root, N+k)
+	 *  value_length[k] = getJsonbLength(root, N+k)
+	 *  value_jentry[k] = root->children[N+k]
 	 *
 	 * Accept the update only when:
-	 *   - both diff_lo and diff_hi fall inside the same value k
-	 *   - that value's JEntry is NOT a container (so changes are
-	 *     contained within a top-level scalar)
+	 *  - both diff_lo and diff_hi fall inside the same value k
+	 *  - that value's JEntry is NOT a container (so changes are
+	 *  contained within a top-level scalar)
 	 *
 	 * Anything that touches the header, JEntries, KVMap, key area,
 	 * or crosses a value boundary, or lands inside a binary
-	 * container value (array/object), is out of scope for L2.1b
+	 * container value (array/object), is out of scope for
 	 * and we decline.
 	 */
 	{
@@ -1983,7 +2004,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 		 * getJsonbOffset(root, N+k) returns the offset of the k-th
 		 * value RELATIVE TO THE START OF THE DATA AREA (which
 		 * starts at data_area_offset and contains keys followed by
-		 * values).  So absolute offset of value k within the body
+		 * values). So absolute offset of value k within the body
 		 * is data_area_offset + getJsonbOffset(root, N+k).
 		 */
 		for (k = 0; k < N; k++)
@@ -2001,8 +2022,8 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 				{
 					/*
 					 * Diff is inside an array/object value — out of
-					 * scope.  This catches scenario C: same-length
-					 * array element replacement.  postgrespro had a
+					 * scope. This catches scenario C: same-length
+					 * array element replacement. postgrespro had a
 					 * latent correctness bug here; we decline so core
 					 * falls back to full retoast and produces the
 					 * correct result.
@@ -2028,7 +2049,7 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	}
 
 	/*
-	 * All conditions met.  Build a DIFF custom-pointer.  Diff offset
+	 * All conditions met. Build a DIFF custom-pointer. Diff offset
 	 * is the byte offset within the body PAYLOAD; diff length is
 	 * (diff_hi - diff_lo + 1); diff data is the new bytes in that
 	 * range.
@@ -2070,7 +2091,7 @@ jbtl_update_diffs_emitted(PG_FUNCTION_ARGS)
 }
 
 /*
- * jbtl_test_subtree_spill_key  (M5.0a test fixture, debug-only)
+ * jbtl_test_subtree_spill_key
  *
  *	Args: rel oid, jb jsonb, key text
  *	Returns: jsonb (custom-varlena of mode JBTL_POINTER_SUBTREE)
@@ -2080,19 +2101,19 @@ jbtl_update_diffs_emitted(PG_FUNCTION_ARGS)
  *	chain in `rel`'s toast relation, then constructs a parent body
  *	where the JEntry at that key position has type
  *	JBTL_JENTRY_ISCONTAINER_PTR and the value-data slot carries the
- *	new chain's varatt_external.  Wraps the parent body in a
+ *	new chain's varatt_external. Wraps the parent body in a
  *	JBTL_POINTER_SUBTREE custom-varlena.
  *
- *	Restrictions (simplifying assumptions for M5.0a):
- *	  - input body must be a non-scalar object
- *	  - target key's value must be a container (jbvBinary)
- *	  - body must not use offset cache (no JEntry has JENTRY_HAS_OFF
- *	    on any value JEntry that follows the spilled one)
- *	  - input body must not have KVMap (i.e., not produced with
- *	    SET jsonb_sort_field_values=on)
+ *	Restrictions (simplifying assumptions for ):
+ *	 - input body must be a non-scalar object
+ *	 - target key's value must be a container (jbvBinary)
+ *	 - body must not use offset cache (no JEntry has JENTRY_HAS_OFF
+ *	 on any value JEntry that follows the spilled one)
+ *	 - input body must not have KVMap (i.e., not produced with
+ *	 SET jsonb_sort_field_values=on)
  *
- *	These restrictions are sufficient for M5.0a tests (3-key documents
- *	with one big array).  M5.0b's production writer in tsr_toast will
+ *	These restrictions are sufficient for tests (3-key documents
+ *	with one big array). 's production writer in tsr_toast will
  *	handle the general case.
  */
 PG_FUNCTION_INFO_V1(jbtl_test_subtree_spill_key);
@@ -2138,7 +2159,7 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("jbtl_test_subtree_spill_key: KVMap-bearing objects "
-						"not supported in M5.0a fixture; "
+						"not supported; "
 						"use SET jsonb_sort_field_values=off")));
 
 	N = JsonContainerSize(root);
@@ -2190,7 +2211,7 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("jbtl_test_subtree_spill_key: body uses JEntry "
-							"offset cache; not supported in M5.0a fixture")));
+							"offset cache; not supported")));
 	}
 
 	hdr_je_size = (int32) sizeof(uint32) + n_jentries * (int32) sizeof(JEntry);
@@ -2199,7 +2220,7 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 
 	/*
 	 * Wrap the value's container bytes in a fresh varlena and save it
-	 * to the relation's toast.  This is the "child" toast chain.
+	 * to the relation's toast. This is the "child" toast chain.
 	 */
 	child_varlena_size = val_len + VARHDRSZ;
 	child_varlena = (struct varlena *) palloc(child_varlena_size);
@@ -2220,13 +2241,13 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 	VARATT_EXTERNAL_GET_POINTER(child_ext, DatumGetPointer(child_datum));
 
 	/*
-	 * Build the new parent body.  Layout of new body:
-	 *   [hdr | JBTL_JBC_TOBJECT_TOASTED]
-	 *   [JEntries — same except value at match_idx is rewritten]
-	 *   [keys — unchanged]
-	 *   [values 0..match_idx-1 — unchanged]
-	 *   [JbtlToastedContainerPointer = JEntry header_copy + varatt_external]
-	 *   [values match_idx+1..N-1 — unchanged]
+	 * Build the new parent body. Layout of new body:
+	 *  [hdr | JBTL_JBC_TOBJECT_TOASTED]
+	 *  [JEntries — same except value at match_idx is rewritten]
+	 *  [keys — unchanged]
+	 *  [values 0..match_idx-1 — unchanged]
+	 *  [JbtlToastedContainerPointer = JEntry header_copy + varatt_external]
+	 *  [values match_idx+1..N-1 — unchanged]
 	 *
 	 * New value-payload size: 4 (JEntry header_copy) + TOAST_POINTER_SIZE.
 	 * Net body delta: new_value_payload_size − val_len.
@@ -2285,7 +2306,7 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 			new_payload->header = root->header;	/* copy of CHILD container's
 												 * header is the same as the
 												 * value's JEntry container
-												 * indicator.  Postgrespro stores
+												 * indicator. Postgrespro stores
 												 * the child-container's header
 												 * here; we use root's header bits
 												 * since we synthesised the child
@@ -2322,10 +2343,10 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Wrap in JBTL_POINTER_SUBTREE custom-varlena.  For the M5.0a
+	 * Wrap in JBTL_POINTER_SUBTREE custom-varlena. For the
 	 * test fixture we pass InvalidOid as the toasterid because the
 	 * read dispatcher in jbtl_detoast does not actually consult the
-	 * toasterid field — it dispatches purely on the mode tag.  M5.0b's
+	 * toasterid field — it dispatches purely on the mode tag. 's
 	 * production tsr_toast will set toasterid correctly via the normal
 	 * toaster context.
 	 */
@@ -2370,44 +2391,44 @@ jsonb_toaster_lite_handler(PG_FUNCTION_ARGS)
 
 /*
  * jbtl_slice_probe(jb jsonb, sliceoffset int, slicelength int)
- *	  RETURNS (slice_bytes bytea, chunks_total int, chunks_fetched int,
- *	           toast_pages_touched int, chunks_decompressed int,
- *	           bytes_decompressed int)
+ *	 RETURNS (slice_bytes bytea, chunks_total int, chunks_fetched int,
+ *	 toast_pages_touched int, chunks_decompressed int,
+ *	 bytes_decompressed int)
  *
- *	Test probe used by the L1.2c-1 regression to verify that a slice
- *	read fetches strictly fewer chunks than a full read.  Inspects the
+ *	Test probe used by the regression to verify that a slice
+ *	read fetches strictly fewer chunks than a full read. Inspects the
  *	raw datum (without core auto-detoasting) so we can see the
  *	JBTL_POINTER custom-varlena and walk into our chunk-fetcher with
  *	counters.
  *
  *	Output columns:
- *	  slice_bytes          the slice payload as bytea
- *	  chunks_total         total chunks of the value (logical)
- *	  chunks_fetched       chunks actually decoded from disk for this slice
- *	  toast_pages_touched  count(distinct blockno) of the toast tuples
- *	                       fetched.  This is the honest physical-I/O
- *	                       metric: ~4 chunks share an 8KB page, so
- *	                       chunks_fetched can overstate page savings.
- *	                       0 in compute-only mode (PLAIN_JSONB / fallback).
- *	  chunks_decompressed  per-chunk pglz decompression count;
- *	                       0 for plain mode, non-zero only in
- *	                       JBTL_POINTER_COMPRESSED_CHUNKS.
- *	  bytes_decompressed   total bytes produced by per-chunk pglz
- *	                       decompression in this call; 0 for plain.
+ *	 slice_bytes the slice payload as bytea
+ *	 chunks_total total chunks of the value (logical)
+ *	 chunks_fetched chunks actually decoded from disk for this slice
+ *	 toast_pages_touched count(distinct blockno) of the toast tuples
+ *	 fetched. This is the honest physical-I/O
+ *	 metric: ~4 chunks share an 8KB page, so
+ *	 chunks_fetched can overstate page savings.
+ *	 0 in compute-only mode (PLAIN_JSONB / fallback).
+ *	 chunks_decompressed per-chunk pglz decompression count;
+ *	 0 for plain mode, non-zero only in
+ *	 JBTL_POINTER_COMPRESSED_CHUNKS.
+ *	 bytes_decompressed total bytes produced by per-chunk pglz
+ *	 decompression in this call; 0 for plain.
  *
  *	Behaviour by what arrives at PG_GETARG_DATUM(0):
- *	  - a JBTL_POINTER custom-varlena: extract bare ext-ptr, call
- *	    jbtl_toast_fetch_slice_plain, return the slice bytes plus
- *	    chunks_total / chunks_fetched / toast_pages_touched.
- *	  - a JBTL_POINTER_COMPRESSED_CHUNKS custom-varlena: same shape,
- *	    additionally surfaces chunks_decompressed / bytes_decompressed.
- *	  - a JBTL_PLAIN_JSONB custom-varlena: slice the inline body in
- *	    memory; all counters 0.
- *	  - any other shape (bare TOAST pointer, plain inline jsonb,
- *	    expanded, etc.): detoast in full first, then slice in memory;
- *	    all counters 0.  This case is not the one the L1.2c-1
- *	    acceptance test exercises but is useful for sanity checks
- *	    on small values.
+ *	 - a JBTL_POINTER custom-varlena: extract bare ext-ptr, call
+ *	 jbtl_toast_fetch_slice_plain, return the slice bytes plus
+ *	 chunks_total / chunks_fetched / toast_pages_touched.
+ *	 - a JBTL_POINTER_COMPRESSED_CHUNKS custom-varlena: same shape,
+ *	 additionally surfaces chunks_decompressed / bytes_decompressed.
+ *	 - a JBTL_PLAIN_JSONB custom-varlena: slice the inline body in
+ *	 memory; all counters 0.
+ *	 - any other shape (bare TOAST pointer, plain inline jsonb,
+ *	 expanded, etc.): detoast in full first, then slice in memory;
+ *	 all counters 0. This case is not the one the
+ *	 acceptance test exercises but is useful for sanity checks
+ *	 on small values.
  */
 Datum
 jbtl_slice_probe(PG_FUNCTION_ARGS)
@@ -2500,8 +2521,8 @@ jbtl_slice_probe(PG_FUNCTION_ARGS)
 	else
 	{
 		/*
-		 * Not one of our custom varlenas.  Fall back to detoasting in
-		 * full and slicing in memory.  No chunk counters are meaningful
+		 * Not one of our custom varlenas. Fall back to detoasting in
+		 * full and slicing in memory. No chunk counters are meaningful
 		 * here.
 		 */
 		struct varlena *full = detoast_attr(raw);
@@ -2522,7 +2543,7 @@ jbtl_slice_probe(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Wrap the slice payload as a bytea result.  bytea has the same
+	 * Wrap the slice payload as a bytea result. bytea has the same
 	 * varlena layout as our slice so we can return it almost as-is,
 	 * but to be safe we copy into a fresh bytea so the caller can
 	 * pfree the input.
@@ -2548,34 +2569,34 @@ jbtl_slice_probe(PG_FUNCTION_ARGS)
 
 /*
  * jbtl_chunk_inspect(jb jsonb)
- *	  RETURNS TABLE (chunk_no int, chunk_seq int, raw_offset int,
- *	                 raw_size int, stored_size int,
- *	                 is_compressed bool, compression_method int)
+ *	 RETURNS TABLE (chunk_no int, chunk_seq int, raw_offset int,
+ *	 raw_size int, stored_size int,
+ *	 is_compressed bool, compression_method int)
  *
  *	Per-row dump of the toast relation backing a jsonb_toaster_lite
- *	value.  Used by L1.2c-2's regression test to confirm that
+ *	value. Used's regression test to confirm that
  *	per-chunk-compressed values actually have at least one
  *	VARATT_IS_COMPRESSED row, and to expose mixed compressed/raw
  *	streams.
  *
  *	Output columns:
- *	  chunk_no        sequential row number 0..N-1 (in chunk_seq order)
- *	  chunk_seq       raw value of column 2 (= last byte offset in
- *	                  uncompressed payload for compressed-chunks mode,
- *	                  = sequential index for plain-chunks mode)
- *	  raw_offset      first byte offset of this chunk in the
- *	                  uncompressed payload (computed; same as chunk_seq
- *	                  in plain mode * TOAST_MAX_CHUNK_SIZE, or
- *	                  chunk_seq - raw_size + 1 in compressed mode)
- *	  raw_size        bytes this chunk represents in the uncompressed
- *	                  payload
- *	  stored_size     bytes this chunk occupies on disk (raw size of
- *	                  the chunk_data column varlena, including header)
- *	  is_compressed   TRUE if VARATT_IS_COMPRESSED on this row
- *	  compression_method  0=PGLZ, 1=LZ4, 2=invalid (raw)
+ *	 chunk_no sequential row number 0..N-1 (in chunk_seq order)
+ *	 chunk_seq raw value of column 2 (= last byte offset in
+ *	 uncompressed payload for compressed-chunks mode,
+ *	 = sequential index for plain-chunks mode)
+ *	 raw_offset first byte offset of this chunk in the
+ *	 uncompressed payload (computed; same as chunk_seq
+ *	 in plain mode * TOAST_MAX_CHUNK_SIZE, or
+ *	 chunk_seq - raw_size + 1 in compressed mode)
+ *	 raw_size bytes this chunk represents in the uncompressed
+ *	 payload
+ *	 stored_size bytes this chunk occupies on disk (raw size of
+ *	 the chunk_data column varlena, including header)
+ *	 is_compressed TRUE if VARATT_IS_COMPRESSED on this row
+ *	 compression_method 0=PGLZ, 1=LZ4, 2=invalid (raw)
  *
  *	Only invoked from regression tests; this is internal observability
- *	machinery.  Pass-through values that are not stored as
+ *	machinery. Pass-through values that are not stored as
  *	jsonb_toaster_lite custom-pointers (plain inline jsonb, regular
  *	external TOAST) yield zero rows.
  */

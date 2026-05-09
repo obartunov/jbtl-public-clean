@@ -1,24 +1,24 @@
 /*-------------------------------------------------------------------------
  *
  * jsonb_toaster_lite_pointers.c
- *	  Custom-varlena pointer constructors for jsonb_toaster_lite.
+ *	 Custom-varlena pointer constructors for jsonb_toaster_lite.
  *
  * Source-of-truth provenance:
- *	  Ported from postgrespro/postgres@jsonb_toaster (HEAD 583a292),
- *	  contrib/jsonb_toaster/jsonb_toast_internals.c lines 40..386,
- *	  minus the array/chunked-array makers (jsonx_toast_make_pointer_array
- *	  and jsonx_toast_wrap_array_into_pointer at lines 171..208), and
- *	  with all jsonx_, Jsonx, and JSONX_ names renamed to
- *	  jbtl_, Jbtl, and JBTL_.  Original names are noted in
- *	  the per-function port-trace comments.
+ *	 Ported from postgrespro/postgres@jsonb_toaster (HEAD 583a292),
+ *	 contrib/jsonb_toaster/jsonb_toast_internals.c lines 40..386,
+ *	 minus the array/chunked-array makers (jsonx_toast_make_pointer_array
+ *	 and jsonx_toast_wrap_array_into_pointer at lines 171..208), and
+ *	 with all jsonx_, Jsonx, and JSONX_ names renamed to
+ *	 jbtl_, Jbtl, and JBTL_. Original names are noted in
+ *	 the per-function port-trace comments.
  *
- *	  No chunk-machinery (writer, fetcher, detoast iterator) is ported
- *	  in this commit -- those land in L1.2/L1.3.
+ *	 No chunk-machinery (writer, fetcher, detoast iterator) lives in
+ *	 this file -- those are in jsonb_toaster_lite_chain.c.
  *
  * Copyright (c) 2026, Postgres Professional
  *
  * IDENTIFICATION
- *	  contrib/jsonb_toaster_lite/jsonb_toaster_lite_pointers.c
+ *	 contrib/jsonb_toaster_lite/jsonb_toaster_lite_pointers.c
  *
  *-------------------------------------------------------------------------
  */
@@ -40,7 +40,7 @@
  *	Ported from jsonxWriteCustomToastPointerHeader (internals.c:40..67).
  *
  *	Lay out a VARATT_CUSTOM varlena with INTALIGN'd 32-bit mode-tag and
- *	a `datalen`-byte data area.  Returns a pointer to the first byte of
+ *	a `datalen`-byte data area. Returns a pointer to the first byte of
  *	the data area (suitably aligned), so the caller can fill it in.
  *
  *	`rawsize` is the original (pre-toast) size of the value; it is
@@ -82,8 +82,8 @@ jbtl_write_custom_toast_pointer_header(char *ptr, Oid toasterid, uint32 header,
  *
  *	Allocate a fresh varlena large enough to hold the JBTL custom-ptr
  *	header plus `datalen` bytes of payload, and lay out the header in
- *	place.  Returns the varlena and yields the data-area pointer through
- *	*pdata.  Caller fills the data area according to the chosen mode.
+ *	place. Returns the varlena and yields the data-area pointer through
+ *	*pdata. Caller fills the data area according to the chosen mode.
  */
 static struct varlena *
 jbtl_toast_make_custom_pointer(Oid toasterid, uint32 header,
@@ -105,7 +105,7 @@ jbtl_toast_make_custom_pointer(Oid toasterid, uint32 header,
  *	Ported from jsonx_toast_make_plain_pointer (internals.c:83..96).
  *
  *	Wrap a fully-inline jsonb body (no out-of-line chunks) in a
- *	JBTL_PLAIN_JSONB custom-varlena.  Used when the encoded jsonb is
+ *	JBTL_PLAIN_JSONB custom-varlena. Used when the encoded jsonb is
  *	small enough to live inside the row plus its custom-pointer header.
  *
  *	`jbc` points to the in-memory JsonbContainer (header + JEntries +
@@ -128,58 +128,18 @@ jbtl_toast_make_plain_pointer(Oid toasterid, JsonbContainer *jbc, int len)
 
 
 /*
- * jbtl_toast_make_pointer_with_tids
- *	Ported from jsonx_toast_make_pointer_with_tids (internals.c:97..122).
- *
- *	Build a JBTL_POINTER_DIRECT_TIDS custom-varlena: a TOAST pointer
- *	plus an inline `nchunks * sizeof(ItemPointerData)` array of TIDs
- *	for the toasted chunks, allowing direct heap access without a
- *	systable scan.  Returns the varlena and yields the inline TID-array
- *	location through *chunk_tids; caller writes the TIDs into that area.
- *
- *	Public in L1.1 so it is available to chunk-machinery writers in
- *	L1.2 without becoming a "defined but not used" warning here.
- */
-struct varlena *
-jbtl_toast_make_pointer_with_tids(Oid toasterid,
-								  struct varatt_external *toast_pointer,
-								  int data_size, ItemPointer *chunk_tids)
-{
-	uint32		nchunks =
-		(data_size + TOAST_MAX_CHUNK_SIZE - 1) / TOAST_MAX_CHUNK_SIZE;
-	int			inline_size = nchunks * sizeof(ItemPointerData);
-	char	   *data;
-	struct varlena *ptr =
-		jbtl_toast_make_custom_pointer(toasterid,
-									   JBTL_POINTER_DIRECT_TIDS | nchunks,
-									   TOAST_POINTER_SIZE + inline_size,
-									   data_size + VARHDRSZ, &data);
-
-	Assert((intptr_t) data == INTALIGN((intptr_t) data));
-
-	SET_VARTAG_EXTERNAL(data, VARTAG_ONDISK);
-	memcpy(VARDATA_EXTERNAL(data), toast_pointer, sizeof(*toast_pointer));
-	memset(data + TOAST_POINTER_SIZE, 0, inline_size);
-
-	*chunk_tids = (ItemPointer)(data + TOAST_POINTER_SIZE);
-
-	return ptr;
-}
-
-
-/*
  * jbtl_toast_make_pointer_compressed_chunks
  *	Ported from jsonx_toast_make_pointer_compressed_chunks
  *	(internals.c:123..140).
  *
  *	Build a JBTL_POINTER_COMPRESSED_CHUNKS custom-varlena: a TOAST
- *	pointer whose chunk rows carry per-chunk-compressed payload.  Used
+ *	pointer whose chunk rows carry per-chunk-compressed payload. Used
  *	by the sliced detoast iterator so reading byte-range [a..b) only
  *	needs to fetch and decompress the chunks that overlap that range.
  *
  *	No inline tail; the only inline data is the wrapped varatt_external.
  *
- *	Public from L1.2a onwards: callers in chunk-machinery (writer)
+ *	Public: callers in chunk-machinery (writer)
  *	wrap a toast pointer in this mode after writing per-chunk-compressed
  *	rows.
  */
@@ -207,10 +167,10 @@ jbtl_toast_make_pointer_compressed_chunks(Oid toasterid,
  *	Wrap a bare TOAST pointer in a JBTL_POINTER custom-varlena.
  *
  *	Symmetric to jbtl_toast_make_pointer_compressed_chunks, but for
- *	plain (uncompressed) chunks.  The postgrespro source emits a bare
+ *	plain (uncompressed) chunks. The postgrespro source emits a bare
  *	(unwrapped) TOAST pointer for the "ntids=0, no diff, no
  *	compressed_chunks" case (the dispatcher branch at the end of
- *	jsonxMakeToastPointer).  jsonb_toaster_lite needs the wrap to
+ *	jsonxMakeToastPointer). jsonb_toaster_lite needs the wrap to
  *	exist regardless of mode so that core routes reads through
  *	tsr_detoast and our reader is exercised.
  *
@@ -244,17 +204,17 @@ jbtl_toast_wrap_in_jbtl_pointer(Oid toasterid,
  *
  *	Format mirrors postgrespro's jsonx_toast_make_pointer_diff:
  *
- *	  [varatt_custom header]
- *	  [varatt_external base — unchanged, points at existing chunks]
- *	  [JbtlPointerDiff: int32 offset; char data[diff_len]]
+ *	 [varatt_custom header]
+ *	 [varatt_external base — unchanged, points at existing chunks]
+ *	 [JbtlPointerDiff: int32 offset; char data[diff_len]]
  *
  *	`diff_offset` is the byte offset within the assembled jsonb body
  *	where the overlay applies (taken absolute, just like the
- *	postgrespro original).  `diff_len` is encoded implicitly as
+ *	postgrespro original). `diff_len` is encoded implicitly as
  *	(inline_size - offsetof(JbtlPointerDiff, data)) at read time.
  *
  *	The outer custom-pointer keeps `va_rawsize = base.va_rawsize` —
- *	the BASE total size.  This matches the historical contract and
+ *	the BASE total size. This matches the historical contract and
  *	enforces same-byte-length replacement: the apply path allocates
  *	a buffer of base.va_rawsize and the overlay must not extend past
  *	[diff_offset + diff_len) within it.
@@ -295,7 +255,7 @@ jbtl_toast_make_pointer_diff(Oid toasterid,
 
 /*
  * jbtl_toast_make_pointer_subtree
- *	Build a JBTL_POINTER_SUBTREE custom-varlena.  The given parent_body
+ *	Build a JBTL_POINTER_SUBTREE custom-varlena. The given parent_body
  *	bytes are copied verbatim into the custom-varlena's data area;
  *	caller is responsible for ensuring that any JEntries with
  *	JBTL_JENTRY_ISCONTAINER_PTR have a valid JbtlToastedContainerPointer
@@ -303,10 +263,10 @@ jbtl_toast_make_pointer_diff(Oid toasterid,
  *
  *	The custom-varlena's va_rawsize is set to parent_body_size — that is
  *	the size of the AS-STORED body, not the assembled size after children
- *	are spliced in.  Callers that need the assembled size must ask the
+ *	are spliced in. Callers that need the assembled size must ask the
  *	reader (jbtl_detoast) which computes it dynamically.
  *
- *	M5.0a use: only from the test-fixture path.  M5.0b will produce the
+ *	 use: only from the test-fixture path. will produce the
  *	same custom-varlena from the production initial-spill path.
  */
 struct varlena *
@@ -327,15 +287,15 @@ jbtl_toast_make_pointer_subtree(Oid toasterid,
 
 
 /*
- * jbtl_toast_make_pointer_subtree_v1 — M5.0b-3 production constructor.
+ * jbtl_toast_make_pointer_subtree_v1 — production constructor.
  *
  *	Produces a JBTL_POINTER_SUBTREE custom-varlena with a v1
- *	JbtlSubtreeHeader prefix carrying parent identity.  Reader
- *	(M5.0a, jbtl_detoast SUBTREE branch) will be teach-by-version
- *	updated in M5.0b-3 to skip the header before assembling.
+ *	JbtlSubtreeHeader prefix carrying parent identity. Reader
+ *
+ *	updated to skip the header before assembling.
  *
  *	Layout of the resulting payload:
- *	  [ JbtlSubtreeHeader (16 bytes, v1) ][ parent body bytes ]
+ *	 [ JbtlSubtreeHeader (16 bytes, v1) ][ parent body bytes ]
  */
 struct varlena *
 jbtl_toast_make_pointer_subtree_v1(Oid toasterid,
