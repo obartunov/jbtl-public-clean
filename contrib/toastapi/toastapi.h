@@ -117,16 +117,10 @@ typedef Datum (*toaster_detoast_function) (ToasterContext tcxt,
 										   int length);
 
 /* Return virtual table of functions, optional */
-typedef void *(*toaster_vtable_function) (ToasterContext tcxt,
-										  Datum toast_ptr);
-
 /* validate definition of a toaster Oid */
 typedef bool (*toaster_validate_function) (Oid toasteroid, Oid typeoid,
 										   char storage, char compression,
 										   Oid amoid, bool false_ok);
-
-#define TOASTREL_VACUUM_FULL_DISABLED 0x01
-typedef int (*toaster_relinfo_function) (Relation toast_rel);
 
 /*
  * API struct for Toaster.
@@ -148,8 +142,6 @@ struct TsrRoutine
 	toaster_update_function tsr_update;
 	toaster_copy_function tsr_copy;
 	toaster_delete_function tsr_delete;
-	toaster_vtable_function tsr_vtable;
-	toaster_relinfo_function tsr_relinfo;
 };
 
 static inline TsrRoutine *

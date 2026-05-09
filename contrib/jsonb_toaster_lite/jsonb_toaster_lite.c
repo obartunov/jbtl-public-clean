@@ -1628,8 +1628,7 @@ jbtl_delete(ToasterContext tcxt, Datum value, bool is_speculative)
  *
  *	tsr_copy will be wired alongside the per-field-toasting writer in
  *	a later milestone. tsr_update is the partial-rewrite fast path
- *	(diff/append) -- deferred. tsr_vtable is for embedded-iterator
- *	dispatch -- deferred until we have a structured detoast iterator.
+ *	(diff/append) -- deferred.
  */
 /*
  * jbtl_copy — tsr_copy entry point.
@@ -2360,13 +2359,6 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-static void *
-jbtl_vtable(ToasterContext tcxt, Datum toast_ptr)
-{
-	JBTL_NOT_IMPL("tsr_vtable");
-	return NULL;
-}
-
 /* ---- handler ------------------------------------------------------------ */
 
 Datum
@@ -2380,8 +2372,6 @@ jsonb_toaster_lite_handler(PG_FUNCTION_ARGS)
 	tsr->tsr_delete = jbtl_delete;
 	tsr->tsr_copy = jbtl_copy;
 	tsr->tsr_update = jbtl_update;
-	tsr->tsr_vtable = jbtl_vtable;
-	/* tsr_relinfo: optional, leave NULL */
 
 	PG_RETURN_POINTER(tsr);
 }

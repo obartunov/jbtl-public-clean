@@ -1984,63 +1984,6 @@ vac_truncate_clog(TransactionId frozenXID,
 	LWLockRelease(WrapLimitsVacuumLock);
 }
 
-static Oid
-get_main_rel_for_toast_rel(Oid toastrelid)
-{
-	Relation	class_rel = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(class_rel, InvalidOid, false,
-										  NULL, 0, NULL);
-	HeapTuple	tup;
-	Oid			relid = InvalidOid;
-
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_class relform = (Form_pg_class) GETSTRUCT(tup);
-
-		if (relform->reltoastrelid == toastrelid)
-		{
-			relid = relform->oid;
-			break;
-		}
-	}
-
-	systable_endscan(scan);
-	table_close(class_rel, NoLock);
-
-	if (!OidIsValid(relid))
-		elog(ERROR, "could not find main relation for TOAST relation %u",
-			 toastrelid);
-
-	return relid;
-}
-
-static bool
-toastrel_vacuum_full_is_disabled(Relation toastrel, VacuumParams *params)
-{
-	Oid			mainrelid = get_main_rel_for_toast_rel(RelationGetRelid(toastrel));
-	Relation	mainrel = vacuum_open_relation(mainrelid, NULL, params->options,
-											   params->log_vacuum_min_duration >= 0,
-											   AccessShareLock);
-	bool		res = false;
-
-	if (!mainrel)
-		return true;
-
-	if (Toastapi_relinfo_hook &&
-		(Toastapi_relinfo_hook(mainrel, toastrel) & TOASTREL_VACUUM_FULL_DISABLED))
-	{
-		res = true;
-		ereport(WARNING,
-		(errmsg("skipping \"%s\" --- %s is disabled by toaster",
-				RelationGetRelationName(toastrel),
-				"VACUUM FULL")));
-	}
-
-	relation_close(mainrel, AccessShareLock);
-
-	return res;
-}
-
 /*
  *	vacuum_rel() -- vacuum one heap relation
  *
@@ -2219,20 +2162,6 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 		CommitTransactionCommand();
 		/* It's OK to proceed with ANALYZE on this table */
 		return true;
-	}
-
-	/*
-	 * Check if VACUUM FULL of TOAST relation is disabled by the
-	 * toasters.
-	 */
-	if (rel->rd_rel->relkind == RELKIND_TOASTVALUE &&
-		(params.options & VACOPT_FULL) != 0 &&
-		toastrel_vacuum_full_is_disabled(rel, &params))
-	{
-		relation_close(rel, lmode);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		return false;
 	}
 
 	/*

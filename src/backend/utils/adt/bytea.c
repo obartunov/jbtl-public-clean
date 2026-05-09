@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
-#include "access/toast_hook.h"
 #include "common/hashfn.h"
 #include "common/int.h"
 #include "fmgr.h"
@@ -492,24 +491,6 @@ byteaoctetlen(PG_FUNCTION_ARGS)
 }
 
 /*
- * Check TOAST API get_vtable hook to call append function
- * of bytea appendable Toaster
- */
-static inline ByteaToastRoutine *
-bytea_get_toast_routine(Datum value)
-{
-	if (VARATT_IS_CUSTOM(DatumGetPointer(value)) && Toastapi_vtable_hook)
-	{
-		ByteaToastRoutine *routine = Toastapi_vtable_hook(value);
-
-		if (routine && routine->magic == BYTEA_TOASTER_MAGIC)
-			return routine;
-	}
-
-	return NULL;
-}
-
-/*
  * byteacat -
  *	  takes two bytea* and returns a bytea* that is the concatenation of
  *	  the two.
@@ -519,17 +500,8 @@ bytea_get_toast_routine(Datum value)
 Datum
 byteacat(PG_FUNCTION_ARGS)
 {
-	Datum           d1 = PG_GETARG_DATUM(0);
-	ByteaToastRoutine *routine = bytea_get_toast_routine(d1);
-	bytea      *t1;
-	bytea      *t2;
-
-	if (routine)
-	if((routine->append))
-	PG_RETURN_DATUM(routine->append(d1, PG_GETARG_DATUM(1)));
-
-	t1 = PG_GETARG_BYTEA_PP(0);
-	t2 = PG_GETARG_BYTEA_PP(1);
+	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
+	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
 
 	PG_RETURN_BYTEA_P(bytea_catenate(t1, t2));
 }

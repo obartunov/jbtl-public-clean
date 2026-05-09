@@ -144,7 +144,6 @@ dummy_toaster_handler(PG_FUNCTION_ARGS)
 	tsr->tsr_update = dummy_toaster_update;
 	tsr->tsr_detoast = dummy_toaster_detoast;
 	tsr->tsr_validate = dummy_toaster_validate;
-	tsr->tsr_vtable = NULL;
 
 	PG_RETURN_POINTER(tsr);
 }

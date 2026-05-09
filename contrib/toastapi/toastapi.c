@@ -46,8 +46,6 @@ static Toastapi_size_hook_type toastapi_size_hook = NULL;
 static Toastapi_copy_hook_type toastapi_copy_hook = NULL;
 static Toastapi_update_hook_type toastapi_update_hook = NULL;
 static Toastapi_delete_hook_type toastapi_delete_hook = NULL;
-static Toastapi_vtable_hook_type toastapi_vtable_hook = NULL;
-static Toastapi_relinfo_hook_type toastapi_relinfo_hook = NULL;
 
 /* FIXME handler oid stored instead of toaster oid in custom pointers */
 /*
@@ -310,32 +308,6 @@ toastapi_delete(Relation rel, int attnum, Datum value, bool is_speculative)
 	toaster->tsr_delete(&tcxt, value, is_speculative);
 }
 
-static void *
-toastapi_vtable(Datum value)
-{
-	ToasterContextData tcxt;
-	TsrRoutine *toaster = get_toaster_for_ptr(NULL, -1, value, &tcxt);
-
-	return toaster->tsr_vtable ? toaster->tsr_vtable(&tcxt, value) : NULL;
-}
-
-static int
-toastapi_relinfo(Relation main_rel, Relation toast_rel)
-{
-	int			natts = RelationGetNumberOfAttributes(main_rel);
-	int			res = 0;
-
-	for (int i = 0; i < natts; i++)
-	{
-		TsrRoutine *toaster = get_toaster_for_attr(main_rel, i, NULL);
-
-		if (toaster && toaster->tsr_relinfo)
-			res |= toaster->tsr_relinfo(toast_rel);
-	}
-
-	return res;
-}
-
 void _PG_init(void)
 {
 	/*
@@ -354,8 +326,6 @@ void _PG_init(void)
 	toastapi_copy_hook = Toastapi_copy_hook;
 	toastapi_update_hook = Toastapi_update_hook;
 	toastapi_delete_hook = Toastapi_delete_hook;
-	toastapi_vtable_hook = Toastapi_vtable_hook;
-	toastapi_relinfo_hook = Toastapi_relinfo_hook;
 
 	Toastapi_toast_hook = toastapi_toast;
 	Toastapi_detoast_hook = toastapi_detoast;
@@ -363,6 +333,4 @@ void _PG_init(void)
 	Toastapi_copy_hook = toastapi_copy;
 	Toastapi_update_hook = toastapi_update;
 	Toastapi_delete_hook = toastapi_delete;
-	Toastapi_vtable_hook = toastapi_vtable;
-	Toastapi_relinfo_hook = toastapi_relinfo;
 }

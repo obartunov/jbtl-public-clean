@@ -415,7 +415,6 @@ bytea_toaster_handler(PG_FUNCTION_ARGS)
 	tsr->tsr_delete = bytea_toaster_delete;
 	tsr->tsr_copy = bytea_toaster_copy;
 	tsr->tsr_update = bytea_toaster_update;
-	tsr->tsr_vtable = bytea_toaster_vtable;
 
 	PG_RETURN_POINTER(tsr);
 }

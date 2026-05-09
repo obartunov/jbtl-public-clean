@@ -28,8 +28,6 @@ Toastapi_toast_hook_type Toastapi_toast_hook = NULL;
 Toastapi_update_hook_type Toastapi_update_hook = NULL;
 Toastapi_copy_hook_type Toastapi_copy_hook = NULL;
 Toastapi_delete_hook_type Toastapi_delete_hook = NULL;
-Toastapi_vtable_hook_type Toastapi_vtable_hook = NULL;
-Toastapi_relinfo_hook_type Toastapi_relinfo_hook = NULL;
 
 /*
  * Prepare to TOAST a tuple.

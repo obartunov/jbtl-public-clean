@@ -234,22 +234,6 @@ typedef Datum (*Toastapi_detoast_hook_type) (Datum value,
 											 int offset,
 											 int length);
 
-Replicate TOASTed value - currently unused, preserved for further development.
-typedef Datum (*Toastapi_repl_hook_type) (Oid, Datum,
-											 int, int);
-
-Vacuum TOASTed value - currently unused, preserved for further development.
-typedef Datum (*Toastapi_vacuum_hook_type) (Oid, Datum,
-											 int, int);
-
-Retrieve Toaster virtual functions table - used to call extended Toaster functions.
-typedef void *(*Toastapi_vtable_hook_type) (Datum value);
-
-Retrieve additional properties of TOAST table for Toaster if it has tsr_relinfo
-function implemented.
-typedef int (*Toastapi_relinfo_hook_type) (Relation main_rel,
-										   Relation toast_rel);
-
 This hook allows passing size calculation for Custom TOAST pointer to toastapi
 extension, along with the definition of Custom Pointer itself, instead of
 defining Custom pointer in the core.
@@ -414,8 +398,6 @@ typedef struct TsrRoutine
 	toaster_update_function tsr_update;
 	toaster_copy_function tsr_copy;
 	toaster_delete_function tsr_delete;
-	toaster_vtable_function tsr_vtable;
-	toaster_relinfo_function tsr_relinfo;
 } TsrRoutine;
 
 TOAST API method description:
@@ -504,19 +486,6 @@ Datum value             - TOASTed value to delete;
 bool is_speculative     - flag for tuple inserted by the same command that deletes it;
 Output:
 void
-
-typedef void *(*toaster_vtable_function) (ToasterContext tcxt,
-										  Datum toast_ptr);
-- returns virtual functions table - structure containing pointers to functions
-extending pre-defined function set. See III for more detailed virtual functions
-table explanation.
-
-Input:
-ToasterContext tcxt     - structure containing TOAST storage reference, Toaster OID,
-                        TOASTed attribute number, TOAST options;
-Datum value             - TOASTed value;
-Output:
-void *                  - pointer to a table of virtual functions
 
 typedef bool (*toaster_validate_function) (Oid toasteroid, Oid typeoid,
 										   char storage, char compression,
