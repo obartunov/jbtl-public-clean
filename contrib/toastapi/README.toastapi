@@ -581,3 +581,152 @@ following test was used:
 
 Tests show that TOAST API does not have any overhead in means of performance over
 standard implementation.
+
+X. Audit note: cleaned-tree minimization
+
+This section records the rationale for the API surface as it stands
+after commit 3ab8a37 ("Minimize Toast API surface to what cleaned
+jsonb toaster needs").
+
+X.0 Scope principle for the Toast API
+
+The Toast API is a lifecycle interface, not an operator interface.
+It exists so that a toaster can manage the lifecycle of a TOASTed
+value: turn an in-memory Datum into stored representation, retrieve
+it back, ask its size, propagate it across copies, replace it on
+update, and dispose of it on delete or rollback.  The cleaned
+surface is exactly:
+
+    tsr_toast
+    tsr_detoast
+    Toastapi_size_hook        (size; queried by core via cheap hook)
+    tsr_delete
+    tsr_copy
+    tsr_update
+    tsr_validate
+
+Plus a single narrow read-path bridge that core jsonb operator code
+uses to skip detoast when reading one field out of a custom jsonb
+varlena:
+
+    Toastapi_jsonb_object_field_hook
+
+Anything beyond lifecycle should not accumulate here.  In particular,
+per-type operator fast paths (bytea `||`, jsonb_path_exists,
+text concat, etc.) do NOT belong on the Toast API surface even
+though they could be wired the same way.  A type's specialised
+read or update fast path is a property of the type, not of the
+toaster contract.  If a type wants such a fast path, the right
+shape is a type-local provider interface on the type itself
+(for example a bytea-provider interface registered by the type's
+operators), not a new Toastapi_*_hook.  The
+Toastapi_jsonb_object_field_hook is grandfathered as the single
+existing read-side bridge; it is not a template.
+
+X.1 init
+
+Removed.  The original tsr_init was called from
+CheckAndCreateToastTable and BootstrapToastTable, once per toaster
+per relation.  The only shipped consumer (jsonb_toaster_init) was
+a one-line passthrough to vanilla create_toast_table:
+
+    static void
+    jsonb_toaster_init(Relation rel, Oid toastoid, ...)
+    {
+        (void) create_toast_table(rel, toastoid, ...);
+    }
+
+The cleaned core (src/backend/catalog/toasting.c) calls
+create_toast_table directly for every column regardless of
+atttoaster, which is uniform and correct for every toaster the
+cleaned line ships.  Removing tsr_init eliminates a level of
+indirection that no current toaster exercises.
+
+A future toaster that needs to skip toast-table creation or create
+additional relations at create time would have to arrange setup
+via SQL on extension install (which is what jsonb_toaster_lite
+does for jbtl_subtree_refs) or via a private _PG_init.
+
+X.2 get_vtable
+
+Removed.  The original get_vtable was the integration point that
+let a custom TOAST pointer participate in vanilla operator code
+paths without forcing detoast.  Core consumers were:
+
+  - src/backend/utils/adt/json_generic.c:DatumGetJson -- generic
+    JsonContainerOps polymorphism, picking the toaster's own
+    container_ops if the magic matched JSON_TOASTER_MAGIC.
+  - src/backend/utils/adt/varlena.c:byteacat -- appendable bytea
+    fast path, picking the toaster's append() function if the
+    magic matched BYTEA_TOASTER_MAGIC.
+
+For jsonb/JBTL the cleaned line does NOT keep the old generic
+vtable/container-ops model.  The bridge from core jsonb code to a
+JBTL value is the single narrow hook
+Toastapi_jsonb_object_field_hook on the jsonb_object_field
+operator.  Cleaned M7 (DIFF read fast path) rides on that hook.
+The generic vtable was too broad for the cleaned scope.
+
+For bytea the cleaned line does NOT have an equivalent in any
+form.  Cleaned core byteacat (src/backend/utils/adt/bytea.c) is
+plain vanilla -- no VARATT_IS_CUSTOM dispatch.  The
+appendable-bytea fast path from the 2022 "One TOAST fits all"
+talk is not reachable in cleaned.  Direct INSERT/UPDATE through
+tsr_toast/tsr_update still produces appendable storage, but the
+`||` operator falls back to full bytea_catenate.
+
+Do NOT add Toastapi_bytea_append_hook.
+
+A bytea-specific operator fast path does not belong on the
+general Toast API surface (see X.0).  If appendable bytea is ever
+reopened, the right shape is a type-local bytea provider
+interface that the type's operators can probe -- a property of
+the bytea type, not of the toaster contract.  Mechanically that
+keeps the Toast API focused on lifecycle and lets each type
+evolve its own specialised contract without enlarging the
+common interface.
+
+X.3 relinfo
+
+Removed.  The original tsr_relinfo was wired in
+src/backend/commands/vacuum.c at the VACUUM FULL prep step.  If
+any column's toaster returned TOASTREL_VACUUM_FULL_DISABLED,
+VACUUM FULL was skipped (with a WARNING) for the table.  The
+only shipped consumer (jsonb_toaster_relinfo) returned exactly
+that bit unconditionally, disabling VACUUM FULL on any table
+managed by old jsonb_toaster.
+
+Historical correction.  The 3ab8a37 commit message described
+relinfo as having "no consumer in tree".  That is true for the
+cleaned set of toasters (no current cleaned toaster uses
+VACUUM-FULL disable), but the vacuum.c wiring itself was a real
+consumer in core, and the old jsonb_toaster actively used the
+hook.  The historical record should reflect that: relinfo was
+not meaningless; it was unnecessary for the cleaned scope.
+
+Removing relinfo is currently safe because the cleaned storage
+modes (JBTL_POINTER, JBTL_POINTER_COMPRESSED_CHUNKS,
+JBTL_POINTER_DIFF, JBTL_POINTER_DIFF_COMP, JBTL_POINTER_SUBTREE)
+do not share chunk rows across heap-tuple versions at chunk-row
+granularity.  VACUUM FULL on a JBTL-managed table re-toasts each
+live heap tuple through tsr_toast and produces fresh chains; the
+storage shape may normalize across the rewrite but the logical
+value is preserved.  Regression coverage for this property lives
+alongside the update-side v1 tests.
+
+If a future cleaned mode reintroduces chunk-row sharing across
+heap-tuple versions (for example, M-C-style array chunk-TID
+inline arrays -- see M9_FORENSIC.md), VACUUM FULL is no longer
+automatically safe and the new mode must come with an explicit
+story.  Three shapes are conceivable; the choice is the
+new-mode designer's, not the Toast API's:
+
+  (a) re-introduce a relinfo-like disable so VACUUM FULL is
+      refused on tables using that mode;
+  (b) prove and implement that the rewrite path correctly
+      materializes shared chunks under the caller's snapshot;
+  (c) supply a rewrite-time mapping from old chunk TIDs to new
+      chunk TIDs that the rewrite path consults.
+
+This audit note records the invariant: the safety of removing
+relinfo is conditional on the current storage modes only.
