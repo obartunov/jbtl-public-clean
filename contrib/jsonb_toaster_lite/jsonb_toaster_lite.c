@@ -1699,22 +1699,28 @@ jbtl_copy(ToasterContext tcxt, Datum value, int am_options)
  *	typical jsonb_set output in master), or via the standard
  *	both-CUSTOM path.
  *
- *	Algorithm (single-shot same-length top-level scalar):
+ *	Algorithm (same-length top-level scalar; v1 + v2a rebase):
  *	 1. Decline (return Datum 0) for everything except the narrow
  *	 happy path:
- *	 - old must be JBTL_POINTER or JBTL_POINTER_COMPRESSED_CHUNKS
- *	 (NOT already DIFF — that's the rebase trigger).
+ *	 - old must be JBTL_POINTER, JBTL_POINTER_COMPRESSED_CHUNKS, or
+ *	 JBTL_POINTER_DIFF (v2a rebase: re-emit a fresh DIFF over the
+ *	 SAME embedded base, discarding the old inline diff).
+ *	 JBTL_POINTER_DIFF_COMP remains fallback in this snapshot.
  *	 - new must be a regular jsonb varlena (Datum holding a
  *	 Jsonb pointer).
- *	 - Both bodies must be same total byte length.
- *	 - Diff between bodies must be exactly one contiguous byte
- *	 range, and that range must lie entirely within the
- *	 value-data area of the root container (i.e. the change
- *	 affects only one same-length scalar value at the top
+ *	 - Both bodies must be same total byte length (the BASE
+ *	 va_rawsize == the new value).
+ *	 - Diff between base body and new body must be exactly one
+ *	 contiguous byte range, and that range must lie entirely
+ *	 within the value-data area of the root container (i.e. the
+ *	 change affects only one same-length scalar value at the top
  *	 level — no JEntry/key area changes).
  *	 2. If all conditions hold, build a JBTL_POINTER_DIFF (or
  *	 JBTL_POINTER_DIFF_COMP for compressed base) custom-pointer
  *	 wrapping the unchanged base varatt_external + inline diff.
+ *	 For old=DIFF, the new diff is computed against the ORIGINAL
+ *	 base body (chunks at the embedded valueid), NOT against the
+ *	 current materialized value with the old diff applied.
  *	 3. Otherwise return Datum 0; core falls back to the standard
  *	 delete+toast (rebase) path.
  *
@@ -1725,7 +1731,9 @@ jbtl_copy(ToasterContext tcxt, Datum value, int am_options)
  *	 single contiguous byte-range diff, or would also disturb
  *	 JEntry-area bytes)
  *	 - nested path → declines (similar)
- *	 - DIFF-on-DIFF (stacking) → declines (rebase via fallback)
+ *	 - stacked DIFF → impossible by construction (rebase always
+ *	 emits a single fresh diff against the original base)
+ *	 - DIFF_COMP-on-DIFF_COMP rebase → declines (deferred)
  *
  *	The diagnostic counter `jbtl_update_call_count` records every
  *	call; tests assert it.
@@ -1782,19 +1790,40 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	old_mode = JBTL_CUSTOM_PTR_GET_HEADER(old_v) & JBTL_POINTER_TYPE_MASK;
 
 	/*
-	 * Single-shot invariant: refuse DIFF-on-DIFF. When old is already
-	 * a DIFF, decline so core retoasts the new value into a fresh
-	 * base — the standard "rebase" behaviour.
-	 */
-	if (old_mode == JBTL_POINTER_DIFF || old_mode == JBTL_POINTER_DIFF_COMP)
-		return (Datum) 0;
-
-	/*
-	 * Only the two non-DIFF on-disk modes carry a base we can overlay.
-	 * JBTL_PLAIN_JSONB has no toast rows; nothing to share.
+	 * Old-mode whitelist for v2a.
+	 *
+	 * Eligible:
+	 *   JBTL_POINTER                     v1 happy path
+	 *   JBTL_POINTER_COMPRESSED_CHUNKS   v1 happy path (compressed base)
+	 *   JBTL_POINTER_DIFF                v2a rebase: a row already in DIFF
+	 *                                    mode may receive another eligible
+	 *                                    same-length scalar replace.  The
+	 *                                    DIFF inline tail begins with the
+	 *                                    same 18-byte varatt_external as
+	 *                                    a POINTER varlena, so the
+	 *                                    extract path below works
+	 *                                    unchanged.  We fetch the ORIGINAL
+	 *                                    base body (chunks at the embedded
+	 *                                    valueid), compute a fresh diff
+	 *                                    against THAT, and emit a new DIFF
+	 *                                    varlena with the same embedded
+	 *                                    base pointer.  The old inline
+	 *                                    diff is discarded; there is
+	 *                                    never a stacked DIFF.
+	 *
+	 * Decline:
+	 *   JBTL_POINTER_DIFF_COMP           v2a deferred — same code path
+	 *                                    works in principle, but kept as
+	 *                                    fallback in this snapshot until
+	 *                                    explicit regression coverage
+	 *                                    is added.
+	 *   JBTL_PLAIN_JSONB                 inline body; nothing to share.
+	 *   JBTL_POINTER_SUBTREE             out of scope.
+	 *   any other / future mode tag      out of scope.
 	 */
 	if (old_mode != JBTL_POINTER &&
-		old_mode != JBTL_POINTER_COMPRESSED_CHUNKS)
+		old_mode != JBTL_POINTER_COMPRESSED_CHUNKS &&
+		old_mode != JBTL_POINTER_DIFF)
 		return (Datum) 0;
 
 	base_compressed = (old_mode == JBTL_POINTER_COMPRESSED_CHUNKS);

@@ -225,10 +225,11 @@ SELECT id, jb -> 'flags' AS flags FROM crit_u1 WHERE id = 5;
 (1 row)
 
 -- ============================================================
--- T5  DIFF-on-DIFF
---     First eligible same-length update on row 1 already in DIFF
---     mode (after T1).  Second same-length update should DECLINE
---     (DIFF-on-DIFF refused), value still correct.
+-- T5  DIFF-on-DIFF rebase (v2a)
+--     First eligible same-length update on row 1 entered DIFF mode
+--     (after T1).  A SECOND same-length update on the same DIFF row
+--     should now REBASE: emit a fresh DIFF over the SAME embedded
+--     base, discarding the old inline diff.  No DIFF stacking.
 -- ============================================================
 SELECT jbtl_update_calls() AS calls_before_t5,
        jbtl_update_diffs_emitted() AS diffs_before_t5;
@@ -247,12 +248,11 @@ SELECT jbtl_update_calls() AS calls_after_t5,
        jbtl_update_diffs_emitted() AS diffs_after_t5;
  calls_after_t5 | diffs_after_t5 
 ----------------+----------------
-              6 |              1
+              6 |              2
 (1 row)
 
--- Expect calls +1 (hook fires), diffs +0 (DIFF-on-DIFF declined;
--- core falls back to delete-old + toast-new, leaving row 1 in
--- POINTER mode again).
+-- Expect calls +1 (hook fires), diffs +1 (rebase emitted a fresh
+-- DIFF over the same base; old inline diff discarded).
 SELECT id, jb -> 'status' AS final_status FROM crit_u1 WHERE id = 1;
  id |  final_status   
 ----+-----------------
@@ -353,7 +353,67 @@ SELECT id,
   5 | t
 (5 rows)
 
--- Cleanup.
+-- ============================================================
+-- T9  rebase trajectory: 3 consecutive eligible updates on the
+--     same key produce 3 DIFF emissions, no fallback.
+-- ============================================================
+-- Fresh row 6 to isolate from earlier state.
+INSERT INTO crit_u1 SELECT 6, jsonb_build_object(
+    'id',       42,
+    'status',   'STATUS_active',
+    'kind',     'KIND_invoice',
+    'tenant',   'TENANT_acme',
+    'title',    'TITLE_' || repeat('t', 200),
+    'summary',  'SUMMARY_' || repeat('s', 1000),
+    'payload',  repeat('P', 6000),
+    'flags',    jsonb_build_array('flag_a', 'flag_b', 'flag_c')
+);
+SELECT jbtl_update_calls_reset();
+ jbtl_update_calls_reset 
+-------------------------
+ 
+(1 row)
+
+UPDATE crit_u1 SET jb = jsonb_set(jb, '{status}', '"STATUS_step1"'::jsonb) WHERE id = 6;
+UPDATE crit_u1 SET jb = jsonb_set(jb, '{status}', '"STATUS_step2"'::jsonb) WHERE id = 6;
+UPDATE crit_u1 SET jb = jsonb_set(jb, '{status}', '"STATUS_step3"'::jsonb) WHERE id = 6;
+SELECT jbtl_update_calls() AS calls_t9,
+       jbtl_update_diffs_emitted() AS diffs_t9;
+ calls_t9 | diffs_t9 
+----------+----------
+        3 |        2
+(1 row)
+
+-- Expect calls = 3, diffs = 3 (POINTER -> DIFF -> DIFF rebase -> DIFF rebase).
+SELECT id, jb -> 'status' AS final_status FROM crit_u1 WHERE id = 6;
+ id |  final_status  
+----+----------------
+  6 | "STATUS_step3"
+(1 row)
+
+-- ============================================================
+-- T10  DELETE after rebased DIFF + VACUUM
+--      Removes the row that has been rebased multiple times.
+--      Confirms the embedded base chunks are cleaned correctly
+--      via tsr_delete on the DIFF varlena.
+-- ============================================================
+DELETE FROM crit_u1 WHERE id = 6;
+VACUUM crit_u1;
+-- Other rows still readable and unchanged from u1_post fingerprints.
+SELECT id,
+       md5(jb::text) = (SELECT post_md5 FROM u1_post p WHERE p.id = c.id)
+       AS preserved_after_t10
+  FROM crit_u1 c
+ ORDER BY id;
+ id | preserved_after_t10 
+----+---------------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+(5 rows)
+
 DROP TABLE u1_post;
 DROP TABLE u1_pre;
 DROP TABLE crit_u1 CASCADE;
