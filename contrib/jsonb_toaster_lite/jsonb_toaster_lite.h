@@ -396,9 +396,35 @@ jbtl_toast_count_chunks(struct varatt_external *toast_pointer);
  *	and the SQL handlers route to core's jsonb_object_field.
  */
 
+/*
+ * JbtlDiffInfo
+ *
+ *	Out-parameter struct populated by jbtl_unwrap_to_toast_pointer when
+ *	the unwrapped row is JBTL_POINTER_DIFF and the caller has opted in
+ *	to DIFF handling (by passing a non-NULL pointer). Conveys the
+ *	overlay's geometry and the inline overlay bytes to
+ *	jbtl_toast_fetch_object_field.
+ *
+ *	`diff_lo` is the byte offset within the BASE body payload where the
+ *	overlay applies; `diff_len` is the number of overlay bytes;
+ *	`inline_diff` points at those bytes inside the wrapper varlena and
+ *	remains valid for the lifetime of the wrapper.
+ *
+ *	When the unwrapped mode is JBTL_POINTER or JBTL_POINTER_COMPRESSED_CHUNKS,
+ *	the struct is not touched.
+ */
+typedef struct JbtlDiffInfo
+{
+	int32		diff_lo;
+	int32		diff_len;
+	const char *inline_diff;
+} JbtlDiffInfo;
+
+
 extern JsonbValue *
 jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 							  uint32 mode,
+							  const JbtlDiffInfo *diff_info,
 							  const char *key, int keylen,
 							  int32 *out_chunks_total,
 							  int32 *out_chunks_fetched,
@@ -411,15 +437,28 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 /* ---- shared locator helper used by both the read path and
  *	the dry-run update probe. Body in jsonb_toaster_lite_object_field.c.
  *
- *	Returns true if `raw` is a JBTL custom-varlena pointing at on-disk
- *	chunks (JBTL_POINTER or JBTL_POINTER_COMPRESSED_CHUNKS); fills
- *	*out_mode and *out_ext. Returns false for inline JBTL_PLAIN_JSONB,
- *	non-CUSTOM varlenas, or unsupported modes.
+ *	Returns true if `raw` is a JBTL custom-varlena that the fast path
+ *	can handle:
+ *
+ *	  - JBTL_POINTER / JBTL_POINTER_COMPRESSED_CHUNKS: fills *out_mode
+ *	    and *out_ext to that wrapper's on-disk chunks pointer.
+ *	  - JBTL_POINTER_DIFF: only if `out_diff_info != NULL`. Fills
+ *	    *out_mode = JBTL_POINTER_DIFF, *out_ext = the EMBEDDED base
+ *	    varatt_external (not the wrapper), and *out_diff_info with the
+ *	    overlay's (diff_lo, diff_len, inline_diff). The caller is
+ *	    expected to read base bytes via the JBTL_POINTER reader on
+ *	    *out_ext.
+ *
+ *	Returns false for inline JBTL_PLAIN_JSONB, non-CUSTOM varlenas,
+ *	JBTL_POINTER_DIFF when out_diff_info == NULL, JBTL_POINTER_DIFF_COMP
+ *	(M7 explicitly excludes this; future milestone), and other modes.
+ *	On false, out parameters are not modified.
  */
 extern bool
 jbtl_unwrap_to_toast_pointer(struct varlena *raw,
 							 uint32 *out_mode,
-							 struct varatt_external *out_ext);
+							 struct varatt_external *out_ext,
+							 JbtlDiffInfo *out_diff_info);
 
 
 /* ---- subtree refs catalog -----------------------------------

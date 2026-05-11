@@ -179,9 +179,47 @@ jbtl_fetch_slice_dispatch(struct varatt_external *toast_pointer,
  *	over the chunk range it actually touched and writes the
  *	count of distinct toast pages. See jbtl_count_pages_in_chunk_range.
  */
+/*
+ * Geometry tags for DIFF read fast path. Computed from
+ * (v_lo, v_hi, diff_lo, diff_hi) where [v_lo, v_hi] is the requested
+ * key's encoded value range in the base body and [diff_lo, diff_hi]
+ * is the inline overlay range.
+ */
+#define JBTL_GEO_DISJ				0
+#define JBTL_GEO_EQUAL				1
+#define JBTL_GEO_INNER				2
+#define JBTL_GEO_OVERLAP_PARTIAL	3
+
+/*
+ * classify_diff_geometry
+ *
+ *	Pure integer classifier. Caller has already excluded G_MISS (key
+ *	not in KVMap) and G_CONTAINER (JEntry type says container). All
+ *	four geometries below are constructible under v1/v2a admission
+ *	for scalar K; G_OVERLAP_PARTIAL specifically should not occur for
+ *	well-formed admitted DIFFs but is classified defensively so the
+ *	fast path falls back instead of returning wrong bytes.
+ *
+ *	Preconditions (cheap to assert): v_lo <= v_hi, diff_lo <= diff_hi.
+ */
+static inline int
+classify_diff_geometry(int32 v_lo, int32 v_hi,
+					   int32 diff_lo, int32 diff_hi)
+{
+	if (diff_hi < v_lo || diff_lo > v_hi)
+		return JBTL_GEO_DISJ;
+	if (diff_lo == v_lo && diff_hi == v_hi)
+		return JBTL_GEO_EQUAL;
+	if (diff_lo >= v_lo && diff_hi <= v_hi)
+		return JBTL_GEO_INNER;
+	return JBTL_GEO_OVERLAP_PARTIAL;
+}
+
+
 JsonbValue *
 jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 							  uint32 mode,
+							  const JbtlDiffInfo *diff_info,
 							  const char *key, int keylen,
 							  int32 *out_chunks_total,
 							  int32 *out_chunks_fetched,
@@ -227,13 +265,32 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	JsonbValue *result;
 	int			i;
 
+	/*
+	 * For JBTL_POINTER_DIFF, the caller (jbtl_unwrap_to_toast_pointer)
+	 * has set toast_pointer to the EMBEDDED base varatt_external and
+	 * placed the overlay info in diff_info. The on-disk chunks the
+	 * slice dispatcher reads from are plain (uncompressed) — that is
+	 * exactly what the base mode is — so route slice reads through
+	 * JBTL_POINTER's reader. We never feed JBTL_POINTER_DIFF into
+	 * jbtl_fetch_slice_dispatch; it only knows POINTER and
+	 * COMPRESSED_CHUNKS.
+	 *
+	 * For JBTL_POINTER_DIFF_COMP (compressed base + DIFF), the unwrap
+	 * gate already rejected, so we never see that mode here. Future
+	 * M8 work can extend this.
+	 */
+	uint32		base_mode = (mode == JBTL_POINTER_DIFF) ? JBTL_POINTER : mode;
+
+	Assert(diff_info == NULL || mode == JBTL_POINTER_DIFF);
+	Assert(mode != JBTL_POINTER_DIFF || diff_info != NULL);
+
 	*out_fallback = false;
 
 	/* Step 1: fetch a prefix that covers (we hope) the structural part. */
 	if (prefix_size > attrsize)
 		prefix_size = attrsize;
 
-	prefix = jbtl_fetch_slice_dispatch(toast_pointer, mode,
+	prefix = jbtl_fetch_slice_dispatch(toast_pointer, base_mode,
 									   0, prefix_size,
 									   &chunks_total,
 									   &chunks_fetched_first,
@@ -304,7 +361,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 
 		pfree(prefix);
 
-		prefix = jbtl_fetch_slice_dispatch(toast_pointer, mode,
+		prefix = jbtl_fetch_slice_dispatch(toast_pointer, base_mode,
 										   0, better_size,
 										   &chunks_total_2,
 										   &chunks_fetched_2,
@@ -351,7 +408,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 
 		pfree(prefix);
 
-		prefix = jbtl_fetch_slice_dispatch(toast_pointer, mode,
+		prefix = jbtl_fetch_slice_dispatch(toast_pointer, base_mode,
 										   0, better_size,
 										   &chunks_total_2,
 										   &chunks_fetched_2,
@@ -431,72 +488,180 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	}
 
 	/*
-	 * Step 7b: bail when the value occupies more than ~half the body.
-	 * In that case fetching only the value would still touch most
-	 * chunks; doing it AFTER a structural prefix fetch costs more
-	 * total chunk reads than a single full detoast would. Pure
-	 * heuristic; tunable. Reading the whole body via the existing
-	 * full path then doing the lookup in memory is what the caller
-	 * does on fallback, and that's strictly cheaper here.
+	 * Step 7c (DIFF only): classify geometry between K's encoded value
+	 * range [v_lo, v_hi] (unpadded; matches writer's admission) and the
+	 * inline DIFF range [diff_lo, diff_hi]. Decide whether the fast
+	 * path can serve this case, and if so, which sub-strategy applies
+	 * in Step 8.
 	 *
-	 *	The 50 % threshold is conservative — even a 49 %-of-body
-	 *	value would force the value-fetch to overlap the prefix
-	 *	fetch in chunk space, where each overlap pays a duplicate
-	 *	BT-walk row. If profiling later argues for a tighter
-	 *	bound (say 70 %), this is the one knob to turn.
-	 */
-	if ((int64) value_len * 2 > (int64) attrsize)
-	{
-		*out_fallback = true;
-		goto out;
-	}
-
-	/* Step 8: fetch the value bytes (possibly already in prefix).
+	 *	Constructible geometries under v1/v2a admission:
+	 *	  G_DISJ   K's value untouched by the overlay
+	 *	  G_EQUAL  overlay replaces K's entire value range
+	 *	  G_INNER  overlay strictly inside K's value range
 	 *
-	 *	Numerics and nested-container values are INTALIGN'd in the data
-	 *	area: the writer pads before them so the actual payload starts
-	 *	at INTALIGN(unpadded_offset). The pad bytes are NOT counted
-	 *	in JEntry length. So for any value type we may need to fetch
-	 *	an extra `pad` bytes at the front; in the result construction
-	 *	we skip those pad bytes for types that need them. Strings and
-	 *	bool/null have pad=0 because no preceding alignment is added
-	 *	for them.
+	 *	G_OVERLAP_PARTIAL should not occur for a well-formed admitted
+	 *	DIFF (the writer asserts containment), but we classify it
+	 *	defensively and fall back rather than risk wrong bytes.
 	 */
 	{
-		uint32		pad = INTALIGN(value_offset_in_data) - value_offset_in_data;
-		int32		fetch_len = (int32) (value_len + pad);
+		int			geom = -1;
 
-		value_byte_end_in_body =
-			min_prefix + (int) value_offset_in_data + fetch_len;
-
-		if (body_len >= value_byte_end_in_body)
+		if (diff_info != NULL)
 		{
-			value_bytes = base_addr + value_offset_in_data;
-		}
-		else
-		{
-			struct varlena *value_chunk;
-			int32		chunks_total_v = 0;
-			int32		chunks_fetched_v = 0;
+			int32		v_lo;
+			int32		v_hi;
+			int32		diff_lo = diff_info->diff_lo;
+			int32		diff_hi = diff_lo + diff_info->diff_len - 1;
 
-			value_chunk = jbtl_fetch_slice_dispatch(toast_pointer, mode,
-													min_prefix + value_offset_in_data,
-													fetch_len,
-													&chunks_total_v,
-													&chunks_fetched_v,
-													NULL);
-			chunks_fetched_total += chunks_fetched_v;
-			value_bytes = VARDATA(value_chunk);
-			if (out_pages_touched)
+			v_lo = (int32) (min_prefix + (int) value_offset_in_data);
+			v_hi = v_lo + (int32) value_len - 1;
+
+			/*
+			 * Sanity: every admitted DIFF satisfies these invariants;
+			 * if any of them is violated the inline tail is malformed.
+			 * Fall back rather than ERROR; the slow detoaster will
+			 * raise ERRCODE_DATA_CORRUPTED with full context if the
+			 * same bytes really are corrupt.
+			 */
+			if (diff_info->diff_len <= 0 ||
+				diff_lo < 0 ||
+				diff_hi < diff_lo)
 			{
-				int32		val_start = min_prefix + value_offset_in_data;
-				int32		lo = val_start / TOAST_MAX_CHUNK_SIZE;
-				int32		hi = (val_start + fetch_len - 1) / TOAST_MAX_CHUNK_SIZE;
+				*out_fallback = true;
+				goto out;
+			}
 
-				if (lo < pages_lo) pages_lo = lo;
-				if (hi > pages_hi) pages_hi = hi;
+			geom = classify_diff_geometry(v_lo, v_hi, diff_lo, diff_hi);
+
+			if (geom == JBTL_GEO_OVERLAP_PARTIAL)
+			{
+				*out_fallback = true;
+				goto out;
 			}
 		}
+
+		/*
+		 * Step 7b: bail when the value occupies more than ~half the body.
+		 * In that case fetching only the value would still touch most
+		 * chunks; doing it AFTER a structural prefix fetch costs more
+		 * total chunk reads than a single full detoast would. Pure
+		 * heuristic; tunable. Reading the whole body via the existing
+		 * full path then doing the lookup in memory is what the caller
+		 * does on fallback, and that's strictly cheaper here.
+		 *
+		 *	The 50 % threshold is conservative — even a 49 %-of-body
+		 *	value would force the value-fetch to overlap the prefix
+		 *	fetch in chunk space, where each overlap pays a duplicate
+		 *	BT-walk row. If profiling later argues for a tighter
+		 *	bound (say 70 %), this is the one knob to turn.
+		 *
+		 *	For DIFF G_EQUAL we skip the threshold: there is no slice
+		 *	fetch at all (value comes from the inline overlay), so
+		 *	the threshold's "value-fetch overlaps prefix-fetch" cost
+		 *	is zero. For DIFF G_DISJ and G_INNER the threshold still
+		 *	applies because they perform a base slice fetch.
+		 */
+		if (geom != JBTL_GEO_EQUAL &&
+			(int64) value_len * 2 > (int64) attrsize)
+		{
+			*out_fallback = true;
+			goto out;
+		}
+
+		/* Step 8: fetch the value bytes (possibly already in prefix).
+		 *
+		 *	Numerics and nested-container values are INTALIGN'd in the data
+		 *	area: the writer pads before them so the actual payload starts
+		 *	at INTALIGN(unpadded_offset). The pad bytes are NOT counted
+		 *	in JEntry length. So for any value type we may need to fetch
+		 *	an extra `pad` bytes at the front; in the result construction
+		 *	we skip those pad bytes for types that need them. Strings and
+		 *	bool/null have pad=0 because no preceding alignment is added
+		 *	for them.
+		 */
+		{
+			uint32		pad = INTALIGN(value_offset_in_data) - value_offset_in_data;
+			int32		fetch_len = (int32) (value_len + pad);
+
+			value_byte_end_in_body =
+				min_prefix + (int) value_offset_in_data + fetch_len;
+
+			if (geom == JBTL_GEO_EQUAL)
+			{
+				/*
+				 * G_EQUAL — overlay replaces K's entire unpadded value
+				 * range. inline_diff carries exactly value_len bytes of
+				 * scalar content (no pad). For numeric values pad > 0,
+				 * and the writer's byte-wise diff never includes pad
+				 * bytes (they are identical in base and new bodies), so
+				 * G_EQUAL on a numeric is essentially unreachable under
+				 * admission. If it does occur with pad > 0 (e.g. some
+				 * future writer admits it), we lack the pad bytes that
+				 * Step 9's Numeric construction expects — fall back.
+				 *
+				 * For pad == 0 (strings, bool, null), the inline bytes
+				 * are the answer directly. No slice fetch.
+				 */
+				if (pad != 0)
+				{
+					*out_fallback = true;
+					goto out;
+				}
+				value_bytes = (char *) diff_info->inline_diff;
+			}
+			else if (body_len >= value_byte_end_in_body)
+			{
+				value_bytes = base_addr + value_offset_in_data;
+			}
+			else
+			{
+				struct varlena *value_chunk;
+				int32		chunks_total_v = 0;
+				int32		chunks_fetched_v = 0;
+
+				value_chunk = jbtl_fetch_slice_dispatch(toast_pointer, base_mode,
+														min_prefix + value_offset_in_data,
+														fetch_len,
+														&chunks_total_v,
+														&chunks_fetched_v,
+														NULL);
+				chunks_fetched_total += chunks_fetched_v;
+				value_bytes = VARDATA(value_chunk);
+				if (out_pages_touched)
+				{
+					int32		val_start = min_prefix + value_offset_in_data;
+					int32		lo = val_start / TOAST_MAX_CHUNK_SIZE;
+					int32		hi = (val_start + fetch_len - 1) / TOAST_MAX_CHUNK_SIZE;
+
+					if (lo < pages_lo) pages_lo = lo;
+					if (hi > pages_hi) pages_hi = hi;
+				}
+			}
+
+			/*
+			 * Step 8b (DIFF G_INNER): apply the inline overlay locally
+			 * onto the value bytes we just sourced (from prefix or from
+			 * stage-3 slice). The buffer is palloc'd and owned by us;
+			 * mutating it in place is safe.
+			 *
+			 * value_bytes points to (unpadded) v_lo. The overlay starts
+			 * at diff_lo, so its offset within value_bytes is
+			 * (diff_lo - v_lo). Bounds: admission guarantees diff_lo >=
+			 * v_lo and (diff_lo + diff_len - 1) <= v_hi = v_lo + value_len - 1,
+			 * i.e. diff_lo - v_lo + diff_len <= value_len. Asserted.
+			 */
+			if (geom == JBTL_GEO_INNER)
+			{
+				int32		v_lo = (int32) (min_prefix + (int) value_offset_in_data);
+				int32		local_off = diff_info->diff_lo - v_lo;
+
+				Assert(local_off >= 0);
+				Assert(local_off + diff_info->diff_len <= (int32) value_len);
+
+				memcpy(value_bytes + local_off,
+					   diff_info->inline_diff,
+					   diff_info->diff_len);
+			}
 
 		/* Step 9: construct the JsonbValue. */
 		result = (JsonbValue *) palloc(sizeof(JsonbValue));
@@ -544,6 +709,7 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 			*out_fallback = true;
 			goto out;
 		}
+		}
 	}
 
 	if (out_chunks_total)
@@ -584,17 +750,28 @@ out:
  * jbtl_unwrap_to_toast_pointer
  *
  *	Given a possibly-CUSTOM raw varlena, decide whether we can take
- *	the fast path. On success, fills *out_mode and *out_ext and
- *	returns true. On any reason to fall back, returns false; out
- *	parameters are not modified.
+ *	the fast path. On success, fills *out_mode and *out_ext (and
+ *	*out_diff_info when DIFF) and returns true. On any reason to fall
+ *	back, returns false; out parameters are not modified.
  *
- *	Exported (non-static) because 's update probe in
- *	jsonb_toaster_lite_update_probe.c reuses the same locator step.
+ *	JBTL_POINTER_DIFF is accepted only when out_diff_info is non-NULL.
+ *	The defensive validation gate here mirrors the writer-side admission
+ *	(jbtl_update) and protects the geometry classifier downstream from
+ *	junk that should never appear under v1/v2a but is cheap to check.
+ *	Clear-corruption cases (bad embedded varatt_external, negative
+ *	diff offset, non-positive diff length, diff longer than the inline
+ *	tail can carry, inline tail smaller than the JbtlPointerDiff header)
+ *	all fall back rather than ERROR: the fallback path applies the
+ *	overlay correctly via the existing detoaster, which is responsible
+ *	for raising ERRCODE_DATA_CORRUPTED if the same predicates fail when
+ *	the full body is materialised. We do not want to raise corruption
+ *	errors from the fast-path side gate.
  */
 bool
 jbtl_unwrap_to_toast_pointer(struct varlena *raw,
 							 uint32 *out_mode,
-							 struct varatt_external *out_ext)
+							 struct varatt_external *out_ext,
+							 JbtlDiffInfo *out_diff_info)
 {
 	uint32		mode;
 	char	   *bare;
@@ -604,17 +781,63 @@ jbtl_unwrap_to_toast_pointer(struct varlena *raw,
 
 	mode = JBTL_CUSTOM_PTR_GET_HEADER(raw) & JBTL_POINTER_TYPE_MASK;
 
-	if (mode != JBTL_POINTER && mode != JBTL_POINTER_COMPRESSED_CHUNKS)
-		return false;
+	if (mode == JBTL_POINTER || mode == JBTL_POINTER_COMPRESSED_CHUNKS)
+	{
+		bare = JBTL_CUSTOM_PTR_GET_DATA(raw);
 
-	bare = JBTL_CUSTOM_PTR_GET_DATA(raw);
+		if (!VARATT_IS_EXTERNAL_ONDISK(bare))
+			return false;
 
-	if (!VARATT_IS_EXTERNAL_ONDISK(bare))
-		return false;
+		VARATT_EXTERNAL_GET_POINTER(*out_ext, bare);
+		*out_mode = mode;
+		return true;
+	}
 
-	VARATT_EXTERNAL_GET_POINTER(*out_ext, bare);
-	*out_mode = mode;
-	return true;
+	if (mode == JBTL_POINTER_DIFF && out_diff_info != NULL)
+	{
+		char	   *inline_data;
+		int32		inline_size;
+		JbtlPointerDiff *diff;
+		int32		diff_data_size;
+
+		bare = JBTL_CUSTOM_PTR_GET_DATA(raw);
+
+		if (!VARATT_IS_EXTERNAL_ONDISK(bare))
+			return false;
+
+		inline_size = (int32) JBTL_CUSTOM_PTR_GET_DATA_SIZE(raw)
+			- (int32) TOAST_POINTER_SIZE;
+
+		/*
+		 * Inline tail must at least carry the JbtlPointerDiff header.
+		 * A non-positive diff payload (inline_size == header) is a
+		 * pathological writer output; fall back rather than treat as
+		 * a no-op overlay.
+		 */
+		if (inline_size <= (int32) offsetof(JbtlPointerDiff, data))
+			return false;
+
+		inline_data = bare + TOAST_POINTER_SIZE;
+		diff = (JbtlPointerDiff *) inline_data;
+		diff_data_size = inline_size - (int32) offsetof(JbtlPointerDiff, data);
+
+		if (diff->offset < 0 || diff_data_size <= 0)
+			return false;
+
+		VARATT_EXTERNAL_GET_POINTER(*out_ext, bare);
+		*out_mode = JBTL_POINTER_DIFF;
+		out_diff_info->diff_lo = diff->offset;
+		out_diff_info->diff_len = diff_data_size;
+		out_diff_info->inline_diff = diff->data;
+		return true;
+	}
+
+	/*
+	 * JBTL_POINTER_DIFF when caller did not opt in;
+	 * JBTL_POINTER_DIFF_COMP (M7 out of scope);
+	 * JBTL_POINTER_SUBTREE; future / unknown modes — all fall back.
+	 */
+	return false;
 }
 
 
@@ -668,10 +891,11 @@ jbtl_object_field(PG_FUNCTION_ARGS)
 	struct varlena *raw = (struct varlena *) DatumGetPointer(raw_datum);
 	uint32		mode;
 	struct varatt_external ext_ptr;
+	JbtlDiffInfo diff_info;
 	JsonbValue *jbv;
 	bool		fallback = false;
 
-	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr))
+	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr, &diff_info))
 	{
 		/* Slow path: full detoast + core lookup. */
 		Jsonb	   *jb = DatumGetJsonbP(raw_datum);
@@ -686,6 +910,7 @@ jbtl_object_field(PG_FUNCTION_ARGS)
 	}
 
 	jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode,
+										mode == JBTL_POINTER_DIFF ? &diff_info : NULL,
 										VARDATA_ANY(key),
 										VARSIZE_ANY_EXHDR(key),
 										NULL, NULL, NULL, NULL,
@@ -729,10 +954,11 @@ jbtl_object_field_text(PG_FUNCTION_ARGS)
 	struct varlena *raw = (struct varlena *) DatumGetPointer(raw_datum);
 	uint32		mode;
 	struct varatt_external ext_ptr;
+	JbtlDiffInfo diff_info;
 	JsonbValue *jbv;
 	bool		fallback = false;
 
-	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr))
+	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr, &diff_info))
 	{
 		Jsonb	   *jb = DatumGetJsonbP(raw_datum);
 
@@ -746,6 +972,7 @@ jbtl_object_field_text(PG_FUNCTION_ARGS)
 	}
 
 	jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode,
+										mode == JBTL_POINTER_DIFF ? &diff_info : NULL,
 										VARDATA_ANY(key),
 										VARSIZE_ANY_EXHDR(key),
 										NULL, NULL, NULL, NULL,
@@ -842,13 +1069,13 @@ jbtl_object_field_probe(PG_FUNCTION_ARGS)
 		elog(ERROR, "function returning record called in context that cannot accept type record");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr))
+	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr, NULL))
 	{
 		fallback = true;
 	}
 	else
 	{
-		jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode,
+		jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode, NULL,
 											VARDATA_ANY(key),
 											VARSIZE_ANY_EXHDR(key),
 											&chunks_total,
@@ -941,6 +1168,7 @@ jbtl_jsonb_object_field_hook_fn(Datum raw_jb, text *key,
 	struct varlena *raw = (struct varlena *) DatumGetPointer(raw_jb);
 	uint32		mode;
 	struct varatt_external ext_ptr;
+	JbtlDiffInfo diff_info;
 	JsonbValue *jbv;
 	bool		fallback = false;
 
@@ -953,10 +1181,11 @@ jbtl_jsonb_object_field_hook_fn(Datum raw_jb, text *key,
 	 */
 	Assert(VARATT_IS_CUSTOM(raw));
 
-	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr))
+	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr, &diff_info))
 		return false;
 
 	jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode,
+										mode == JBTL_POINTER_DIFF ? &diff_info : NULL,
 										VARDATA_ANY(key),
 										VARSIZE_ANY_EXHDR(key),
 										NULL, NULL, NULL, NULL,
