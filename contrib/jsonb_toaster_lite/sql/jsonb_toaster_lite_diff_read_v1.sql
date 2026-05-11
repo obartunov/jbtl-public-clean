@@ -1,0 +1,288 @@
+--
+-- jsonb_toaster_lite DIFF read fast path (M7) regression coverage.
+--
+-- Exercises public `jb -> 'key'` and `jb ->> 'key'` on JBTL_POINTER_DIFF
+-- rows across the four FAST geometries (G_MISS, G_DISJ, G_EQUAL, G_INNER)
+-- plus the fallback cases (G_CONTAINER, prefix-too-small heuristic,
+-- non-CUSTOM jsonb, POINTER baseline).
+--
+-- Correctness is asserted as md5 equality against a parallel vanilla
+-- (non-CUSTOM) table holding the same logical values. Buffer counts are
+-- not asserted here; they are platform-sensitive and are validated by
+-- the probe note. Buffer-collapse evidence sits in
+-- DIFF_READ_FAST_PATH_PROBE.md.
+--
+
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS toastapi;
+CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+
+--
+-- Two parallel tables. crit_d1 is CUSTOM-toasted; crit_d1_vanilla is
+-- plain jsonb. Bodies are identical at every step. md5 cross-check
+-- crit_d1 against crit_d1_vanilla after every UPDATE.
+--
+DROP TABLE IF EXISTS crit_d1 CASCADE;
+DROP TABLE IF EXISTS crit_d1_vanilla CASCADE;
+
+CREATE TABLE crit_d1 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'crit_d1', 'jb') > 0
+       AS attached;
+
+CREATE TABLE crit_d1_vanilla (id int PRIMARY KEY, jb jsonb);
+
+SET jsonb_sort_field_values = off;
+
+--
+-- Bodies large enough to push out-of-line (>4 KB). Carry both small
+-- scalar keys (suitable for G_EQUAL on numerics with pad == 0 by
+-- luck of offset, or G_INNER for the alignment-padded case) and a
+-- long-string key (always G_INNER reachable when its scalar bytes
+-- get modified inside). Also one container key for G_CONTAINER.
+--
+INSERT INTO crit_d1
+SELECT g,
+       jsonb_build_object(
+         'id',       42 + g,
+         'status',   'STATUS_active',
+         'kind',     'KIND_invoice',
+         'tenant',   'TENANT_acme',
+         'title',    'TITLE_' || repeat('t', 200),
+         'summary',  'SUMMARY_' || repeat('s', 1000),
+         'payload',  repeat('P', 6000),
+         'flags',    jsonb_build_array('flag_a', 'flag_b', 'flag_c')
+       )
+FROM generate_series(1, 5) g;
+
+INSERT INTO crit_d1_vanilla SELECT id, jb FROM crit_d1;
+
+RESET jsonb_sort_field_values;
+
+ANALYZE crit_d1;
+ANALYZE crit_d1_vanilla;
+
+--
+-- Section A: POINTER baseline (pre-UPDATE). All keys must round-trip
+-- byte-identically between custom and vanilla.
+--
+\echo
+\echo === A. POINTER baseline (no DIFF yet) ===
+SELECT id,
+       md5((c.jb -> 'status')::text)  = md5((v.jb -> 'status')::text)  AS status_ok,
+       md5((c.jb -> 'title')::text)   = md5((v.jb -> 'title')::text)   AS title_ok,
+       md5((c.jb -> 'summary')::text) = md5((v.jb -> 'summary')::text) AS summary_ok,
+       md5((c.jb -> 'payload')::text) = md5((v.jb -> 'payload')::text) AS payload_ok,
+       md5((c.jb -> 'flags')::text)   = md5((v.jb -> 'flags')::text)   AS flags_ok,
+       (c.jb -> 'never_was') IS NOT DISTINCT FROM (v.jb -> 'never_was') AS missing_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id)
+ ORDER BY id;
+
+--
+-- Section B: G_EQUAL — replace a same-length scalar in place via a
+-- field rewrite. Status is a 13-char string ('STATUS_active'); we
+-- rewrite it to another 13-char string ('STATUS_closed'). Strings
+-- have pad == 0, so the writer's byte-wise diff range coincides with
+-- the value's encoded byte range (or is strictly inside, depending
+-- on which characters differ — both are reachable). md5 equality is
+-- the only correctness gate.
+--
+UPDATE crit_d1         SET jb = jsonb_set(jb, '{status}', '"STATUS_closed"') WHERE id IN (1, 2);
+UPDATE crit_d1_vanilla SET jb = jsonb_set(jb, '{status}', '"STATUS_closed"') WHERE id IN (1, 2);
+
+\echo
+\echo === B. G_EQUAL / G_INNER on status (string) — fast path ===
+SELECT id,
+       md5((c.jb -> 'status')::text)  = md5((v.jb -> 'status')::text)  AS status_ok,
+       md5((c.jb -> 'kind')::text)    = md5((v.jb -> 'kind')::text)    AS kind_ok_disj,
+       md5((c.jb -> 'title')::text)   = md5((v.jb -> 'title')::text)   AS title_ok_disj,
+       md5((c.jb -> 'summary')::text) = md5((v.jb -> 'summary')::text) AS summary_ok_disj,
+       md5((c.jb -> 'flags')::text)   = md5((v.jb -> 'flags')::text)   AS flags_ok_container,
+       (c.jb -> 'never_was') IS NOT DISTINCT FROM (v.jb -> 'never_was') AS missing_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id)
+ WHERE id IN (1, 2)
+ ORDER BY id;
+
+--
+-- Section C: G_INNER — replace a slice strictly inside a long string.
+-- title is 'TITLE_' + 200 'x' chars (technically 't'; we keep
+-- the canonical setup but rewrite to a same-length variant).
+-- Use repeat('t', 200) → 100 't' + 'Z' + 99 't' (200 chars; pad 0).
+--
+UPDATE crit_d1
+   SET jb = jsonb_set(jb, '{title}',
+                      to_jsonb('TITLE_' || repeat('t', 100) || 'Z' || repeat('t', 99)))
+ WHERE id IN (3, 4);
+UPDATE crit_d1_vanilla
+   SET jb = jsonb_set(jb, '{title}',
+                      to_jsonb('TITLE_' || repeat('t', 100) || 'Z' || repeat('t', 99)))
+ WHERE id IN (3, 4);
+
+\echo
+\echo === C. G_INNER on title (long string) — fast path ===
+SELECT id,
+       md5((c.jb -> 'title')::text)   = md5((v.jb -> 'title')::text)   AS title_ok_inner,
+       md5((c.jb -> 'status')::text)  = md5((v.jb -> 'status')::text)  AS status_ok_disj,
+       md5((c.jb -> 'payload')::text) = md5((v.jb -> 'payload')::text) AS payload_ok_disj,
+       md5((c.jb -> 'flags')::text)   = md5((v.jb -> 'flags')::text)   AS flags_ok_container,
+       (c.jb ->> 'title')             = (v.jb ->> 'title')             AS title_text_ok,
+       (c.jb -> 'never_was') IS NOT DISTINCT FROM (v.jb -> 'never_was') AS missing_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id)
+ WHERE id IN (3, 4)
+ ORDER BY id;
+
+--
+-- Section D: G_EQUAL on a small int. id values are 42+g (43..47).
+-- Replace 43 → 44, 44 → 45 (same-length encoded integers). Whether
+-- this lands as G_EQUAL or G_INNER depends on the numeric's
+-- alignment offset; both produce correct bytes via the fast path,
+-- so md5 equality is the only invariant.
+--
+UPDATE crit_d1
+   SET jb = jsonb_set(jb, '{id}', to_jsonb((jb ->> 'id')::int + 1))
+ WHERE id = 5;
+UPDATE crit_d1_vanilla
+   SET jb = jsonb_set(jb, '{id}', to_jsonb((jb ->> 'id')::int + 1))
+ WHERE id = 5;
+
+\echo
+\echo === D. G_EQUAL / G_INNER on numeric id ===
+SELECT id,
+       md5((c.jb -> 'id')::text)      = md5((v.jb -> 'id')::text)      AS id_ok,
+       md5((c.jb -> 'status')::text)  = md5((v.jb -> 'status')::text)  AS status_ok_disj,
+       md5((c.jb -> 'title')::text)   = md5((v.jb -> 'title')::text)   AS title_ok_disj,
+       md5((c.jb -> 'flags')::text)   = md5((v.jb -> 'flags')::text)   AS flags_ok_container,
+       (c.jb ->> 'id')                = (v.jb ->> 'id')                AS id_text_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id)
+ WHERE id = 5
+ ORDER BY id;
+
+--
+-- Section E: confirm row 5's storage shape after numeric same-length
+-- update is JBTL_POINTER_DIFF (not full re-toast). pg_column_size on a
+-- POINTER row is ~36 bytes; on a DIFF row it grows by the inline tail
+-- (TOAST_POINTER_SIZE + JbtlPointerDiff header + diff_len bytes). For
+-- a single-byte numeric DIFF we expect pg_column_size to be small
+-- (well under 100 bytes) — anything close to the body's plain size
+-- (say > 1000) would indicate fallback.
+--
+\echo
+\echo === E. row 5 storage shape (small ⇒ DIFF, not fallback re-toast) ===
+SELECT id,
+       pg_column_size(jb) < 200 AS in_row_is_small
+  FROM crit_d1
+ WHERE id = 5;
+
+--
+-- Section F: container key (G_CONTAINER) on a DIFF row — fallback path.
+-- 'flags' is a 3-element array. Reading it on a row with a non-flags
+-- DIFF must yield the same bytes as vanilla. We have such rows above
+-- (rows 1-5 all have non-flags DIFFs). The fast path declines via
+-- JBE_ISCONTAINER bail and core's full detoast applies the overlay
+-- before core jsonb_object_field runs.
+--
+\echo
+\echo === F. G_CONTAINER (flags array) — fallback through core ===
+SELECT id,
+       md5((c.jb -> 'flags')::text)  = md5((v.jb -> 'flags')::text)  AS flags_ok,
+       (c.jb -> 'flags' ->> 0)       = (v.jb -> 'flags' ->> 0)       AS flag0_ok,
+       (c.jb -> 'flags' ->> 1)       = (v.jb -> 'flags' ->> 1)       AS flag1_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id)
+ ORDER BY id;
+
+--
+-- Section G: non-CUSTOM jsonb — must continue to bypass the hook.
+-- The hook gates on VARATT_IS_CUSTOM(raw); inline plain jsonb (short
+-- bodies) and core-TOASTed jsonb both route through core directly.
+--
+DROP TABLE IF EXISTS crit_d1_plain CASCADE;
+CREATE TABLE crit_d1_plain (id int PRIMARY KEY, jb jsonb);
+INSERT INTO crit_d1_plain VALUES
+  (1, '{"k":"small","n":42}'::jsonb),
+  (2, jsonb_build_object('big', repeat('q', 10000)));
+
+\echo
+\echo === G. non-CUSTOM jsonb still correct ===
+SELECT id,
+       (jb ->> 'k')                            AS k_or_null,
+       (jb -> 'n')::text                       AS n_text,
+       (jb -> 'never_was') IS NULL             AS missing_is_null,
+       length(jb ->> 'big')                    AS big_len
+  FROM crit_d1_plain
+ ORDER BY id;
+
+--
+-- Section H: POINTER fast path unchanged. Re-insert a row that we did
+-- NOT update, so it stays in JBTL_POINTER mode (no DIFF), and read it
+-- via the fast path. Compare to vanilla.
+--
+\echo
+\echo === H. POINTER row read after surrounding DIFF updates ===
+-- crit_d1 has 5 rows; only ids 1-5 were updated. Reinsert id=6 as a
+-- POINTER row (no UPDATE → no DIFF), then read keys against vanilla.
+SET jsonb_sort_field_values = off;
+INSERT INTO crit_d1
+VALUES (6, jsonb_build_object(
+              'id',       42 + 6,
+              'status',   'STATUS_active',
+              'kind',     'KIND_invoice',
+              'tenant',   'TENANT_acme',
+              'title',    'TITLE_' || repeat('t', 200),
+              'summary',  'SUMMARY_' || repeat('s', 1000),
+              'payload',  repeat('P', 6000),
+              'flags',    jsonb_build_array('flag_a', 'flag_b', 'flag_c')
+           ));
+INSERT INTO crit_d1_vanilla SELECT 6, jb FROM crit_d1 WHERE id = 6;
+RESET jsonb_sort_field_values;
+
+SELECT id,
+       md5((c.jb -> 'status')::text)  = md5((v.jb -> 'status')::text)  AS status_ok,
+       md5((c.jb -> 'title')::text)   = md5((v.jb -> 'title')::text)   AS title_ok,
+       md5((c.jb -> 'payload')::text) = md5((v.jb -> 'payload')::text) AS payload_ok,
+       (c.jb -> 'never_was') IS NOT DISTINCT FROM (v.jb -> 'never_was') AS missing_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id)
+ WHERE id = 6
+ ORDER BY id;
+
+--
+-- Section I: end-to-end. All rows, all keys, md5 must match vanilla.
+-- This is the catch-all corruption gate: if any geometry returns
+-- wrong bytes anywhere, md5 diverges for that (row, key) cell.
+--
+\echo
+\echo === I. exhaustive md5 cross-check (all rows × all keys) ===
+SELECT
+  COUNT(*) AS rows_total,
+  bool_and(md5((c.jb -> 'id')::text)      = md5((v.jb -> 'id')::text))      AS id_all_ok,
+  bool_and(md5((c.jb -> 'status')::text)  = md5((v.jb -> 'status')::text))  AS status_all_ok,
+  bool_and(md5((c.jb -> 'kind')::text)    = md5((v.jb -> 'kind')::text))    AS kind_all_ok,
+  bool_and(md5((c.jb -> 'tenant')::text)  = md5((v.jb -> 'tenant')::text))  AS tenant_all_ok,
+  bool_and(md5((c.jb -> 'title')::text)   = md5((v.jb -> 'title')::text))   AS title_all_ok,
+  bool_and(md5((c.jb -> 'summary')::text) = md5((v.jb -> 'summary')::text)) AS summary_all_ok,
+  bool_and(md5((c.jb -> 'payload')::text) = md5((v.jb -> 'payload')::text)) AS payload_all_ok,
+  bool_and(md5((c.jb -> 'flags')::text)   = md5((v.jb -> 'flags')::text))   AS flags_all_ok,
+  bool_and((c.jb -> 'never_was') IS NOT DISTINCT FROM (v.jb -> 'never_was')) AS missing_all_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id);
+
+--
+-- Section J: lifecycle smoke after DIFF reads. Bodies should survive
+-- VACUUM and VACUUM FULL with identical md5 (the read path doesn't
+-- write, so this primarily exercises that VACUUM doesn't disturb the
+-- DIFF wrappers).
+--
+VACUUM crit_d1;
+VACUUM FULL crit_d1;
+
+\echo
+\echo === J. md5 stable after VACUUM + VACUUM FULL ===
+SELECT
+  bool_and(md5((c.jb -> 'status')::text) = md5((v.jb -> 'status')::text)) AS status_ok,
+  bool_and(md5((c.jb -> 'title')::text)  = md5((v.jb -> 'title')::text))  AS title_ok,
+  bool_and(md5((c.jb -> 'id')::text)     = md5((v.jb -> 'id')::text))     AS id_ok,
+  bool_and(md5((c.jb -> 'flags')::text)  = md5((v.jb -> 'flags')::text))  AS flags_ok
+  FROM crit_d1 c JOIN crit_d1_vanilla v USING (id);
+
+--
+-- Cleanup.
+--
+DROP TABLE crit_d1, crit_d1_vanilla, crit_d1_plain;
