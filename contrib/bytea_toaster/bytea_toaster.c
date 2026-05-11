@@ -349,59 +349,18 @@ bytea_toaster_detoast(ToasterContext tcxt, Datum toastptr,
 	return PointerGetDatum(result);
 }
 
-static Datum
-bytea_toaster_append(Datum d1, Datum d2)
-{
-	AppendableToastData t1_data;
-	bytea	   *t1;
-	bytea	   *t2 = DatumGetByteaPP(d2);
-	char	   *t2_data = VARDATA_ANY(t2);
-	int32		t2_size = VARSIZE_ANY_EXHDR(t2);
-
-	Assert(VARATT_IS_CUSTOM(DatumGetPointer(d1)));
-	VARATT_CUSTOM_GET_APPENDABLE_DATA(d1, t1_data);
-
-	if (t2_size <= 0)
-		return d1;
-
-	/* Simply append inline TOAST data if not compressed */
-	if (!VARATT_EXTERNAL_IS_COMPRESSED(t1_data.ptr))
-	{
-		Oid			toasterid = VARATT_CUSTOM_GET_TOASTERID(DatumGetPointer(d1));
-		char	   *res_inline_tail_data;
-		Datum		result =
-			bytea_toaster_make_pointer(toasterid, &t1_data.ptr,
-									   t1_data.version,
-									   (Size) t1_data.inline_tail_size + t2_size,
-									   &res_inline_tail_data);
-
-		if (t1_data.inline_tail_size)
-			memcpy(res_inline_tail_data,
-				   t1_data.inline_tail_data,
-				   t1_data.inline_tail_size);
-
-		memcpy(res_inline_tail_data + t1_data.inline_tail_size,
-			   t2_data, t2_size);
-
-		return result;
-	}
-
-	/* Detoast first arg and call ordinary byteacat() */
-	t1 = DatumGetByteaPP(d1);
-
-	return DirectFunctionCall2(byteacat, PointerGetDatum(t1), PointerGetDatum(t2));
-}
-
-static void *
-bytea_toaster_vtable(ToasterContext tcxt, Datum toast_ptr)
-{
-	ByteaToastRoutine *routine = palloc0(sizeof(*routine));
-
-	routine->magic = BYTEA_TOASTER_MAGIC;
-	routine->append = bytea_toaster_append;
-
-	return routine;
-}
+/*
+ * Note: bytea_toaster_append() and bytea_toaster_vtable() used to live
+ * here as the registrants of the appendable-bytea fast path on the
+ * byteacat (`||`) operator.  The cleaned toastapi minimization
+ * (commit 3ab8a37) removed the TsrRoutine.get_vtable field, so there
+ * is no way to register them and core byteacat (src/backend/utils/adt/
+ * bytea.c) no longer probes for them.  They became unreachable and
+ * were removed.  Direct INSERT/UPDATE through tsr_toast/tsr_update
+ * still produce appendable storage; only the `||`-operator fast path
+ * is currently absent.  See contrib/toastapi/README.toastapi Section X
+ * and contrib/bytea_toaster/README.bytea_toaster.
+ */
 
 PG_FUNCTION_INFO_V1(bytea_toaster_handler);
 Datum

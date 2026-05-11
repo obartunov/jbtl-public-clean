@@ -5,17 +5,53 @@ I. The Pluggable TOAST
 On Pluggable TOAST please check contrib/toastapi/README.toastapi
 
 The Appendable BYTEA Toaster is a part of a Pluggable TOAST extension
-pack for PostgreSQL. Appendable BYTEA Toaster is a Toaster for BYTEA
-data type with implemented APPEND opration ('||'). Modified Toaster
-stores tail of the TOASTed BYTEA value inline inside Toast Pointer,
-and uses it in APPEND. The UPDATE and APPEND operations instead of
-default TOAST mechanics actually update stored value, without
-invalidating existing and creating a new one.
-
-Note:
-BYTEA Toaster modifies PostgreSQL core to alter byteacat function
-to introduce new implemetation of APPEND for BYTEA.
+pack for PostgreSQL.  It is a Toaster for the BYTEA data type that
+stores the tail of a TOASTed BYTEA value inline inside the custom
+Toast Pointer.  Direct INSERT and UPDATE operations on a BYTEA column
+managed by this toaster therefore produce an appendable storage
+shape: the next UPDATE that writes a longer value can be served by
+extending the inline tail and (when it overflows) by appending new
+chunks, without invalidating the existing value_id or rewriting
+unchanged chunks.
 
 II. Installation
 
 BYTEA Toaster requires TOAST API (toastapi extension) to be installed.
+
+III. The byteacat ('||') operator
+
+Earlier postgrespro snapshots of bytea_toaster registered a
+fast-path implementation of the `||` operator: a custom `append`
+function discoverable through `TsrRoutine.get_vtable`, with core
+byteacat (src/backend/utils/adt/varlena.c) probing the toaster for
+this magic and calling the toaster's append directly when it
+matched.
+
+The cleaned toastapi minimization (commit 3ab8a37) removed the
+`get_vtable` field from `TsrRoutine`, and the cleaned core's
+`byteacat` (src/backend/utils/adt/bytea.c) does not probe for a
+custom append.  As a consequence:
+
+  - `bytea_col = bytea_col || new_bytes` UPDATEs now go through
+    standard `bytea_catenate` and ordinary tsr_toast/tsr_update.
+    The appendable storage shape is still produced, but the
+    "patch the inline tail in place" optimisation no longer
+    happens on `||`.
+
+  - Direct INSERT and full-value UPDATE through tsr_toast and
+    tsr_update continue to exercise the appendable storage path.
+
+  - The previous `bytea_toaster_append` / `bytea_toaster_vtable`
+    functions and the `BYTEA_TOASTER_MAGIC` / `ByteaToastRoutine`
+    types were unreachable in cleaned and have been removed.
+
+The cleaned line does NOT replace the `||` fast path with a new
+Toast API hook.  A bytea-specific operator fast path does not
+belong on the general Toast API surface; the Toast API is a
+lifecycle interface (toast / detoast / size / delete / copy /
+update / validate) and per-type operator fast paths should not
+accumulate as Toastapi_*_hook entries.  If appendable bytea is
+ever reopened, the right shape is a type-local bytea provider
+interface that the bytea type's operators can probe -- a
+property of the bytea type, not of the toaster contract.  This
+is out of current JBTL scope.
