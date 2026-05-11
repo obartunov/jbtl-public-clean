@@ -1,0 +1,5 @@
+# qgeom extension
+comment = 'qgeom CUSTOM-toaster probe (Phase 1.a: transient varlena type only)'
+default_version = '1.0'
+module_pathname = '$libdir/qgeom'
+relocatable = false
