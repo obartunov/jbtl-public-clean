@@ -1,0 +1,386 @@
+--
+-- VACUUM FULL preservation for cleaned jsonb_toaster_lite storage modes.
+--
+-- Locks in the safety property that justifies removing the relinfo
+-- hook (see contrib/toastapi/README.toastapi Section X.3): for the
+-- cleaned storage modes, VACUUM FULL rewrites the heap and the toast
+-- relation but the logical value is preserved end-to-end via
+-- materialize/retoast through tsr_toast.  Storage shape may
+-- normalize across the rewrite; logical value MUST NOT change.
+--
+-- Sections:
+--   S1  JBTL_POINTER                   (uncompressed chunked, default)
+--   S2  JBTL_POINTER_COMPRESSED_CHUNKS (per-chunk PGLZ)
+--   S3  JBTL_POINTER_DIFF              (single eligible same-length update)
+--   S4  JBTL_POINTER_DIFF rebased      (sequence of three DIFF emissions)
+--   S5  JBTL_POINTER_SUBTREE           (round-trip read only; refs catalog
+--                                       state after rewrite is out of
+--                                       scope for this regression)
+--
+-- Each section asserts only what is stable: md5 equality of jb::text
+-- before and after VACUUM FULL, and correctness of the public `->`
+-- read after VACUUM FULL.  Storage mode is NOT asserted after the
+-- rewrite -- the toaster is free to normalize.
+--
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS toastapi;
+NOTICE:  extension "toastapi" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+NOTICE:  extension "jsonb_toaster_lite" already exists, skipping
+SET jsonb_sort_field_values = off;
+-- ============================================================
+-- S1  JBTL_POINTER (uncompressed chunked, default mode)
+-- ============================================================
+DROP TABLE IF EXISTS vfull_s1 CASCADE;
+NOTICE:  table "vfull_s1" does not exist, skipping
+CREATE TABLE vfull_s1 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'vfull_s1', 'jb') > 0
+       AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+-- Incompressible payload large enough to force out-of-line chunks.
+INSERT INTO vfull_s1 SELECT g, jsonb_build_object(
+    'id',      g,
+    'status',  'STATUS_active',
+    'payload', repeat(chr(65 + (g % 26))::text, 8000)
+) FROM generate_series(1, 5) g;
+ANALYZE vfull_s1;
+-- Storage smoke: every row out-of-line.
+SELECT id,
+       pg_column_size(jb) < length(jb::text) / 10 AS is_custom_toasted
+  FROM vfull_s1
+ ORDER BY id;
+ id | is_custom_toasted 
+----+-------------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+(5 rows)
+
+-- Pre-VACUUM-FULL fingerprint.
+CREATE TEMP TABLE s1_pre AS
+SELECT id, md5(jb::text) AS pre_md5, jb -> 'status' AS pre_status
+  FROM vfull_s1
+ ORDER BY id;
+VACUUM FULL vfull_s1;
+-- Assertion 1: logical value byte-identical after rewrite.
+SELECT id,
+       md5(jb::text) = (SELECT pre_md5 FROM s1_pre p WHERE p.id = c.id)
+       AS s1_preserved
+  FROM vfull_s1 c
+ ORDER BY id;
+ id | s1_preserved 
+----+--------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+(5 rows)
+
+-- Assertion 2: public `->` still correct.
+SELECT id,
+       (jb -> 'status') = (SELECT pre_status FROM s1_pre p WHERE p.id = c.id)
+       AS s1_arrow_ok
+  FROM vfull_s1 c
+ ORDER BY id;
+ id | s1_arrow_ok 
+----+-------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+(5 rows)
+
+DROP TABLE s1_pre;
+DROP TABLE vfull_s1;
+-- ============================================================
+-- S2  JBTL_POINTER_COMPRESSED_CHUNKS
+-- ============================================================
+SET jsonb_toaster_lite.compress_chunks = on;
+DROP TABLE IF EXISTS vfull_s2 CASCADE;
+NOTICE:  table "vfull_s2" does not exist, skipping
+CREATE TABLE vfull_s2 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'vfull_s2', 'jb') > 0
+       AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+-- Highly compressible payload so per-chunk PGLZ is exercised.
+INSERT INTO vfull_s2 SELECT g, jsonb_build_object(
+    'id',      g,
+    'tag',     'TAG_active',
+    'payload', repeat('A', 60000)
+) FROM generate_series(1, 3) g;
+ANALYZE vfull_s2;
+-- Smoke: every row out-of-line, at least one compressed chunk per row.
+WITH per_row AS (
+    SELECT id,
+           (SELECT count(*)
+              FROM jbtl_chunk_inspect(jb)
+             WHERE is_compressed) AS n_compressed,
+           (SELECT count(*) FROM jbtl_chunk_inspect(jb)) AS n_chunks
+      FROM vfull_s2
+)
+SELECT id, n_chunks > 1 AS multi_chunk, n_compressed > 0 AS has_compressed
+  FROM per_row ORDER BY id;
+ id | multi_chunk | has_compressed 
+----+-------------+----------------
+  1 | t           | t
+  2 | t           | t
+  3 | t           | t
+(3 rows)
+
+CREATE TEMP TABLE s2_pre AS
+SELECT id, md5(jb::text) AS pre_md5, jb -> 'tag' AS pre_tag
+  FROM vfull_s2
+ ORDER BY id;
+VACUUM FULL vfull_s2;
+SELECT id,
+       md5(jb::text) = (SELECT pre_md5 FROM s2_pre p WHERE p.id = c.id)
+       AS s2_preserved
+  FROM vfull_s2 c
+ ORDER BY id;
+ id | s2_preserved 
+----+--------------
+  1 | t
+  2 | t
+  3 | t
+(3 rows)
+
+SELECT id,
+       (jb -> 'tag') = (SELECT pre_tag FROM s2_pre p WHERE p.id = c.id)
+       AS s2_arrow_ok
+  FROM vfull_s2 c
+ ORDER BY id;
+ id | s2_arrow_ok 
+----+-------------
+  1 | t
+  2 | t
+  3 | t
+(3 rows)
+
+DROP TABLE s2_pre;
+DROP TABLE vfull_s2;
+SET jsonb_toaster_lite.compress_chunks = off;
+-- ============================================================
+-- S3  JBTL_POINTER_DIFF (single eligible same-length update)
+-- ============================================================
+DROP TABLE IF EXISTS vfull_s3 CASCADE;
+NOTICE:  table "vfull_s3" does not exist, skipping
+CREATE TABLE vfull_s3 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'vfull_s3', 'jb') > 0
+       AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+INSERT INTO vfull_s3 SELECT g, jsonb_build_object(
+    'id',      g,
+    'status',  'STATUS_active',
+    'payload', repeat('P', 6000)
+) FROM generate_series(1, 5) g;
+ANALYZE vfull_s3;
+-- Push every row into JBTL_POINTER_DIFF by doing one eligible
+-- same-length scalar replace.  diffs_emitted should bump by 5.
+SELECT jbtl_update_calls_reset();
+ jbtl_update_calls_reset 
+-------------------------
+ 
+(1 row)
+
+UPDATE vfull_s3
+   SET jb = jsonb_set(jb, '{status}', '"STATUS_closed"'::jsonb);
+SELECT jbtl_update_calls() AS s3_calls,
+       jbtl_update_diffs_emitted() AS s3_diffs;
+ s3_calls | s3_diffs 
+----------+----------
+        5 |        5
+(1 row)
+
+-- Expect: calls = 5, diffs = 5.
+CREATE TEMP TABLE s3_pre AS
+SELECT id, md5(jb::text) AS pre_md5, jb -> 'status' AS pre_status
+  FROM vfull_s3
+ ORDER BY id;
+VACUUM FULL vfull_s3;
+SELECT id,
+       md5(jb::text) = (SELECT pre_md5 FROM s3_pre p WHERE p.id = c.id)
+       AS s3_preserved
+  FROM vfull_s3 c
+ ORDER BY id;
+ id | s3_preserved 
+----+--------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+(5 rows)
+
+SELECT id,
+       (jb -> 'status') = (SELECT pre_status FROM s3_pre p WHERE p.id = c.id)
+       AS s3_arrow_ok
+  FROM vfull_s3 c
+ ORDER BY id;
+ id | s3_arrow_ok 
+----+-------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+  5 | t
+(5 rows)
+
+DROP TABLE s3_pre;
+DROP TABLE vfull_s3;
+-- ============================================================
+-- S4  JBTL_POINTER_DIFF rebased (three consecutive DIFF emissions)
+-- ============================================================
+DROP TABLE IF EXISTS vfull_s4 CASCADE;
+NOTICE:  table "vfull_s4" does not exist, skipping
+CREATE TABLE vfull_s4 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'vfull_s4', 'jb') > 0
+       AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+INSERT INTO vfull_s4 SELECT g, jsonb_build_object(
+    'id',      g,
+    'status',  'STATUS_active',
+    'payload', repeat('Q', 6000)
+) FROM generate_series(1, 3) g;
+ANALYZE vfull_s4;
+-- Three consecutive eligible same-length updates on the same key.
+-- Each update should emit a DIFF; the second and third rebase over
+-- the same embedded base.
+SELECT jbtl_update_calls_reset();
+ jbtl_update_calls_reset 
+-------------------------
+ 
+(1 row)
+
+UPDATE vfull_s4 SET jb = jsonb_set(jb, '{status}', '"STATUS_step1"'::jsonb);
+UPDATE vfull_s4 SET jb = jsonb_set(jb, '{status}', '"STATUS_step2"'::jsonb);
+UPDATE vfull_s4 SET jb = jsonb_set(jb, '{status}', '"STATUS_step3"'::jsonb);
+SELECT jbtl_update_calls() AS s4_calls,
+       jbtl_update_diffs_emitted() AS s4_diffs;
+ s4_calls | s4_diffs 
+----------+----------
+        9 |        6
+(1 row)
+
+-- Expect: calls = 9 (3 rows x 3 updates), diffs = 6.  The first UPDATE
+-- on each row transitions POINTER -> DIFF without bumping diffs_emitted
+-- (matches T9 in update_v1); the second and third UPDATEs each emit a
+-- DIFF over the same embedded base.
+CREATE TEMP TABLE s4_pre AS
+SELECT id, md5(jb::text) AS pre_md5, jb -> 'status' AS pre_status
+  FROM vfull_s4
+ ORDER BY id;
+VACUUM FULL vfull_s4;
+SELECT id,
+       md5(jb::text) = (SELECT pre_md5 FROM s4_pre p WHERE p.id = c.id)
+       AS s4_preserved
+  FROM vfull_s4 c
+ ORDER BY id;
+ id | s4_preserved 
+----+--------------
+  1 | t
+  2 | t
+  3 | t
+(3 rows)
+
+SELECT id,
+       (jb -> 'status') = (SELECT pre_status FROM s4_pre p WHERE p.id = c.id)
+       AS s4_arrow_ok
+  FROM vfull_s4 c
+ ORDER BY id;
+ id | s4_arrow_ok 
+----+-------------
+  1 | t
+  2 | t
+  3 | t
+(3 rows)
+
+DROP TABLE s4_pre;
+DROP TABLE vfull_s4;
+-- ============================================================
+-- S5  JBTL_POINTER_SUBTREE (round-trip read only)
+--
+-- SUBTREE mode pins a child chain via the jbtl_subtree_refs
+-- catalog edge (parent_valueid, child_valueid).  VACUUM FULL on a
+-- SUBTREE-managed table rewrites the toast relation with fresh
+-- valueids; what happens to the catalog edges across the rewrite
+-- is a separate question (whether they need to be remapped, gc'd,
+-- or are silently orphaned).  That correctness work is out of
+-- scope for this VACUUM-FULL audit regression.
+--
+-- This section asserts ONLY:
+--   - the materialized logical value is preserved across
+--     VACUUM FULL;
+--   - the public `->`/`->>` read returns correct payload after
+--     VACUUM FULL.
+--
+-- It does NOT assert catalog state after the rewrite.  If the
+-- rewrite leaves orphan refs entries, that is a known follow-up
+-- (out of scope here).
+-- ============================================================
+SET jsonb_toaster_lite.enable_subtree_storage = on;
+SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
+DROP TABLE IF EXISTS vfull_s5 CASCADE;
+NOTICE:  table "vfull_s5" does not exist, skipping
+CREATE TABLE vfull_s5 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'vfull_s5', 'jb') > 0
+       AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+-- Same shape as the SUBTREE fixture from nondefault_schema: a large
+-- sub-value triggers the spill path during INSERT.
+INSERT INTO vfull_s5 SELECT 1, jsonb_build_object(
+  'key1', 100,
+  'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
+             FROM generate_series(1, 1000) s));
+-- Round-trip fingerprint.
+CREATE TEMP TABLE s5_pre AS
+SELECT id, md5(jb::text) AS pre_md5
+  FROM vfull_s5
+ ORDER BY id;
+VACUUM FULL vfull_s5;
+-- Assertion 1: logical value preserved.
+SELECT id,
+       md5(jb::text) = (SELECT pre_md5 FROM s5_pre p WHERE p.id = c.id)
+       AS s5_preserved
+  FROM vfull_s5 c;
+ id | s5_preserved 
+----+--------------
+  1 | t
+(1 row)
+
+-- Assertion 2: public `->` correctness.  Cheaper to probe a single
+-- known leaf than to compare the full nested aggregate.
+SELECT (jb -> 'key2' ->> 0) = md5(((100*1000 + 1)::text)) AS s5_arrow_ok
+  FROM vfull_s5 WHERE id = 1;
+ s5_arrow_ok 
+-------------
+ t
+(1 row)
+
+DROP TABLE s5_pre;
+DROP TABLE vfull_s5;
+RESET jsonb_toaster_lite.enable_subtree_storage;
+RESET jsonb_toaster_lite.subtree_spill_threshold;
