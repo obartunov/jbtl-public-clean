@@ -36,20 +36,33 @@
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
+#include "access/reloptions.h"
 #include "access/table.h"
 #include "access/toast_compression.h"
 #include "access/toast_hook.h"
 #include "access/toast_internals.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
+#include "commands/defrem.h"
+#include "commands/extension.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/jsonb.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/tuplestore.h"
 #include "varatt.h"
 
@@ -97,6 +110,425 @@ int  jbtl_subtree_spill_threshold = 4096;
 
 void		_PG_init(void);
 void		_PG_fini(void);
+
+
+/*
+ * SUBTREE VACUUM FULL / CLUSTER safety gate.
+ *
+ *	On heap rewrite (VACUUM FULL, CLUSTER) core copies CUSTOM
+ *	varlenas as-is and independently renumbers chunk_ids in the
+ *	toast relation -- without invoking any tsr_* callback.  That
+ *	would silently orphan jbtl_subtree_refs edges and leave the
+ *	embedded varatt_external inside SUBTREE varlenas pointing at
+ *	chunk_ids that no longer exist.  The cleaned hook surface
+ *	cannot intercept the rewrite path because no callback fires
+ *	(see commit message for the rewriteheap.c:619 reasoning).
+ *
+ *	This module therefore refuses the command upstream via a
+ *	ProcessUtility_hook.  The hook is installed ONLY when the
+ *	extension is loaded via shared_preload_libraries; otherwise
+ *	the gate is inactive and SUBTREE writes raise a one-shot
+ *	WARNING to inform the user.  Recovery from a refused command
+ *	is documented in the ERROR's errhint.
+ */
+
+/*
+ * Gate state: true iff jbtl_ProcessUtility is installed as our
+ * ProcessUtility_hook.  Set in _PG_init only when extension is
+ * loaded via shared_preload_libraries.  Read by writer paths that
+ * create SUBTREE rows to warn the user when the gate is not active.
+ */
+bool jbtl_gate_active = false;
+
+/* Chained predecessor, restored in _PG_fini. */
+static ProcessUtility_hook_type jbtl_prev_ProcessUtility = NULL;
+
+/*
+ * Resolve the OID of the jsonb_toaster_lite_handler function in
+ * pg_proc.  This is what pgpro_toast stores as 'pgpro_toasthandler'
+ * in pg_attribute.attoptions for a column managed by our toaster.
+ *
+ *	The cache is populated lazily by name lookup via the pg_proc
+ *	syscache.  Multiple matching rows are not expected (function
+ *	name is unique per schema; jsonb_toaster_lite installs into
+ *	exactly one schema), but if encountered we just pick the
+ *	first one -- the gate is permissive on ambiguity.
+ *
+ *	Also populated eagerly by the handler function itself on its
+ *	first invocation (fcinfo->flinfo->fn_oid), which is the
+ *	common path because core caches the TsrRoutine after the
+ *	first toaster handler call.
+ */
+static Oid jbtl_handler_oid_cache = InvalidOid;
+
+static Oid
+jbtl_get_handler_oid(void)
+{
+	CatCList   *catlist;
+	int			i;
+	Oid			result = InvalidOid;
+
+	if (OidIsValid(jbtl_handler_oid_cache))
+		return jbtl_handler_oid_cache;
+
+	catlist = SearchSysCacheList1(PROCNAMEARGSNSP,
+								  CStringGetDatum("jsonb_toaster_lite_handler"));
+	for (i = 0; i < catlist->n_members; i++)
+	{
+		HeapTuple	proctup = &catlist->members[i]->tuple;
+		Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+		if (procform->pronargs == 0 ||
+			procform->pronargs == 1)	/* internal arg, or no arg */
+		{
+			result = procform->oid;
+			break;
+		}
+	}
+	ReleaseSysCacheList(catlist);
+
+	if (OidIsValid(result))
+		jbtl_handler_oid_cache = result;
+	return result;
+}
+
+/*
+ * Return the 1-based attribute number of the first column of `rel`
+ * managed by the jsonb_toaster_lite toaster, or -1 if no such
+ * column exists.
+ *
+ *	pgpro_toast.set_toaster() records the toaster handler OID on
+ *	pg_attribute.attoptions as 'pgpro_toasthandler=<NNN>'.  We
+ *	read attoptions for each column via the pg_attribute syscache,
+ *	parse the option list via untransformRelOptions(), and compare
+ *	the recorded handler OID with the cached jbtl handler OID.
+ *	This avoids depending on toastapi private internals (which
+ *	are not exported as PGDLLEXPORT symbols) and on a hypothetical
+ *	pg_attribute.atttoaster column (which does not exist in this
+ *	cleaned tree).
+ */
+static int
+jbtl_find_managed_attr(Relation rel)
+{
+	Oid			handler_oid;
+	int			i;
+
+	handler_oid = jbtl_get_handler_oid();
+	if (!OidIsValid(handler_oid))
+		return -1;
+
+	for (i = 1; i <= RelationGetNumberOfAttributes(rel); i++)
+	{
+		HeapTuple	atttup;
+		Datum		optsdat;
+		bool		isnull;
+		List	   *opts;
+		ListCell   *lc;
+		Form_pg_attribute attform;
+		int			match = -1;
+
+		atttup = SearchSysCache2(ATTNUM,
+								 ObjectIdGetDatum(RelationGetRelid(rel)),
+								 Int16GetDatum((int16) i));
+		if (!HeapTupleIsValid(atttup))
+			continue;
+
+		attform = (Form_pg_attribute) GETSTRUCT(atttup);
+		if (attform->attisdropped || attform->attlen != -1)
+		{
+			ReleaseSysCache(atttup);
+			continue;
+		}
+
+		optsdat = SysCacheGetAttr(ATTNUM, atttup,
+								  Anum_pg_attribute_attoptions, &isnull);
+		if (isnull)
+		{
+			ReleaseSysCache(atttup);
+			continue;
+		}
+
+		opts = untransformRelOptions(optsdat);
+		foreach(lc, opts)
+		{
+			DefElem    *de = (DefElem *) lfirst(lc);
+			Oid			opthandler;
+
+			if (strcmp(de->defname, "pgpro_toasthandler") != 0)
+				continue;
+
+			opthandler = (Oid) strtoul(defGetString(de), NULL, 10);
+			if (opthandler == handler_oid)
+			{
+				match = i;
+				break;
+			}
+		}
+		list_free_deep(opts);
+		ReleaseSysCache(atttup);
+
+		if (match > 0)
+			return match;
+	}
+	return -1;
+}
+
+/*
+ * Sequentially scan `rel`, looking for a row where attribute `attno`
+ * holds a CUSTOM varlena whose mode is JBTL_POINTER_SUBTREE.
+ *
+ *	The probe walks live tuples under SnapshotAny (we don't care
+ *	about visibility: even dead-but-not-yet-vacuumed SUBTREE rows
+ *	have catalog edges that the rewrite would orphan).
+ *
+ *	The scan stops at the first match.  In the common case the
+ *	first heap page already settles the question; large tables
+ *	without SUBTREE rows pay one full seqscan, but that scan would
+ *	be dwarfed by the VACUUM FULL it gates.
+ */
+static bool
+jbtl_table_has_subtree_row(Relation rel, int attno)
+{
+	TableScanDesc scan;
+	HeapTuple	tup;
+	TupleDesc	desc = RelationGetDescr(rel);
+	Snapshot	snap;
+	bool		found = false;
+
+	/*
+	 * Scan under the current MVCC snapshot, not SnapshotAny.  Dead
+	 * tuples will be reclaimed by VACUUM FULL anyway, and their
+	 * jbtl_subtree_refs edges were already deleted by tsr_delete
+	 * when the UPDATE/DELETE made them dead -- so they cannot
+	 * leave orphans.  Only live SUBTREE rows are unsafe to rewrite.
+	 *
+	 *	Note: we use GetActiveSnapshot() rather than
+	 *	GetTransactionSnapshot() because the gate runs inside
+	 *	ProcessUtility_hook, where the active snapshot is the one
+	 *	the eventual VACUUM FULL will see.
+	 */
+	snap = GetActiveSnapshot();
+	scan = table_beginscan(rel, snap, 0, NULL, 0);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Datum		d;
+		bool		isnull;
+		struct varlena *attr;
+
+		d = heap_getattr(tup, attno, desc, &isnull);
+		if (isnull)
+			continue;
+
+		attr = (struct varlena *) DatumGetPointer(d);
+		if (VARATT_IS_CUSTOM(attr))
+		{
+			uint32		mode =
+				JBTL_CUSTOM_PTR_GET_HEADER(attr) & JBTL_POINTER_TYPE_MASK;
+
+			if (mode == JBTL_POINTER_SUBTREE)
+			{
+				found = true;
+				break;
+			}
+		}
+	}
+	table_endscan(scan);
+	return found;
+}
+
+/*
+ * Refuse VACUUM FULL / CLUSTER on `target_oid` if it currently
+ * carries any SUBTREE-mode row in a jsonb_toaster_lite-managed
+ * column.
+ *
+ *	The target's AccessExclusiveLock is acquired by the gate
+ *	before the row scan, so a concurrent INSERT cannot slip a
+ *	SUBTREE row past us.  The lock is held until end-of-transaction;
+ *	the subsequent VACUUM FULL re-acquires (which is a no-op since
+ *	we already hold it) and proceeds.
+ *
+ *	If `target_oid` has no jsonb_toaster_lite column at all, the
+ *	gate returns immediately without scanning.
+ */
+static void
+jbtl_check_relation_for_subtree(Oid target_oid, const char *cmd_name)
+{
+	Relation	rel;
+	int			attno;
+	bool		has_subtree;
+
+	if (!OidIsValid(target_oid))
+		return;
+
+	/*
+	 * Take AccessExclusiveLock so that no concurrent transaction
+	 * can sneak a SUBTREE row in between our scan and the actual
+	 * VACUUM FULL.  This is the lock VACUUM FULL would have taken
+	 * anyway; acquiring it here is conservative but correct.
+	 */
+	rel = try_table_open(target_oid, AccessExclusiveLock);
+	if (rel == NULL)
+		return;
+
+	/* Skip non-plain-table relkinds; only base tables can have toaster. */
+	if (rel->rd_rel->relkind != RELKIND_RELATION &&
+		rel->rd_rel->relkind != RELKIND_MATVIEW)
+	{
+		table_close(rel, NoLock);
+		return;
+	}
+
+	attno = jbtl_find_managed_attr(rel);
+	if (attno < 0)
+	{
+		/* No jbtl-managed column: nothing to protect. */
+		table_close(rel, NoLock);
+		return;
+	}
+
+	has_subtree = jbtl_table_has_subtree_row(rel, attno);
+	table_close(rel, NoLock);
+
+	if (has_subtree)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s is not supported on jsonb_toaster_lite "
+						"SUBTREE-managed data",
+						cmd_name),
+				 errdetail("Core's heap-rewrite path copies SUBTREE "
+						   "varlenas as-is and renumbers chunk_ids in "
+						   "the toast relation, leaving entries in "
+						   "jbtl_subtree_refs pointing at non-existent "
+						   "chunks."),
+				 errhint("Re-toast every SUBTREE row out of SUBTREE "
+						 "storage by forcing a fresh datum through "
+						 "the writer, e.g.:\n"
+						 "    SET jsonb_toaster_lite.enable_subtree_storage = off;\n"
+						 "    UPDATE <table> SET <jb_column> = <jb_column>::text::jsonb;\n"
+						 "(An UPDATE that keeps the same in-memory "
+						 "datum -- such as SET col = col -- does NOT "
+						 "re-toast, because the value passes through "
+						 "the writer unchanged.)  "
+						 "%s is then permitted.",
+						 cmd_name)));
+}
+
+/*
+ * ProcessUtility_hook callback.
+ *
+ *	Intercepts T_VacuumStmt with VACOPT_FULL and T_ClusterStmt.  Other
+ *	statements pass through to the prior installed hook (or the
+ *	standard implementation).
+ *
+ *	Multi-relation VACUUM (FULL) is checked per relation; first
+ *	offender raises.  ClusterStmt with a NULL relation (database-wide
+ *	CLUSTER on previously-CLUSTERed tables) is left for the next
+ *	hook -- the gate fires only on a named target.  Database-wide
+ *	CLUSTER is rare and there is no clean way to enumerate "all
+ *	tables that have ever been clustered" from within a
+ *	ProcessUtility_hook without re-implementing get_tables_to_cluster;
+ *	a later milestone can extend this.
+ */
+static void
+jbtl_ProcessUtility(PlannedStmt *pstmt,
+					const char *queryString,
+					bool readOnlyTree,
+					ProcessUtilityContext context,
+					ParamListInfo params,
+					QueryEnvironment *queryEnv,
+					DestReceiver *dest,
+					QueryCompletion *qc)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+
+	if (IsA(parsetree, VacuumStmt))
+	{
+		VacuumStmt *vs = (VacuumStmt *) parsetree;
+		bool		is_full = false;
+		ListCell   *lc;
+
+		foreach(lc, vs->options)
+		{
+			DefElem    *opt = (DefElem *) lfirst(lc);
+
+			if (strcmp(opt->defname, "full") == 0)
+			{
+				is_full = defGetBoolean(opt);
+				if (is_full)
+					break;
+			}
+		}
+
+		if (is_full && vs->is_vacuumcmd)
+		{
+			ListCell   *lc2;
+
+			foreach(lc2, vs->rels)
+			{
+				VacuumRelation *vr = (VacuumRelation *) lfirst(lc2);
+				Oid			target_oid;
+
+				if (vr->relation == NULL)
+					continue;	/* "VACUUM FULL" without table: shouldn't happen with FULL but skip */
+
+				/*
+				 * vr->oid may already be resolved by the caller; if not,
+				 * fall back to RangeVarGetRelid (read-only no-error
+				 * resolution; the actual VACUUM will re-resolve and
+				 * error if missing).
+				 */
+				target_oid = vr->oid;
+				if (!OidIsValid(target_oid))
+					target_oid = RangeVarGetRelid(vr->relation,
+												  NoLock, true /* missing_ok */);
+
+				jbtl_check_relation_for_subtree(target_oid, "VACUUM FULL");
+			}
+		}
+	}
+	else if (IsA(parsetree, RepackStmt))
+	{
+		RepackStmt *rs = (RepackStmt *) parsetree;
+
+		/*
+		 * RepackStmt covers CLUSTER, REPACK, and the internal
+		 * VACUUMFULL dispatch (the VacuumStmt path above catches
+		 * the top-level VACUUM FULL command; this branch is the
+		 * direct CLUSTER / REPACK form).
+		 *
+		 * Database-wide CLUSTER (relation == NULL) is left for the
+		 * next hook -- the gate fires only on a named target.
+		 * Enumerating "all tables that have ever been clustered"
+		 * here would duplicate get_tables_to_cluster; a later
+		 * milestone can extend this.
+		 */
+		if (rs->relation != NULL &&
+			(rs->command == REPACK_COMMAND_CLUSTER ||
+			 rs->command == REPACK_COMMAND_REPACK ||
+			 rs->command == REPACK_COMMAND_VACUUMFULL))
+		{
+			Oid			target_oid;
+			const char *cmd_name =
+				(rs->command == REPACK_COMMAND_CLUSTER) ? "CLUSTER" :
+				(rs->command == REPACK_COMMAND_REPACK)  ? "REPACK"  :
+														  "VACUUM FULL";
+
+			target_oid = RangeVarGetRelid(rs->relation->relation,
+										  NoLock, true /* missing_ok */);
+			jbtl_check_relation_for_subtree(target_oid, cmd_name);
+		}
+	}
+
+	/* Chain. */
+	if (jbtl_prev_ProcessUtility)
+		(*jbtl_prev_ProcessUtility) (pstmt, queryString, readOnlyTree,
+									 context, params, queryEnv,
+									 dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+								context, params, queryEnv,
+								dest, qc);
+}
 
 void
 _PG_init(void)
@@ -152,6 +584,27 @@ _PG_init(void)
 	 * does not guarantee _PG_fini will be called).
 	 */
 	Toastapi_jsonb_object_field_hook = jbtl_jsonb_object_field_hook_fn;
+
+	/*
+	 * ProcessUtility_hook is the VACUUM FULL / CLUSTER safety gate
+	 * for SUBTREE-managed data (see banner above jbtl_ProcessUtility).
+	 *
+	 * It MUST be installed via shared_preload_libraries to guarantee
+	 * the hook is active in every backend.  A backend that has not
+	 * yet LOAD-ed the module would silently bypass the gate, leaving
+	 * the orphan-refs leak open.  We therefore install the hook
+	 * ONLY when this _PG_init runs as part of shared_preload_libraries
+	 * processing.  If the module was loaded another way (LOAD, or
+	 * implicit load on first reference to a SQL-callable function),
+	 * we set jbtl_gate_active = false so that paths which create
+	 * SUBTREE rows can emit a clear WARNING about the unsafe state.
+	 */
+	if (process_shared_preload_libraries_in_progress)
+	{
+		jbtl_prev_ProcessUtility = ProcessUtility_hook;
+		ProcessUtility_hook = jbtl_ProcessUtility;
+		jbtl_gate_active = true;
+	}
 }
 
 void
@@ -164,6 +617,16 @@ _PG_fini(void)
 	 */
 	if (Toastapi_jsonb_object_field_hook == jbtl_jsonb_object_field_hook_fn)
 		Toastapi_jsonb_object_field_hook = NULL;
+
+	/*
+	 * Restore the ProcessUtility chain.  Best-effort: only release
+	 * if we still own the top of the chain (another extension may
+	 * have stacked on top of us, in which case _PG_fini cannot
+	 * unwind cleanly -- PostgreSQL does not guarantee unloading
+	 * order anyway).
+	 */
+	if (ProcessUtility_hook == jbtl_ProcessUtility)
+		ProcessUtility_hook = jbtl_prev_ProcessUtility;
 }
 
 /* ---- callbacks ---------------------------------------------------------- */
@@ -372,6 +835,37 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 			return (Datum) 0;
 		}
 	}
+
+	/*
+	 * About to create a SUBTREE row + insert refs edges.  If the
+	 * ProcessUtility gate is not active (extension not loaded via
+	 * shared_preload_libraries in this backend), warn once per
+	 * statement: a subsequent VACUUM FULL or CLUSTER will silently
+	 * leave orphan edges in jbtl_subtree_refs.
+	 *
+	 *	Note: this only warns the writer; it does NOT refuse the
+	 *	write, because the writer state is otherwise correct and
+	 *	the data is readable.  The user can recover with
+	 *	jbtl_subtree_refs_gc() after the rewrite, or add
+	 *	shared_preload_libraries = 'jsonb_toaster_lite' and
+	 *	restart to enable the gate.
+	 */
+	if (!jbtl_gate_active)
+		ereport(WARNING,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("jsonb_toaster_lite: SUBTREE write without "
+						"VACUUM FULL safety gate"),
+				 errdetail("The ProcessUtility hook that refuses "
+						   "VACUUM FULL / CLUSTER on SUBTREE-managed "
+						   "data is only installed when "
+						   "jsonb_toaster_lite is loaded via "
+						   "shared_preload_libraries.  This backend "
+						   "did not load it that way, so a subsequent "
+						   "VACUUM FULL on this table could leave "
+						   "orphan entries in jbtl_subtree_refs."),
+				 errhint("Add 'jsonb_toaster_lite' to "
+						 "shared_preload_libraries and restart the "
+						 "server before relying on the gate.")));
 
 	/*
 	 * Open the heap row's toast relation + first index for child
@@ -2394,6 +2888,16 @@ Datum
 jsonb_toaster_lite_handler(PG_FUNCTION_ARGS)
 {
 	TsrRoutine *tsr = MakeTsrRoutine();
+
+	/*
+	 * Self-identify our OID for the VACUUM FULL gate.  We need the
+	 * handler's pg_proc OID to walk pg_attribute.attoptions and find
+	 * columns managed by us; capturing fn_oid here is the simplest
+	 * way that does not require name-based lookup (which is fragile
+	 * and was crashing on argtypes==NULL/nargs==-1 in LookupFuncName).
+	 */
+	if (!OidIsValid(jbtl_handler_oid_cache) && fcinfo->flinfo != NULL)
+		jbtl_handler_oid_cache = fcinfo->flinfo->fn_oid;
 
 	tsr->tsr_validate = jbtl_validate;
 	tsr->tsr_toast = jbtl_toast;

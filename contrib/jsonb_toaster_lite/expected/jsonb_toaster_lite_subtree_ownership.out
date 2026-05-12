@@ -10,7 +10,7 @@
 --	T1  repeated UPDATE on byte-identical sub-object
 --	T2  DELETE + VACUUM
 --	T3  aborted UPDATE
---	T4  VACUUM FULL (orphan-edge behaviour + gc)
+--	T4  VACUUM FULL / CLUSTER refusal + recovery via SUBTREE off
 --	T5  flip-flop UPDATE between two byte-distinct shapes
 --
 -- The tests do NOT exercise M-B-style reuse (which does not exist
@@ -34,10 +34,11 @@
 -- gc the catalog count starts at 0 for the section's purposes.
 --
 \set ON_ERROR_STOP on
+-- Deterministic starting state: suppress NOTICE for "already exists".
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS toastapi;
-NOTICE:  extension "toastapi" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
-NOTICE:  extension "jsonb_toaster_lite" already exists, skipping
+RESET client_min_messages;
 SET jsonb_sort_field_values = off;
 SET jsonb_toaster_lite.enable_subtree_storage = on;
 SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
@@ -65,7 +66,7 @@ SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
 SELECT jbtl_subtree_refs_gc() AS noise_cleared;
  noise_cleared 
 ---------------
-             1
+             0
 (1 row)
 
 SELECT count(*) AS t1_initial_total, jbtl_subtree_refs_check() AS t1_initial_dead
@@ -314,26 +315,21 @@ SELECT 'after_rollback_vacuum' AS phase,
 DROP TABLE t3_st;
 DROP TABLE t3_pre;
 -- ============================================================
--- T4  VACUUM FULL
+-- T4  VACUUM FULL — REFUSED on SUBTREE-managed table
 --
 -- Scenario:
 --   Several rows with SUBTREE.  VACUUM FULL.
 --
--- What is being pinned:
---   - md5(jb::text) preserved per row across VACUUM FULL;
---   - public `->` correctness after rewrite;
---   - the state of jbtl_subtree_refs after the rewrite is
---     explicitly recorded.  The rewrite goes through
---     detoast + retoast, which:
---       1. allocates a NEW toast relation OID for the rewritten
---          heap (so child_toastrelid of old edges no longer
---          matches any live table's reltoastrelid);
---       2. inserts fresh edges for each rewritten row;
---       3. leaves OLD edges in the catalog pointing at the dropped
---          toast relation (orphans).
---   - jbtl_subtree_refs_check() reports the orphan count;
---   - jbtl_subtree_refs_gc() cleans them up.
---   - logical value is still preserved after gc.
+-- What is being pinned (M9.1-fix behaviour):
+--   - VACUUM FULL is REFUSED with ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE
+--     while jbtl_subtree_refs has any edge for the target's
+--     reltoastrelid;
+--   - the refusal aborts cleanly, no orphan introduced;
+--   - logical value remains readable after the refused attempt
+--     (no corruption);
+--   - CLUSTER is refused similarly;
+--   - after dropping SUBTREE rows and gc, VACUUM FULL is permitted
+--     and preserves logical value across the rewrite.
 -- ============================================================
 SELECT jbtl_subtree_refs_gc() AS noise_cleared;
  noise_cleared 
@@ -360,20 +356,52 @@ CREATE TEMP TABLE t4_pre AS
 SELECT id, md5(jb::text) AS md5_pre,
        jb -> 'key2' ->> 0 AS arrow_pre
   FROM t4_st ORDER BY id;
--- Pre-rewrite catalog state.
-SELECT 'pre_vacuum_full' AS phase,
+-- Pre-state: 3 edges (one per row).
+SELECT 'pre_attempt' AS phase,
        (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
         WHERE c.relname='t4_st' AND r.parent_toastrelid = c.reltoastrelid)
            AS edges_for_t4,
-       (SELECT count(*) FROM jbtl_subtree_refs) AS edges_total,
        jbtl_subtree_refs_check() AS dead;
-      phase      | edges_for_t4 | edges_total | dead 
------------------+--------------+-------------+------
- pre_vacuum_full |            3 |           3 |    0
+    phase    | edges_for_t4 | dead 
+-------------+--------------+------
+ pre_attempt |            3 |    0
 (1 row)
 
-VACUUM FULL t4_st;
--- Post-rewrite: logical preservation.
+-- Assertion 1: VACUUM FULL refused (SQLSTATE 55000).
+DO $$
+BEGIN
+    VACUUM FULL t4_st;
+    RAISE NOTICE 't4_vfull_unexpectedly_succeeded';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 't4_vfull_refused_as_expected';
+END;
+$$;
+NOTICE:  t4_vfull_refused_as_expected
+-- Assertion 2: CLUSTER refused symmetrically.
+CREATE INDEX t4_id_idx ON t4_st (id);
+DO $$
+BEGIN
+    CLUSTER t4_st USING t4_id_idx;
+    RAISE NOTICE 't4_cluster_unexpectedly_succeeded';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 't4_cluster_refused_as_expected';
+END;
+$$;
+NOTICE:  t4_cluster_refused_as_expected
+-- Assertion 3: catalog unchanged after refusals.  Each refusal
+-- aborted its own VACUUM/CLUSTER transaction; the catalog is
+-- exactly as before.
+SELECT 'after_refused_attempts' AS phase,
+       (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
+        WHERE c.relname='t4_st' AND r.parent_toastrelid = c.reltoastrelid)
+           AS edges_for_t4,
+       jbtl_subtree_refs_check() AS dead;
+         phase          | edges_for_t4 | dead 
+------------------------+--------------+------
+ after_refused_attempts |            3 |    0
+(1 row)
+
+-- Assertion 4: logical value still readable (no corruption).
 SELECT id,
        md5(jb::text) = (SELECT md5_pre FROM t4_pre p WHERE p.id = c.id)
        AS t4_md5_preserved,
@@ -388,55 +416,45 @@ SELECT id,
   3 | t                | t
 (3 rows)
 
--- Post-rewrite: catalog state.  Record what is observable.
--- After VACUUM FULL, the old toast relation is gone and a new one
--- was allocated.  Live edges are for the NEW reltoastrelid; old
--- edges are orphans whose child_toastrelid is the dropped old
--- toast.
-SELECT 'post_vacuum_full_before_gc' AS phase,
+-- Recovery: force a re-toast through the writer.  An identity
+-- UPDATE (SET col = col) does NOT work because the SUBTREE
+-- varlena passes through unchanged; casting to text and back
+-- yields a plain in-memory jsonb that the writer routes to
+-- POINTER mode (GUC is off).
+SET jsonb_toaster_lite.enable_subtree_storage = off;
+UPDATE t4_st SET jb = jb::text::jsonb;
+SELECT jbtl_subtree_refs_gc() AS recovery_gc;
+ recovery_gc 
+-------------
+           0
+(1 row)
+
+SELECT 'post_recovery' AS phase,
        (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
         WHERE c.relname='t4_st' AND r.parent_toastrelid = c.reltoastrelid)
-           AS edges_live_for_t4,
-       (SELECT count(*) FROM jbtl_subtree_refs) AS edges_total,
+           AS edges_for_t4,
        jbtl_subtree_refs_check() AS dead;
-           phase            | edges_live_for_t4 | edges_total | dead 
-----------------------------+-------------------+-------------+------
- post_vacuum_full_before_gc |                 3 |           3 |    3
+     phase     | edges_for_t4 | dead 
+---------------+--------------+------
+ post_recovery |            0 |    0
 (1 row)
 
--- Run gc.
-SELECT jbtl_subtree_refs_gc() AS t4_gc_removed;
- t4_gc_removed 
----------------
-             3
-(1 row)
-
--- Post-gc.  Live edges for t4_st must remain unchanged; orphan
--- count must be 0.
-SELECT 'post_vacuum_full_after_gc' AS phase,
-       (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
-        WHERE c.relname='t4_st' AND r.parent_toastrelid = c.reltoastrelid)
-           AS edges_live_for_t4,
-       (SELECT count(*) FROM jbtl_subtree_refs) AS edges_total,
-       jbtl_subtree_refs_check() AS dead;
-           phase           | edges_live_for_t4 | edges_total | dead 
----------------------------+-------------------+-------------+------
- post_vacuum_full_after_gc |                 0 |           0 |    0
-(1 row)
-
--- Logical value still preserved after gc.
+-- Assertion 5: VACUUM FULL now succeeds, preserves logical value.
+VACUUM FULL t4_st;
 SELECT id,
        md5(jb::text) = (SELECT md5_pre FROM t4_pre p WHERE p.id = c.id)
-       AS t4_md5_preserved_after_gc
+       AS t4_md5_preserved_after_vfull
   FROM t4_st c
  ORDER BY id;
- id | t4_md5_preserved_after_gc 
-----+---------------------------
+ id | t4_md5_preserved_after_vfull 
+----+------------------------------
   1 | t
   2 | t
   3 | t
 (3 rows)
 
+-- Restore for subsequent sections.
+SET jsonb_toaster_lite.enable_subtree_storage = on;
 DROP TABLE t4_st;
 DROP TABLE t4_pre;
 -- ============================================================

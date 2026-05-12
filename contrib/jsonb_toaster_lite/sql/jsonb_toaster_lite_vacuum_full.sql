@@ -13,9 +13,9 @@
 --   S2  JBTL_POINTER_COMPRESSED_CHUNKS (per-chunk PGLZ)
 --   S3  JBTL_POINTER_DIFF              (single eligible same-length update)
 --   S4  JBTL_POINTER_DIFF rebased      (sequence of three DIFF emissions)
---   S5  JBTL_POINTER_SUBTREE           (round-trip read only; refs catalog
---                                       state after rewrite is out of
---                                       scope for this regression)
+--   S5  JBTL_POINTER_SUBTREE           (refusal + recovery + final
+--                                       VACUUM FULL succeeds)
+--   S6  Gate must not false-positive on leftover catalog edges
 --
 -- Each section asserts only what is stable: md5 equality of jb::text
 -- before and after VACUUM FULL, and correctness of the public `->`
@@ -25,8 +25,14 @@
 
 \set ON_ERROR_STOP on
 
+-- Deterministic starting state: extensions may or may not be present
+-- depending on test order; the NOTICE on "already exists" makes the
+-- expected output state-dependent.  Suppress the messages instead of
+-- pinning a particular state.
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS toastapi;
 CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
+RESET client_min_messages;
 
 SET jsonb_sort_field_values = off;
 
@@ -237,29 +243,28 @@ DROP TABLE s4_pre;
 DROP TABLE vfull_s4;
 
 -- ============================================================
--- S5  JBTL_POINTER_SUBTREE (round-trip read only)
+-- S5  JBTL_POINTER_SUBTREE — VACUUM FULL is REFUSED
 --
--- SUBTREE mode pins a child chain via the jbtl_subtree_refs
--- catalog edge (parent_valueid, child_valueid).  VACUUM FULL on a
--- SUBTREE-managed table rewrites the toast relation with fresh
--- valueids; what happens to the catalog edges across the rewrite
--- is a separate question (whether they need to be remapped, gc'd,
--- or are silently orphaned).  That correctness work is out of
--- scope for this VACUUM-FULL audit regression.
+-- SUBTREE rows pin a child chain via the jbtl_subtree_refs catalog
+-- edge.  Core's heap-rewrite path does not invoke jsonb_toaster_lite
+-- delete/copy callbacks on the source SUBTREE row, and the
+-- toast-relation rewrite renumbers chunk value_ids; together these
+-- would leave the catalog with orphan edges.
 --
--- This section asserts ONLY:
---   - the materialized logical value is preserved across
---     VACUUM FULL;
---   - the public `->`/`->>` read returns correct payload after
---     VACUUM FULL.
---
--- It does NOT assert catalog state after the rewrite.  If the
--- rewrite leaves orphan refs entries, that is a known follow-up
--- (out of scope here).
+-- The extension installs a ProcessUtility_hook that refuses
+-- VACUUM FULL / CLUSTER on relations whose reltoastrelid has any
+-- jbtl_subtree_refs edge.  This section pins that refusal and the
+-- recovery path: drop SUBTREE rows + gc + retry succeeds.
 -- ============================================================
 
 SET jsonb_toaster_lite.enable_subtree_storage = on;
 SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
+
+-- Clear any residual edges from earlier sections so the test starts
+-- from a known state.  (S1-S4 do not create SUBTREE edges, but the
+-- catalog persists across DROP TABLE and may carry edges from prior
+-- runs in the same database.)
+SELECT jbtl_subtree_refs_gc() AS noise_cleared;
 
 DROP TABLE IF EXISTS vfull_s5 CASCADE;
 CREATE TABLE vfull_s5 (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
@@ -273,27 +278,121 @@ INSERT INTO vfull_s5 SELECT 1, jsonb_build_object(
   'key2', (SELECT jsonb_agg(md5((100*1000 + s)::text))
              FROM generate_series(1, 1000) s));
 
--- Round-trip fingerprint.
+-- Pre-state: 1 edge for this table.
+SELECT 'pre_vacuum_full' AS phase,
+       (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
+        WHERE c.relname='vfull_s5' AND r.parent_toastrelid = c.reltoastrelid)
+           AS edges_for_vfull_s5;
+
+-- Save fingerprint before the (refused) attempt.
 CREATE TEMP TABLE s5_pre AS
 SELECT id, md5(jb::text) AS pre_md5
   FROM vfull_s5
  ORDER BY id;
 
-VACUUM FULL vfull_s5;
+-- Assertion 1: VACUUM FULL is REFUSED with our error.  Wrap in a
+-- block so the ERROR does not abort the script; the SQLSTATE is
+-- 55000 (ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE).
+DO $$
+BEGIN
+    VACUUM FULL vfull_s5;
+    RAISE NOTICE 's5_vfull_unexpectedly_succeeded';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 's5_vfull_refused_as_expected';
+END;
+$$;
 
--- Assertion 1: logical value preserved.
+-- Assertion 2: catalog edge unchanged (the refusal aborted the
+-- VACUUM FULL transaction; no orphan introduced).
+SELECT 'after_refused_attempt' AS phase,
+       (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
+        WHERE c.relname='vfull_s5' AND r.parent_toastrelid = c.reltoastrelid)
+           AS edges_for_vfull_s5,
+       jbtl_subtree_refs_check() AS dead;
+
+-- Assertion 3: logical value still readable (refusal did not corrupt
+-- anything).
 SELECT id,
        md5(jb::text) = (SELECT pre_md5 FROM s5_pre p WHERE p.id = c.id)
-       AS s5_preserved
-  FROM vfull_s5 c;
+       AS s5_md5_preserved,
+       (jb -> 'key2' ->> 0) = md5(((100*1000 + 1)::text)) AS s5_arrow_ok
+  FROM vfull_s5 c WHERE id = 1;
 
--- Assertion 2: public `->` correctness.  Cheaper to probe a single
--- known leaf than to compare the full nested aggregate.
-SELECT (jb -> 'key2' ->> 0) = md5(((100*1000 + 1)::text)) AS s5_arrow_ok
-  FROM vfull_s5 WHERE id = 1;
+-- Recovery path: disable SUBTREE storage, force a re-toast through
+-- the writer by feeding it a freshly-parsed value.  An identity
+-- UPDATE (SET col = col) does NOT work here because the SUBTREE
+-- custom-varlena passes through the writer unchanged; casting to
+-- text and back guarantees a plain in-memory jsonb that the writer
+-- will route to POINTER mode (GUC is off).
+SET jsonb_toaster_lite.enable_subtree_storage = off;
+UPDATE vfull_s5 SET jb = jb::text::jsonb;
+
+-- Drop any orphan edges left over from prior runs.
+SELECT jbtl_subtree_refs_gc() AS recovery_gc;
+
+SELECT 'post_recovery' AS phase,
+       (SELECT count(*) FROM jbtl_subtree_refs r, pg_class c
+        WHERE c.relname='vfull_s5' AND r.parent_toastrelid = c.reltoastrelid)
+           AS edges_for_vfull_s5;
+
+-- Now VACUUM FULL is permitted.
+VACUUM FULL vfull_s5;
+
+SELECT id,
+       md5(jb::text) = (SELECT pre_md5 FROM s5_pre p WHERE p.id = c.id)
+       AS s5_md5_after_recovery
+  FROM vfull_s5 c WHERE id = 1;
 
 DROP TABLE s5_pre;
 DROP TABLE vfull_s5;
+
+RESET jsonb_toaster_lite.enable_subtree_storage;
+RESET jsonb_toaster_lite.subtree_spill_threshold;
+
+-- ============================================================
+-- S6  Gate must not false-positive on leftover catalog edges
+--
+-- The gate scans the target table's live rows for SUBTREE-mode
+-- varlenas, not the jbtl_subtree_refs catalog.  This section
+-- pins the desired behaviour: a table that has NEVER held a
+-- SUBTREE row must not be blocked by orphan edges left over
+-- from a prior DROP TABLE of an unrelated SUBTREE-using table.
+-- ============================================================
+
+SET jsonb_toaster_lite.enable_subtree_storage = on;
+SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SELECT jbtl_subtree_refs_gc() AS noise_cleared;
+
+-- Create a SUBTREE table, then DROP it without gc.  Edges remain.
+DROP TABLE IF EXISTS s6_orphan_src CASCADE;
+CREATE TABLE s6_orphan_src (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 's6_orphan_src', 'jb') > 0
+       AS attached;
+INSERT INTO s6_orphan_src SELECT 1, jsonb_build_object(
+  'id', 1,
+  'key2', (SELECT jsonb_agg(md5(s::text))
+             FROM generate_series(1, 1000) s));
+DROP TABLE s6_orphan_src;
+
+SELECT 's6_orphan_edges' AS phase,
+       (SELECT count(*) > 0 FROM jbtl_subtree_refs) AS has_orphan_edges;
+
+-- Now create an unrelated POINTER-only table.  VACUUM FULL must
+-- succeed regardless of the leftover edges.
+SET jsonb_toaster_lite.enable_subtree_storage = off;
+DROP TABLE IF EXISTS s6_clean CASCADE;
+CREATE TABLE s6_clean (id int PRIMARY KEY, jb jsonb STORAGE EXTERNAL);
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 's6_clean', 'jb') > 0
+       AS attached;
+INSERT INTO s6_clean SELECT 1, jsonb_build_object('payload', repeat('Z', 8000));
+
+VACUUM FULL s6_clean;
+
+SELECT 's6_clean_vfull_ok' AS phase, pg_column_size(jb) > 0 AS readable
+  FROM s6_clean WHERE id = 1;
+
+DROP TABLE s6_clean;
+SELECT jbtl_subtree_refs_gc();
 
 RESET jsonb_toaster_lite.enable_subtree_storage;
 RESET jsonb_toaster_lite.subtree_spill_threshold;

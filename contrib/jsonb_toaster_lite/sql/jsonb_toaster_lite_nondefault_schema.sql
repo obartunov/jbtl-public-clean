@@ -18,6 +18,10 @@
 
 \set ON_ERROR_STOP on
 
+-- Deterministic starting state: drop the extension if present;
+-- suppress NOTICEs for "already exists"/"does not exist" so the
+-- expected output does not depend on test order.
+SET client_min_messages = warning;
 DROP EXTENSION IF EXISTS jsonb_toaster_lite CASCADE;
 DROP SCHEMA IF EXISTS m50_nondef_test CASCADE;
 
@@ -34,6 +38,7 @@ END $$;
 CREATE EXTENSION IF NOT EXISTS toastapi;
 CREATE SCHEMA m50_nondef_test;
 CREATE EXTENSION jsonb_toaster_lite SCHEMA m50_nondef_test;
+RESET client_min_messages;
 
 LOAD 'jsonb_toaster_lite';
 SET jsonb_sort_field_values = off;
