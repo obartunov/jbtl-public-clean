@@ -809,8 +809,28 @@ jbtl_try_spill_subtree(ToasterContext tcxt, struct varlena *attr,
 	jentries = root->children;
 	base_addr = (char *) (jentries + n_jentries);
 
-	/* Reject offset-cache for now:  fixture restriction. */
-	for (k = val_base + 1; k < n_jentries; k++)
+	/*
+	 * Reject offset-cache flag on any value JEntry.
+	 *
+	 * NOTE: HAS_OFF on a key JEntry is harmless (writer copies keys
+	 * byte-identical, reader walks back through unchanged key offsets).
+	 * HAS_OFF on a value JEntry is the dangerous case, because:
+	 *  - the spillable slot itself may carry HAS_OFF (when its index is
+	 *    a stride hit, e.g. val_base + 0 for N == JENTRYOFFSETSTRIDE),
+	 *    and overwriting it to ISCONTAINER_PTR without HAS_OFF leaves
+	 *    the original JEntry's cached-offset semantics in a torn state;
+	 *  - downstream value JEntries with HAS_OFF still carry pre-spill
+	 *    cached offsets that no longer match the new data area where
+	 *    the spilled value has shrunk from val_len to TOAST_POINTER
+	 *    payload size.
+	 *
+	 * The previous loop started at val_base + 1, missing the val_base
+	 * slot itself.  When the alphabetically-first key happens to be
+	 * the large spillable child and N == JENTRYOFFSETSTRIDE, that slot
+	 * carries HAS_OFF and the resulting SUBTREE row is unreadable
+	 * (malloc corruption observed on detoast).  Start at val_base.
+	 */
+	for (k = val_base; k < n_jentries; k++)
 		if (jentries[k] & JENTRY_HAS_OFF)
 			return (Datum) 0;
 
