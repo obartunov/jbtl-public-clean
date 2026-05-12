@@ -2273,6 +2273,543 @@ jbtl_copy(ToasterContext tcxt, Datum value, int am_options)
 static int jbtl_update_call_count = 0;
 static int jbtl_update_diff_emitted_count = 0;
 
+/*
+ * Diagnostic counters for the M9.2 narrow SUBTREE reuse path.
+ *
+ *	subtree_reuse_attempts — how many times jbtl_update entered the
+ *	  SUBTREE branch (i.e. old_mode == JBTL_POINTER_SUBTREE and
+ *	  new_value is plain).
+ *
+ *	subtree_reuse_success — how many of those returned a non-zero
+ *	  Datum (reuse path took effect).  attempts - success = number of
+ *	  declines that fell through to the standard detoast+retoast.
+ *
+ *	subtree_children_reused — total number of SUBTREE children whose
+ *	  on-disk chain was preserved across an UPDATE.  Sums across all
+ *	  successful reuses.  Tests assert this is > 0 for T1/T2 and
+ *	  unchanged for T3.
+ */
+static int jbtl_update_subtree_reuse_attempts = 0;
+static int jbtl_update_subtree_reuse_success = 0;
+static int jbtl_update_subtree_children_reused = 0;
+
+/*
+ * jbtl_update_subtree_reuse — narrow M-B v0 sub-object reuse.
+ *
+ *	Triggered from jbtl_update when:
+ *	  - old_mode == JBTL_POINTER_SUBTREE (v1; v0 fixture is declined)
+ *	  - new_v is a plain (non-CUSTOM, non-compressed, non-EXTERNAL)
+ *	    jsonb varlena
+ *
+ *	Conditions for reuse (all must hold; any miss → return Datum 0
+ *	to fall back to the standard detoast+retoast):
+ *	  1. Root in old is a jsonb object without KVMap (the spill
+ *	     writer never emits KVMap; v1 SUBTREE rows are guaranteed
+ *	     KVMap-free).
+ *	  2. Root in new is a jsonb object.
+ *	  3. Same N keys in same JEntry order, byte-identical key area.
+ *	     (Strict shape match — any key add/remove/reorder declines.)
+ *	  4. For every value slot k that is ISCONTAINER_PTR in old, the
+ *	     corresponding logical sub-value in new is byte-identical to
+ *	     the assembled child body fetched from the old SUBTREE child
+ *	     chain.  If even one such slot's contents differ, decline
+ *	     (the entire row needs a fresh write to avoid mixing reused
+ *	     and freshly-written children with inconsistent edges).
+ *	  5. For non-ISCONTAINER_PTR value slots: simply copy the new
+ *	     inline bytes into the new body (this is where the value
+ *	     change being applied actually lives).
+ *
+ *	On success:
+ *	  - allocate a new parent_valueid via
+ *	    jbtl_alloc_subtree_parent_valueid
+ *	  - insert one (new_parent_vid → child_vid) edge per reused child
+ *	    BEFORE returning, so that when jbtl_update's caller (or our
+ *	    own delete path) runs jbtl_delete on the old SUBTREE varlena,
+ *	    jbtl_subtree_refs_delete_one observes remaining > 0 on each
+ *	    reused child and preserves the child toast chain
+ *	  - construct a new SUBTREE v1 body with the SAME embedded
+ *	    JbtlToastedContainerPointer bytes at reused slots and the
+ *	    new inline bytes at non-SUBTREE slots
+ *	  - wrap via jbtl_toast_make_pointer_subtree_v1
+ *	  - delete the old SUBTREE row by calling jbtl_delete on old_v
+ *	    BEFORE returning (because jbtl_update's standard "approve,
+ *	    delete old, keep new" path on the CUSTOM-return branch
+ *	    deletes the old TOAST chain via jbtl_toast_delete_datum on
+ *	    the inline varatt_external bytes — that is correct for
+ *	    POINTER-family modes whose data area starts with a TOAST
+ *	    pointer, but NOT for SUBTREE whose data area starts with
+ *	    JbtlSubtreeHeader.  So we own the delete for the SUBTREE
+ *	    case and the caller must NOT run the POINTER-style delete.)
+ *
+ *	Returns the new CUSTOM Datum on success, or Datum 0 to decline.
+ */
+static Datum
+jbtl_update_subtree_reuse(ToasterContext tcxt,
+						  struct varlena *new_v,
+						  struct varlena *old_v)
+{
+	char	   *old_payload;
+	int32		old_payload_size;
+	JbtlSubtreeHeader old_hdr;
+	const char *old_parent_body;
+	int32		old_parent_size;
+	JsonbContainer *old_root;
+	JsonbContainer *new_root;
+	int			N;
+	int			n_jentries;
+	int			val_base;
+	int32		old_data_area_offset;
+	int32		new_data_area_offset;
+	int32		key_area_size;
+	JEntry	   *old_jentries;
+	JEntry	   *new_jentries;
+	int			k;
+	int			n_reused = 0;
+	struct
+	{
+		int			value_idx;	/* k in 0..N-1 */
+		const char *ptr_payload_addr;	/* JbtlToastedContainerPointer in old body */
+		struct varatt_external child_ext;
+		struct varlena *child_full;	/* assembled body for comparison */
+	}		   *reused_slots = NULL;
+
+	jbtl_update_subtree_reuse_attempts++;
+
+	/*
+	 * GUC gate: if the user has explicitly turned SUBTREE storage off
+	 * (e.g. as part of the "force re-toast out of SUBTREE" recovery
+	 * recipe documented by the VACUUM FULL gate), we MUST decline.
+	 * Otherwise the reuse path would silently keep the row in SUBTREE
+	 * format across what the user intended as a normalization UPDATE,
+	 * leaving the VACUUM FULL gate permanently active for that row.
+	 *
+	 *	This is a correctness requirement, not an optimization.  The
+	 *	GUC's contract is "do not produce new SUBTREE rows"; emitting
+	 *	a new SUBTREE root (even one that reuses old children) is
+	 *	still emitting a SUBTREE row.
+	 */
+	if (!jbtl_enable_subtree_storage)
+		return (Datum) 0;
+
+	/*
+	 * Pre-decline guards on new_v (the plain-jsonb sanity checks are
+	 * also applied by the caller, but repeating them here makes the
+	 * helper safe to call standalone).
+	 */
+	if (VARATT_IS_CUSTOM(new_v) ||
+		VARATT_IS_COMPRESSED(new_v) ||
+		VARATT_IS_SHORT(new_v) ||
+		VARATT_IS_EXTERNAL(new_v))
+		return (Datum) 0;
+
+	/*
+	 * Parse old SUBTREE varlena.  We require v1; v0 fixture rows are
+	 * not refs-tracked and are out of scope here.
+	 */
+	old_payload = JBTL_CUSTOM_PTR_GET_DATA(old_v);
+	old_payload_size = (int32) JBTL_CUSTOM_PTR_GET_DATA_SIZE(old_v);
+	if (old_payload_size < (int32) sizeof(JbtlSubtreeHeader))
+		return (Datum) 0;
+	if ((uint8) old_payload[0] != JBTL_SUBTREE_HEADER_V1)
+		return (Datum) 0;	/* v0: skip */
+	memcpy(&old_hdr, old_payload, sizeof(old_hdr));
+	if (old_hdr.header_size != sizeof(JbtlSubtreeHeader))
+		return (Datum) 0;
+	old_parent_body = old_payload + old_hdr.header_size;
+	old_parent_size = old_payload_size - old_hdr.header_size;
+
+	if (old_parent_size < (int32) sizeof(uint32))
+		return (Datum) 0;
+
+	old_root = (JsonbContainer *) old_parent_body;
+	if (!JsonContainerIsObject(old_root))
+		return (Datum) 0;
+	if (JsonContainerHasKVMap(old_root))
+		return (Datum) 0;	/* writer never emits KVMap; defensive */
+
+	N = JsonContainerSize(old_root);
+	if (N == 0)
+		return (Datum) 0;
+	n_jentries = 2 * N;
+	val_base = N;
+
+	/*
+	 * Parse new_v root.
+	 */
+	{
+		int32 new_payload = (int32) VARSIZE(new_v) - VARHDRSZ;
+
+		if (new_payload < (int32) sizeof(uint32))
+			return (Datum) 0;
+		new_root = (JsonbContainer *) VARDATA(new_v);
+		if (!JsonContainerIsObject(new_root))
+			return (Datum) 0;
+		if (JsonContainerHasKVMap(new_root))
+			return (Datum) 0;
+		if (JsonContainerSize(new_root) != N)
+			return (Datum) 0;	/* shape change */
+	}
+
+	/* Data area offsets (no KVMap in either old or new). */
+	old_data_area_offset =
+		(int32) sizeof(uint32) + n_jentries * (int32) sizeof(JEntry);
+	new_data_area_offset = old_data_area_offset;	/* same N → same layout */
+
+	old_jentries = old_root->children;
+	new_jentries = new_root->children;
+
+	/*
+	 * Key area must be byte-identical AND key-JEntry array must match
+	 * exactly.  This pins same key set and same order; lengths and
+	 * offset-cache bits must agree.
+	 */
+	key_area_size = 0;
+	for (k = 0; k < N; k++)
+	{
+		if (old_jentries[k] != new_jentries[k])
+			return (Datum) 0;
+		key_area_size += (int32) getJsonbLength(old_root, k);
+	}
+	if (memcmp((const char *) old_root + old_data_area_offset,
+			   (const char *) new_root + new_data_area_offset,
+			   key_area_size) != 0)
+		return (Datum) 0;
+
+	/*
+	 * Reject offset-cache flags on value JEntries in both old and new.
+	 * The writer's spill path rejects them too (jsonb_toaster_lite.c:656),
+	 * and getJsonbOffset()/getJsonbLength() semantics differ between
+	 * direct-length and cached-offset entries; the new body we emit
+	 * MUST use direct lengths everywhere, so any HAS_OFF in new also
+	 * forces decline.
+	 */
+	for (k = val_base + 1; k < n_jentries; k++)
+		if ((old_jentries[k] & JENTRY_HAS_OFF) ||
+			(new_jentries[k] & JENTRY_HAS_OFF))
+			return (Datum) 0;
+
+	/*
+	 * Pass 1: scan old value JEntries, identify ISCONTAINER_PTR
+	 * slots, fetch each child body fully for the byte-equality
+	 * check.  Allocate temp arrays sized to N (worst case all slots
+	 * are children).
+	 */
+	reused_slots = palloc(N * sizeof(*reused_slots));
+
+	{
+		for (k = 0; k < N; k++)
+		{
+			JEntry old_je = old_jentries[val_base + k];
+
+			if (JBTL_JBE_ISCONTAINER_PTR(old_je))
+			{
+				/* Old has SUBTREE child at slot k. */
+				int32		val_off =
+					(int32) getJsonbOffset(old_root, val_base + k);
+				const char *ptr_addr =
+					old_parent_body + old_data_area_offset + val_off;
+				const JbtlToastedContainerPointer *ptr =
+					(const JbtlToastedContainerPointer *) ptr_addr;
+				struct varatt_external ext;
+				struct varlena *child_full;
+				JEntry		new_je = new_jentries[val_base + k];
+				const char *new_value_addr;
+				int32		new_value_len;
+				int32		child_payload;
+
+				/*
+				 * In new, the same slot must be a container value of
+				 * the same kind (object/array) as the child body's
+				 * stored header.  Otherwise decline.
+				 */
+				if (!JBE_ISCONTAINER(new_je))
+				{
+					int j;
+					for (j = 0; j < n_reused; j++)
+						pfree(reused_slots[j].child_full);
+					pfree(reused_slots);
+					return (Datum) 0;
+				}
+
+				VARATT_EXTERNAL_GET_POINTER(ext, ptr->data);
+				if (!VARATT_EXTERNAL_GET_EXTSIZE(ext))
+				{
+					int j;
+					for (j = 0; j < n_reused; j++)
+						pfree(reused_slots[j].child_full);
+					pfree(reused_slots);
+					return (Datum) 0;
+				}
+
+				/* Fetch child body fully. */
+				child_full = jbtl_toast_fetch_full_plain(&ext, NULL);
+				child_payload = (int32) VARSIZE(child_full) - VARHDRSZ;
+
+				/*
+				 * Locate new's value k within its data area.  For
+				 * objects, value JEntries' offsets are RELATIVE TO
+				 * THE DATA AREA (which begins with keys).
+				 */
+				{
+					int32 new_v_off =
+						(int32) getJsonbOffset(new_root, val_base + k);
+					new_value_addr =
+						(const char *) new_root + new_data_area_offset + new_v_off;
+					new_value_len = (int32) (new_je & JENTRY_OFFLENMASK);
+				}
+
+				if (child_payload != new_value_len ||
+					memcmp(VARDATA(child_full), new_value_addr, new_value_len) != 0)
+				{
+					/* Child body changed; decline whole row. */
+					int j;
+					pfree(child_full);
+					for (j = 0; j < n_reused; j++)
+						pfree(reused_slots[j].child_full);
+					pfree(reused_slots);
+					return (Datum) 0;
+				}
+
+				/*
+				 * Reuse candidate confirmed.  Save everything we need
+				 * to embed the same pointer into the new body.
+				 */
+				reused_slots[n_reused].value_idx = k;
+				reused_slots[n_reused].ptr_payload_addr = ptr_addr;
+				reused_slots[n_reused].child_ext = ext;
+				reused_slots[n_reused].child_full = child_full;
+				n_reused++;
+			}
+			else
+			{
+				/*
+				 * Old slot k is an inline value.  We will copy the
+				 * new inline bytes for this slot into the new body.
+				 * Both old and new must agree on container-ness; if
+				 * old is non-container and new is container, the new
+				 * value's bytes are larger and the new body needs a
+				 * different shape.  Accept only matching kinds.
+				 */
+				JEntry new_je = new_jentries[val_base + k];
+
+				if (JBE_ISCONTAINER(old_je) != JBE_ISCONTAINER(new_je))
+				{
+					int j;
+					for (j = 0; j < n_reused; j++)
+						pfree(reused_slots[j].child_full);
+					pfree(reused_slots);
+					return (Datum) 0;
+				}
+			}
+		}
+	}
+
+	/*
+	 * If no SUBTREE children were reused, this path adds no value
+	 * over the standard detoast+retoast (which would emit a fresh
+	 * SUBTREE if GUC says so, or a POINTER otherwise).  Decline and
+	 * let the fallback do its work.
+	 */
+	if (n_reused == 0)
+	{
+		pfree(reused_slots);
+		return (Datum) 0;
+	}
+
+	/*
+	 * All conditions met.  Build the new SUBTREE row.
+	 *
+	 *	Layout of the new parent body is the SAME as the old's:
+	 *	  [4-byte header][2N JEntries][key area][value area]
+	 *	with ISCONTAINER_PTR slots carrying JbtlToastedContainerPointer
+	 *	(4 bytes JEntry header + TOAST_POINTER_SIZE bytes).
+	 *
+	 *	The JEntry array we emit:
+	 *	  - keys: copy old's key JEntries (already byte-equal to new's)
+	 *	  - values: for ISCONTAINER_PTR slots, write
+	 *	    JBTL_JENTRY_ISCONTAINER_PTR | payload_size
+	 *	    (same as old's value JEntry).  For inline slots, take new's
+	 *	    JEntry as-is.
+	 *
+	 *	Key area: byte-identical between old and new; we copy old's.
+	 *
+	 *	Value area: at each ISCONTAINER_PTR slot copy the same
+	 *	JbtlToastedContainerPointer bytes from old; at each inline slot
+	 *	copy the new value bytes.
+	 */
+	{
+		int32		new_body_size;
+		char	   *new_body;
+		JEntry	   *out_jentries;
+		int32		old_value_payload_size = (int32) sizeof(JEntry) + TOAST_POINTER_SIZE;
+		int32		new_value_area_offset;
+		int32		new_v_data_area_offset =
+			(int32) sizeof(uint32) + n_jentries * (int32) sizeof(JEntry);
+		const char *new_v_data_area =
+			(const char *) new_root + new_v_data_area_offset;
+		Oid			toastrelid = old_hdr.parent_toastrelid;
+		Relation	toastrel;
+		Relation	toastidx;
+		List	   *idxlist;
+		Oid			new_parent_valueid;
+		struct varlena *result;
+		int			ri;
+
+		/*
+		 * Total new body size = headers + same key area + reused
+		 * pointer payloads + inline value bytes.
+		 */
+		new_body_size = old_data_area_offset + key_area_size;
+		new_body_size += n_reused * old_value_payload_size;
+		/* Inline slots: sum lengths from new's JEntries. */
+		for (k = 0; k < N; k++)
+		{
+			JEntry old_je = old_jentries[val_base + k];
+			JEntry new_je = new_jentries[val_base + k];
+
+			if (!JBTL_JBE_ISCONTAINER_PTR(old_je))
+				new_body_size += (int32) (new_je & JENTRY_OFFLENMASK);
+		}
+
+		new_body = palloc(new_body_size);
+
+		/* Header: copy old's (already has JBTL_JBC_TOBJECT_TOASTED hint). */
+		memcpy(new_body, &old_root->header, sizeof(uint32));
+
+		out_jentries = (JEntry *) (new_body + sizeof(uint32));
+
+		/* Key JEntries: byte-equal to new's; copy from old. */
+		memcpy(out_jentries, old_jentries, N * sizeof(JEntry));
+
+		/* Value JEntries. */
+		for (k = 0; k < N; k++)
+		{
+			JEntry old_je = old_jentries[val_base + k];
+			JEntry new_je = new_jentries[val_base + k];
+
+			if (JBTL_JBE_ISCONTAINER_PTR(old_je))
+				out_jentries[val_base + k] =
+					JBTL_JENTRY_ISCONTAINER_PTR |
+					(old_value_payload_size & JENTRY_OFFLENMASK);
+			else
+				out_jentries[val_base + k] = new_je;
+		}
+
+		/* Key area: byte-identical, copy from old. */
+		memcpy(new_body + old_data_area_offset,
+			   old_parent_body + old_data_area_offset,
+			   key_area_size);
+
+		/* Value area. */
+		new_value_area_offset = old_data_area_offset + key_area_size;
+		{
+			int32 dst_pos = new_value_area_offset;
+			int   next_reused = 0;
+
+			for (k = 0; k < N; k++)
+			{
+				JEntry old_je = old_jentries[val_base + k];
+
+				if (JBTL_JBE_ISCONTAINER_PTR(old_je))
+				{
+					/* Copy the SAME JbtlToastedContainerPointer bytes from old. */
+					Assert(next_reused < n_reused &&
+						   reused_slots[next_reused].value_idx == k);
+					memcpy(new_body + dst_pos,
+						   reused_slots[next_reused].ptr_payload_addr,
+						   old_value_payload_size);
+					dst_pos += old_value_payload_size;
+					next_reused++;
+				}
+				else
+				{
+					JEntry new_je = new_jentries[val_base + k];
+					int32 nlen = (int32) (new_je & JENTRY_OFFLENMASK);
+					int32 new_v_off =
+						(int32) getJsonbOffset(new_root, val_base + k);
+
+					memcpy(new_body + dst_pos,
+						   new_v_data_area + new_v_off,
+						   nlen);
+					dst_pos += nlen;
+				}
+			}
+			Assert(dst_pos == new_body_size);
+		}
+
+		/*
+		 * Allocate new parent_valueid and insert refs edges BEFORE
+		 * returning.  Ordering is critical: when jbtl_update calls
+		 * jbtl_delete on the old SUBTREE varlena, the v1 delete
+		 * dispatch will call jbtl_subtree_refs_delete_one for each
+		 * old (old_parent_vid, child_vid) edge; with our new
+		 * (new_parent_vid, child_vid) edges already in the catalog,
+		 * remaining > 0 on every reused child and its toast chain is
+		 * preserved.
+		 */
+		toastrel = table_open(toastrelid, RowExclusiveLock);
+		idxlist = RelationGetIndexList(toastrel);
+		if (idxlist == NIL)
+		{
+			int j;
+			table_close(toastrel, RowExclusiveLock);
+			for (j = 0; j < n_reused; j++)
+				pfree(reused_slots[j].child_full);
+			pfree(reused_slots);
+			pfree(new_body);
+			return (Datum) 0;
+		}
+		toastidx = index_open(linitial_oid(idxlist), RowExclusiveLock);
+		new_parent_valueid =
+			jbtl_alloc_subtree_parent_valueid(toastrel, toastidx);
+		index_close(toastidx, RowExclusiveLock);
+		table_close(toastrel, RowExclusiveLock);
+		list_free(idxlist);
+
+		for (ri = 0; ri < n_reused; ri++)
+		{
+			jbtl_subtree_refs_insert(toastrelid, new_parent_valueid,
+									 reused_slots[ri].child_ext.va_toastrelid,
+									 reused_slots[ri].child_ext.va_valueid);
+		}
+
+		/* Wrap in v1 SUBTREE custom-varlena. */
+		result = jbtl_toast_make_pointer_subtree_v1(tcxt->toasterid,
+													new_parent_valueid,
+													toastrelid,
+													new_body, new_body_size);
+
+		/*
+		 * Delete the old SUBTREE row's edges and chain via the
+		 * standard SUBTREE-aware delete path.  Each old edge
+		 * (old_parent_vid, child_vid) for a reused child decrements
+		 * but does not orphan the child (remaining > 0 thanks to
+		 * the new edge inserted above).  For any old child that is
+		 * NOT in our reused set (impossible in v0 because we require
+		 * full child-set coverage — every old ISCONTAINER_PTR has a
+		 * matching new byte-equal slot), the child chain would be
+		 * deleted.  That path is exercised by tests where the user
+		 * changes a child: byte-identity fails, we decline, and the
+		 * standard detoast+retoast handles the row.
+		 */
+		jbtl_delete(tcxt, PointerGetDatum(old_v), false /* not speculative */);
+
+		/* Cleanup. */
+		{
+			int j;
+			for (j = 0; j < n_reused; j++)
+				pfree(reused_slots[j].child_full);
+		}
+		pfree(reused_slots);
+		pfree(new_body);
+
+		jbtl_update_subtree_reuse_success++;
+		jbtl_update_subtree_children_reused += n_reused;
+
+		return PointerGetDatum(result);
+	}
+}
+
 static Datum
 jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 			int am_options)
@@ -2322,35 +2859,51 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	old_mode = JBTL_CUSTOM_PTR_GET_HEADER(old_v) & JBTL_POINTER_TYPE_MASK;
 
 	/*
-	 * Old-mode whitelist for v2a.
+	 * Old-mode dispatch.
+	 *
+	 * SUBTREE branch (M9.2 narrow M-B v0): if old is SUBTREE and new
+	 * is plain, attempt sub-object reuse.  On success we own the
+	 * delete (jbtl_update_subtree_reuse calls jbtl_delete on old_v
+	 * with the SUBTREE-aware cascade) and return a fresh CUSTOM
+	 * varlena.  On decline (return Datum 0) fall through to the
+	 * standard detoast+retoast path that the existing whitelist
+	 * below would have taken.
+	 */
+	if (old_mode == JBTL_POINTER_SUBTREE)
+	{
+		if (!VARATT_IS_CUSTOM(new_v))
+		{
+			Datum reused = jbtl_update_subtree_reuse(tcxt, new_v, old_v);
+
+			if (reused != (Datum) 0)
+			{
+				jbtl_update_call_count++;
+				return reused;
+			}
+		}
+		/*
+		 * Fall through to decline.  Core's standard fallback then
+		 * runs: detoast(old) → tsr_toast(new) → tsr_delete(old).
+		 * Our tsr_delete (jbtl_delete) is SUBTREE-aware (version
+		 * dispatch + refs cascade), so the old chain is cleaned
+		 * correctly regardless of which mode the retoast emits.
+		 * The retoast will reconstruct a fresh SUBTREE (if GUC
+		 * enabled) with new child chains and new edges.
+		 */
+		return (Datum) 0;
+	}
+
+	/*
+	 * Old-mode whitelist for v2a (POINTER-family modes).
 	 *
 	 * Eligible:
 	 *   JBTL_POINTER                     v1 happy path
 	 *   JBTL_POINTER_COMPRESSED_CHUNKS   v1 happy path (compressed base)
-	 *   JBTL_POINTER_DIFF                v2a rebase: a row already in DIFF
-	 *                                    mode may receive another eligible
-	 *                                    same-length scalar replace.  The
-	 *                                    DIFF inline tail begins with the
-	 *                                    same 18-byte varatt_external as
-	 *                                    a POINTER varlena, so the
-	 *                                    extract path below works
-	 *                                    unchanged.  We fetch the ORIGINAL
-	 *                                    base body (chunks at the embedded
-	 *                                    valueid), compute a fresh diff
-	 *                                    against THAT, and emit a new DIFF
-	 *                                    varlena with the same embedded
-	 *                                    base pointer.  The old inline
-	 *                                    diff is discarded; there is
-	 *                                    never a stacked DIFF.
+	 *   JBTL_POINTER_DIFF                v2a rebase
 	 *
 	 * Decline:
-	 *   JBTL_POINTER_DIFF_COMP           v2a deferred — same code path
-	 *                                    works in principle, but kept as
-	 *                                    fallback in this snapshot until
-	 *                                    explicit regression coverage
-	 *                                    is added.
+	 *   JBTL_POINTER_DIFF_COMP           v2a deferred
 	 *   JBTL_PLAIN_JSONB                 inline body; nothing to share.
-	 *   JBTL_POINTER_SUBTREE             out of scope.
 	 *   any other / future mode tag      out of scope.
 	 */
 	if (old_mode != JBTL_POINTER &&
@@ -2640,6 +3193,9 @@ jbtl_update_calls_reset(PG_FUNCTION_ARGS)
 {
 	jbtl_update_call_count = 0;
 	jbtl_update_diff_emitted_count = 0;
+	jbtl_update_subtree_reuse_attempts = 0;
+	jbtl_update_subtree_reuse_success = 0;
+	jbtl_update_subtree_children_reused = 0;
 	PG_RETURN_VOID();
 }
 
@@ -2648,6 +3204,40 @@ Datum
 jbtl_update_diffs_emitted(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(jbtl_update_diff_emitted_count);
+}
+
+/*
+ * Diagnostic accessors for the M9.2 narrow SUBTREE reuse path.
+ *
+ *	jbtl_update_subtree_reuse_attempts_fn()  - times jbtl_update
+ *	                                           entered SUBTREE branch
+ *	jbtl_update_subtree_reuse_successes_fn() - times the branch
+ *	                                           returned a reused row
+ *	jbtl_update_subtree_children_reused_fn() - total children whose
+ *	                                           chain was preserved
+ *
+ *	C names have _fn suffix to avoid collision with the static int
+ *	counter variables.  SQL aliases drop the suffix.
+ */
+PG_FUNCTION_INFO_V1(jbtl_update_subtree_reuse_attempts_fn);
+Datum
+jbtl_update_subtree_reuse_attempts_fn(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(jbtl_update_subtree_reuse_attempts);
+}
+
+PG_FUNCTION_INFO_V1(jbtl_update_subtree_reuse_successes_fn);
+Datum
+jbtl_update_subtree_reuse_successes_fn(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(jbtl_update_subtree_reuse_success);
+}
+
+PG_FUNCTION_INFO_V1(jbtl_update_subtree_children_reused_fn);
+Datum
+jbtl_update_subtree_children_reused_fn(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(jbtl_update_subtree_children_reused);
 }
 
 /*

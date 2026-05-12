@@ -57,12 +57,16 @@ SET jsonb_toaster_lite.subtree_spill_threshold = 4096;
 -- What is being pinned:
 --   - md5(jb::text) correct after each UPDATE;
 --   - the live edge count for this table stays bounded (== 1);
---   - whether the child_valueid stays the same across UPDATEs
---     (observable: it does NOT in cleaned -- each UPDATE goes
---     through full re-toast: tsr_delete on the old SUBTREE row
---     deletes the old edge, tsr_toast on the new value inserts
---     a new edge.  Cleaned does not implement M-B-style reuse.
---     This test pins that baseline.)
+--   - parent_valueid changes on every UPDATE (new SUBTREE row);
+--   - child_valueid STAYS THE SAME across UPDATEs once M9.2
+--     narrow sub-object reuse is in effect.  The reuse helper
+--     (jbtl_update_subtree_reuse) detects byte-equality of the
+--     child body and preserves the existing toast chain, inserting
+--     a fresh (new_parent_vid, child_vid) edge before the old
+--     edge is decremented by the version-aware delete cascade.
+--     This is the M9.2 narrow M-B v0 behavior.  Prior to M9.2,
+--     each UPDATE went through full re-toast and produced a
+--     fresh child_valueid; the pin here was the opposite.
 --   - jbtl_subtree_refs_check() reports 0 dead edges between
 --     successive UPDATEs (each UPDATE cleans up its own old edge
 --     in the same transaction).

@@ -161,6 +161,20 @@ AS 'MODULE_PATHNAME', 'jbtl_update_calls_reset' LANGUAGE C;
 CREATE FUNCTION jbtl_update_diffs_emitted() RETURNS int
 AS 'MODULE_PATHNAME', 'jbtl_update_diffs_emitted' LANGUAGE C;
 
+-- M9.2: narrow SUBTREE sub-object reuse diagnostic counters.
+--   attempts   = times jbtl_update entered the SUBTREE branch
+--   successes  = times the branch returned a reused row
+--   children   = total children whose toast chain was preserved
+-- attempts - successes = declines that fell through to detoast+retoast.
+CREATE FUNCTION jbtl_update_subtree_reuse_attempts() RETURNS int
+AS 'MODULE_PATHNAME', 'jbtl_update_subtree_reuse_attempts_fn' LANGUAGE C;
+
+CREATE FUNCTION jbtl_update_subtree_reuse_successes() RETURNS int
+AS 'MODULE_PATHNAME', 'jbtl_update_subtree_reuse_successes_fn' LANGUAGE C;
+
+CREATE FUNCTION jbtl_update_subtree_children_reused() RETURNS int
+AS 'MODULE_PATHNAME', 'jbtl_update_subtree_children_reused_fn' LANGUAGE C;
+
 -- test fixture for synthesising JBTL_POINTER_SUBTREE values
 -- without a production writer. Takes (table, parent_jsonb, key) and
 -- returns a custom-pointer that reads as the equivalent jsonb but
