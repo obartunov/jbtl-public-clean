@@ -493,6 +493,14 @@ extern bool jbtl_subtree_refs_child_orphan(Oid child_toastrelid,
 extern bool jbtl_subtree_refs_parent_id_in_use(Oid parent_toastrelid,
 											   Oid parent_valueid);
 
+/*
+ * G1 cheap precheck: any edge at all whose parent lives in the given
+ * toast relation?  Used by the VACUUM FULL / CLUSTER safety gate to
+ * skip the per-target heap scan when the catalog has no SUBTREE edge
+ * for the target's toast relation.
+ */
+extern bool jbtl_subtree_refs_any_for_toastrelid(Oid parent_toastrelid);
+
 extern Oid	jbtl_alloc_subtree_parent_valueid(Relation toastrel,
 											  Relation toastidx);
 

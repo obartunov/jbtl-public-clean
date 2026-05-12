@@ -386,6 +386,44 @@ jbtl_check_relation_for_subtree(Oid target_oid, const char *cmd_name)
 		return;
 	}
 
+	/*
+	 * G1 cheap prechecks.  Both run under the AEL we just acquired,
+	 * so the catalog state we observe cannot change before the
+	 * eventual VACUUM FULL.
+	 *
+	 *	(a) Reltoastrelid invalid: a relation without a toast
+	 *	relation cannot hold SUBTREE rows (SUBTREE references
+	 *	chunks in pg_toast.<rel>).  Skip the heap scan.
+	 *
+	 *	(b) jbtl_subtree_refs holds no edge for this toast relation:
+	 *	the writer invariant (jbtl_try_spill_subtree inserts an edge
+	 *	in the same transaction as the SUBTREE row) guarantees that
+	 *	no edge for our reltoastrelid implies no live SUBTREE row
+	 *	for this table.  Under AEL no concurrent writer can change
+	 *	this between probe and rewrite.  Skip the heap scan.
+	 *
+	 *	A false-positive in (b) -- catalog edge exists but no live
+	 *	heap row carries SUBTREE state (an old orphan from a
+	 *	pre-M9.1 leak) -- merely makes us fall through to the heap
+	 *	scan, which returns the authoritative answer.  A
+	 *	false-negative is impossible by the writer invariant.
+	 */
+	{
+		Oid			my_toastrelid = rel->rd_rel->reltoastrelid;
+
+		if (!OidIsValid(my_toastrelid))
+		{
+			table_close(rel, NoLock);
+			return;
+		}
+
+		if (!jbtl_subtree_refs_any_for_toastrelid(my_toastrelid))
+		{
+			table_close(rel, NoLock);
+			return;
+		}
+	}
+
 	has_subtree = jbtl_table_has_subtree_row(rel, attno);
 	table_close(rel, NoLock);
 

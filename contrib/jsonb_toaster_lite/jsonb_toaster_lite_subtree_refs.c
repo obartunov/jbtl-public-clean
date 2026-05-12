@@ -124,6 +124,66 @@ jbtl_refs_resolve_oids(Oid *out_relid, Oid *out_pkidx, Oid *out_childidx)
 bool jbtl_subtree_refs_parent_id_in_use(Oid parent_toastrelid,
 										Oid parent_valueid);
 
+/*
+ * G1 cheap precheck for the VACUUM FULL / CLUSTER safety gate.
+ *
+ *	Returns true iff jbtl_subtree_refs holds at least one edge whose
+ *	parent_toastrelid equals the caller-supplied OID.
+ *
+ *	The gate calls this under AccessExclusiveLock on the underlying
+ *	heap relation.  That lock blocks any concurrent SUBTREE writer
+ *	from completing, so a "no edge" answer is a strict witness that
+ *	no live SUBTREE row references this toast relation:
+ *
+ *	 - The writer invariant in jbtl_try_spill_subtree inserts edges
+ *	 via CatalogTupleInsert BEFORE returning the SUBTREE wrapper to
+ *	 jbtl_toast; both edge and resulting heap row commit (or roll
+ *	 back) atomically.
+ *	 - Under AEL no concurrent writer can sneak an edge in between
+ *	 our probe and the eventual heap rewrite.
+ *
+ *	A false positive (catalog says yes, heap says no) is harmless:
+ *	the caller falls through to the existing heap scan, which gives
+ *	the authoritative answer.  Such a positive can only arise from
+ *	pre-M9.1 orphan edges (the leak this milestone closed); newer
+ *	leaks are not created.
+ *
+ *	Uses GetActiveSnapshot() to match the heap scan's visibility:
+ *	same-backend uncommitted SUBTREE inserts done earlier in the
+ *	current transaction are visible to both probes, so they cannot
+ *	be missed.
+ */
+bool
+jbtl_subtree_refs_any_for_toastrelid(Oid parent_toastrelid)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData skey[1];
+	bool		found;
+	Oid			refs_relid;
+	Oid			refs_pkidx;
+	Oid			refs_childidx;
+
+	if (!OidIsValid(parent_toastrelid))
+		return false;
+
+	jbtl_refs_resolve_oids(&refs_relid, &refs_pkidx, &refs_childidx);
+	rel = table_open(refs_relid, AccessShareLock);
+
+	ScanKeyInit(&skey[0],
+				Anum_jbtl_refs_parent_toastrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(parent_toastrelid));
+
+	scan = systable_beginscan(rel, refs_pkidx, true,
+							  GetActiveSnapshot(), 1, skey);
+	found = (systable_getnext(scan) != NULL);
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
+}
+
 bool
 jbtl_subtree_refs_parent_id_in_use(Oid parent_toastrelid,
 								   Oid parent_valueid)
