@@ -7,6 +7,7 @@ OBJS = \
 	toastapi_internals.o \
 	toastapi_sqlfuncs.o \
 	toaster_cache.o \
+	toaster_attr_cache.o \
 	toastapi.o \
 	dummy_toaster.o
 

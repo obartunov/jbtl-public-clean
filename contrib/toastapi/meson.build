@@ -4,6 +4,7 @@ toastapi = shared_module('toastapi',
     'toastapi_internals.c',
     'toastapi_sqlfuncs.c',
     'toaster_cache.c',
+  'toaster_attr_cache.c',
     'dummy_toaster.c'
   ),
   kwargs: contrib_mod_args,

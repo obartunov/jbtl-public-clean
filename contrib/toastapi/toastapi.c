@@ -48,69 +48,11 @@ PG_MODULE_MAGIC;
  */
 /* #define TOASTER_HANDLER_OID_IS_TOASTER_ID */
 
-typedef struct RelToastCache
-{
-	TsrRoutine	routine;
-	Oid			toasterid;
-	/* char toaster_options[FLEXIBLE_ARRAY_MEMBER]; */
-} RelToastCache;
-
-/* Placeholder for attributes without custom toasters */
-static RelToastCache invalid_toast_cache;
-
-static RelToastCache *
-init_toaster_cache(Relation rel, Oid toasterid)
-{
-#ifdef TOASTER_HANDLER_OID_IS_TOASTER_ID
-	TsrRoutine *toaster = SearchTsrHandlerCache(toasterid);
-#else
-	TsrRoutine *toaster = SearchTsrCache(toasterid);
-#endif
-	RelToastCache *cache = RelationToastCacheAlloc(rel, sizeof(RelToastCache));
-
-	memcpy(&cache->routine, toaster, sizeof(*toaster));
-	cache->toasterid = toasterid;
-
-	return cache;
-}
-
-static RelToastCache *
-get_toaster_cache_for_attr(Relation rel, int attnum)
-{
-	void	  **rd_toastcache = RelationGetToastCache(rel);
-	RelToastCache *cache = rd_toastcache[attnum];
-
-	if (!cache)
-	{
-		char	   *toasterid_str =
-#ifdef TOASTER_HANDLER_OID_IS_TOASTER_ID
-			attopts_get_toaster_opts(rel, attnum + 1, ATT_HANDLER_NAME);
-#else
-			attopts_get_toaster_opts(rel, attnum + 1, ATT_TOASTER_NAME);
-#endif
-
-		if (!toasterid_str)
-			cache = &invalid_toast_cache;
-		else
-		{
-			Oid toasterid = atoi(toasterid_str);
-
-			if (OidIsValid(toasterid))
-				cache = init_toaster_cache(rel, toasterid);
-			else
-				cache = &invalid_toast_cache;
-		}
-
-		/* reread rd_toastcache after possible relcache invalidations */
-		rd_toastcache = RelationGetToastCache(rel);
-		rd_toastcache[attnum] = cache;
-	}
-
-	if (cache == &invalid_toast_cache)
-		return NULL;
-	/* copy cache into current memory context, referencing rd_toastcache is unsafe */
-	return memcpy(palloc(sizeof(*cache)), cache, sizeof(*cache));
-}
+/*
+ * The per-(relid, attnum) cache lives in toaster_attr_cache.c.  This
+ * provider exposes only the resolver hook implementations here.
+ */
+#include "toaster_attr_cache.h"
 
 /*
  * Routine-struct resolver implementations.
@@ -133,16 +75,17 @@ static TsrRoutine *
 toastapi_get_routine_for_rel(Relation rel, AttrNumber attnum,
 							 ToasterContext outcxt)
 {
-	RelToastCache *cache = get_toaster_cache_for_attr(rel, (int) attnum);
+	Oid			toasterid = InvalidOid;
+	TsrRoutine *routine = ToasterAttrCacheLookup(rel, attnum, &toasterid);
 
-	if (cache == NULL)
+	if (routine == NULL)
 		return NULL;
 
 	if (outcxt != NULL)
 	{
-		outcxt->toaster = &cache->routine;
+		outcxt->toaster = routine;
 		outcxt->rel = rel;
-		outcxt->toasterid = cache->toasterid;
+		outcxt->toasterid = toasterid;
 		outcxt->toastreloid = rel->rd_rel->reltoastrelid;
 		/*
 		 * The legacy bridge stored attnum as 1-based here.  Toasters
@@ -153,7 +96,7 @@ toastapi_get_routine_for_rel(Relation rel, AttrNumber attnum,
 		outcxt->attnum = (int) attnum + 1;
 		/* options is caller's responsibility to set */
 	}
-	return &cache->routine;
+	return routine;
 }
 
 static TsrRoutine *

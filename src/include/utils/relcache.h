@@ -93,12 +93,6 @@ extern void RelationBuildPublicationDesc(Relation relation,
 extern void RelationInitTableAccessMethod(Relation relation);
 
 /*
- * Routines to support cached relation options
- */
-extern void **RelationGetToastCache(Relation relation);
-extern void *RelationToastCacheAlloc(Relation relation, Size size);
-
-/*
  * Routines to support ereport() reports of relation-related errors
  */
 extern int	errtable(Relation rel);
