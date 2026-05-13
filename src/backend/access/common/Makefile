@@ -28,6 +28,7 @@ OBJS = \
 	tidstore.o \
 	toast_compression.o \
 	toast_internals.o \
+	toasterapi.o \
 	tupconvert.o \
 	tupdesc.o
 
