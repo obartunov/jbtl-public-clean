@@ -730,3 +730,23 @@ new-mode designer's, not the Toast API's:
 
 This audit note records the invariant: the safety of removing
 relinfo is conditional on the current storage modes only.
+
+CUSTOM varlena descriptor location
+==================================
+
+The on-disk descriptor for a CUSTOM-tagged TOAST pointer, varatt_custom,
+previously lived at contrib/toastapi/varatt_custom.h.  It is now declared
+in core at src/include/access/toast_custom.h, so that core code (size
+queries, jsonb fast-path dispatch) can resolve the toaster identifier
+without depending on this contrib being on the include path.
+
+Existing extensions should change
+
+  #include "varatt_custom.h"
+
+to
+
+  #include "access/toast_custom.h"
+
+The struct layout, on-disk format, and macros are byte-identical.  This
+is a header-relocation change, not a format change.

@@ -20,7 +20,7 @@
 #include "fmgr.h"
 #include "access/toast_compression.h"
 #include "utils/relcache.h"
-#include "varatt_custom.h"
+#include "access/toast_custom.h"
 
 #define TOASTER_HANDLEROID 8888
 

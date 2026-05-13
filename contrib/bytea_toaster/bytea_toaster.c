@@ -31,7 +31,7 @@
 #include "utils/memutils.h"
 
 #include "toastapi.h"
-#include "varatt_custom.h"
+#include "access/toast_custom.h"
 
 PG_MODULE_MAGIC;
 
