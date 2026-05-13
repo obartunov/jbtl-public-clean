@@ -31,6 +31,7 @@
 #include "access/toast_helper.h"
 #include "access/toast_hook.h"
 #include "access/toast_internals.h"
+#include "access/toasterapi.h"
 #include "utils/fmgroids.h"
 
 
@@ -112,7 +113,12 @@ heap_toast_tuple_externalize(ToastTupleContext *ttc, int attno,
 	int		max_inline_size;
 	int		size;
 
-	if (Toastapi_toast_hook)
+	/*
+	 * If a toaster provider is loaded, leave room in the inline for
+	 * its possibly-larger CUSTOM pointer; the actual routine lookup
+	 * happens inside toast_tuple_externalize.
+	 */
+	if (get_toaster_routine_for_rel_hook)
 	{
 		size = heap_compute_data_size_without_attr(ttc->ttc_rel->rd_att,
 												   ttc->ttc_values,

@@ -223,4 +223,23 @@ extern PGDLLIMPORT toaster_routine_for_rel_hook_type
 extern PGDLLIMPORT toaster_routine_for_id_hook_type
 				   get_toaster_routine_for_id_hook;
 
+/*
+ * Core helpers for dispatching toast lifecycle through the resolver.
+ * They wrap routine lookup, context fill, and any per-column metadata
+ * (e.g., compression method derivation from pg_attribute), so that
+ * core call sites stay short and the metadata extraction lives in one
+ * place.  Return (Datum) 0 when no provider/routine/method is
+ * available, letting the caller fall through to vanilla TOAST.
+ */
+extern Datum dispatch_toaster_toast(Relation rel, AttrNumber attnum,
+									Datum value, int max_inline_size,
+									int am_options);
+extern Datum dispatch_toaster_update(Relation rel, AttrNumber attnum,
+									 Datum new_value, Datum old_value,
+									 int am_options);
+extern Datum dispatch_toaster_copy(Relation rel, AttrNumber attnum,
+								   Datum value, int am_options);
+extern void  dispatch_toaster_delete(Relation rel, AttrNumber attnum,
+									 Datum value, bool is_speculative);
+
 #endif							/* TOASTERAPI_H */
