@@ -366,8 +366,9 @@ PG_FUNCTION_INFO_V1(bytea_toaster_handler);
 Datum
 bytea_toaster_handler(PG_FUNCTION_ARGS)
 {
-	TsrRoutine *tsr = MakeTsrRoutine();
+	TsrRoutine *tsr = palloc0(sizeof(TsrRoutine));
 
+	tsr->tsr_size = sizeof(TsrRoutine);
 	tsr->tsr_validate = bytea_toaster_validate;
 	tsr->tsr_toast = bytea_toaster_toast;
 	tsr->tsr_detoast = bytea_toaster_detoast;

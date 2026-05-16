@@ -136,8 +136,9 @@ PG_FUNCTION_INFO_V1(dummy_toaster_handler);
 Datum
 dummy_toaster_handler(PG_FUNCTION_ARGS)
 {
-	TsrRoutine *tsr = MakeTsrRoutine();
+	TsrRoutine *tsr = palloc0(sizeof(TsrRoutine));
 
+	tsr->tsr_size = sizeof(TsrRoutine);
 	tsr->tsr_toast = dummy_toaster_toast;
 	tsr->tsr_delete = dummy_toaster_delete;
 	tsr->tsr_copy = dummy_toaster_copy;

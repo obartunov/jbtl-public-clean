@@ -132,7 +132,7 @@ GetTsrRoutine(Oid tsrhandler)
 
 	routine = (TsrRoutine *) DatumGetPointer(result);
 
-	if (routine == NULL || routine->tsr_magic != TSR_ROUTINE_MAGIC)
+	if (routine == NULL || routine->tsr_size != sizeof(TsrRoutine))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("toaster handler function %u did not return a %s",

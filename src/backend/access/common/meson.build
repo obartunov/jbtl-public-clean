@@ -16,6 +16,7 @@ backend_sources += files(
   'tidstore.c',
   'toast_compression.c',
   'toast_internals.c',
+  'toasterapi.c',
   'tupconvert.c',
   'tupdesc.c',
 )

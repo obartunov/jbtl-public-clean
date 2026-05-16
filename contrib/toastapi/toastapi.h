@@ -21,6 +21,7 @@
 #include "access/toast_compression.h"
 #include "utils/relcache.h"
 #include "access/toast_custom.h"
+#include "access/toasterapi.h"
 
 #define TOASTER_HANDLEROID 8888
 
@@ -67,92 +68,12 @@ do { \
 /* Size of an EXTERNAL datum that contains a custom TOAST pointer */
 #define TOASTER_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_custom))
 
-typedef struct TsrRoutine TsrRoutine;
-
-typedef struct ToasterContextData
-{
-	TsrRoutine *toaster;
-	Relation	rel;
-	Oid			toasterid;
-	Oid			toastreloid;
-	int			attnum;
-	int			options;
-} ToasterContextData;
-
-typedef ToasterContextData *ToasterContext;
-
 /*
- * Callback function signatures --- see toaster.sgml for more info.
+ * TsrRoutine, ToasterContextData, and the callback function-pointer
+ * typedefs (toaster_toast_function, ...) are now declared in
+ * src/include/access/toasterapi.h, which is included above.  The
+ * extension implementation continues to construct and own these.
  */
-
-/* Toaster function */
-typedef Datum (*toaster_toast_function) (ToasterContext tcxt,
-										 Datum value,
-										 Datum old_value,
-										 int max_inline_size,
-										 int am_options,
-										 char att_storage,
-										 ToastCompressionId cmid);
-
-/* Update toast function, optional */
-typedef Datum (*toaster_update_function) (ToasterContext tcxt,
-										  Datum new_value,
-										  Datum old_value,
-										  int am_options);
-
-/* Copy toast function, optional */
-typedef Datum (*toaster_copy_function) (ToasterContext tcxt,
-										Datum value,
-										int am_options);
-
-/* Delete toast function, optional */
-typedef void (*toaster_delete_function) (ToasterContext tcxt,
-										 Datum value,
-										 bool is_speculative);
-
-/* Detoast function */
-typedef Datum (*toaster_detoast_function) (ToasterContext tcxt,
-										   Datum toast_ptr,
-										   int offset,
-										   int length);
-
-/* Return virtual table of functions, optional */
-/* validate definition of a toaster Oid */
-typedef bool (*toaster_validate_function) (Oid toasteroid, Oid typeoid,
-										   char storage, char compression,
-										   Oid amoid, bool false_ok);
-
-/*
- * API struct for Toaster.
- *
- * Note this must be stored in a single palloc'd chunk of memory.
- */
-
-#define TSR_ROUTINE_MAGIC	0x54747252	/* "TsrR" */
-
-struct TsrRoutine
-{
-	uint32		tsr_magic;
-
-	/* mandatory interface functions */
-	toaster_validate_function tsr_validate;
-	toaster_toast_function tsr_toast;
-	toaster_detoast_function tsr_detoast;
-	/* optional interface functions */
-	toaster_update_function tsr_update;
-	toaster_copy_function tsr_copy;
-	toaster_delete_function tsr_delete;
-};
-
-static inline TsrRoutine *
-MakeTsrRoutine(void)
-{
-	TsrRoutine *tsr = palloc0(sizeof(*tsr));
-
-	tsr->tsr_magic = TSR_ROUTINE_MAGIC;
-
-	return tsr;
-}
 
 /* Functions in toastapi.c */
 extern PGDLLEXPORT void _PG_init(void);

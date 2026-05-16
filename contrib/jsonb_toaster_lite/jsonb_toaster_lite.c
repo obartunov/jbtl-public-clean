@@ -3535,7 +3535,9 @@ jbtl_test_subtree_spill_key(PG_FUNCTION_ARGS)
 Datum
 jsonb_toaster_lite_handler(PG_FUNCTION_ARGS)
 {
-	TsrRoutine *tsr = MakeTsrRoutine();
+	TsrRoutine *tsr = palloc0(sizeof(TsrRoutine));
+
+	tsr->tsr_size = sizeof(TsrRoutine);
 
 	/*
 	 * Self-identify our OID for the VACUUM FULL gate.  We need the

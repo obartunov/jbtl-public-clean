@@ -132,7 +132,6 @@ get_toaster_for_attr(Relation rel, int attnum, ToasterContext cxt)
 		cxt->rel = rel;
 		cxt->toastreloid = rel->rd_rel->reltoastrelid;
 		cxt->toasterid = cache->toasterid;
-		cxt->toaster = &cache->routine;
 		cxt->attnum = attnum + 1;
 	}
 
@@ -223,7 +222,6 @@ get_toaster_for_ptr(Relation rel, int attnum, Datum toast_ptr, ToasterContext tc
 		tcxt->rel = rel;
 		tcxt->toasterid = toasterid;
 		tcxt->toastreloid = rel ? rel->rd_rel->reltoastrelid : InvalidOid;
-		tcxt->toaster = toaster;
 		tcxt->attnum = attnum + 1;
 	}
 
@@ -308,6 +306,36 @@ toastapi_delete(Relation rel, int attnum, Datum value, bool is_speculative)
 	toaster->tsr_delete(&tcxt, value, is_speculative);
 }
 
+/*
+ * Routine-struct resolver implementations — Option A (two-hook split).
+ *
+ * These are wired to get_toaster_id_for_rel_hook /
+ * get_toaster_routine_for_id_hook at _PG_init.  They are introduced
+ * alongside the TsrRoutine declaration in src/include/access/toasterapi.h.
+ * In this commit the flat lifecycle hooks still drive core call sites;
+ * the resolver path is exposed for regression coverage and for providers
+ * that want to wire the new shape during the transition.
+ *
+ * Lifetime contract: the returned pointer is valid for the immediate
+ * call only.  Core must not retain it.  See access/toasterapi.h.
+ */
+static Oid
+toastapi_get_id_for_rel(Relation rel, AttrNumber attnum)
+{
+	RelToastCache *cache = get_toaster_cache_for_attr(rel, (int) attnum);
+
+	if (cache == NULL)
+		return InvalidOid;
+
+	return cache->toasterid;
+}
+
+static const TsrRoutine *
+toastapi_get_routine_for_id(Oid toasterid)
+{
+	return GetTsrRoutineByOid(toasterid, /*noerror=*/true);
+}
+
 void _PG_init(void)
 {
 	/*
@@ -333,4 +361,14 @@ void _PG_init(void)
 	Toastapi_copy_hook = toastapi_copy;
 	Toastapi_update_hook = toastapi_update;
 	Toastapi_delete_hook = toastapi_delete;
+
+	/*
+	 * Install routine resolver hooks introduced for the TsrRoutine
+	 * dispatch path — Option A (two-hook split).  Until the
+	 * lifecycle-conversion patch flips core call sites to use them,
+	 * these are exposed only for the regression tests and for
+	 * future-compatible providers.
+	 */
+	get_toaster_id_for_rel_hook = toastapi_get_id_for_rel;
+	get_toaster_routine_for_id_hook = toastapi_get_routine_for_id;
 }
