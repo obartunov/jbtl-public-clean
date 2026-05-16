@@ -19,15 +19,9 @@
 #include "access/toast_internals.h"
 #include "catalog/pg_type_d.h"
 #include "varatt.h"
+#include "access/toast_custom.h"
 #include "access/toast_hook.h"
-
-/*
- * TOAST API hooks
- */
-Toastapi_toast_hook_type Toastapi_toast_hook = NULL;
-Toastapi_update_hook_type Toastapi_update_hook = NULL;
-Toastapi_copy_hook_type Toastapi_copy_hook = NULL;
-Toastapi_delete_hook_type Toastapi_delete_hook = NULL;
+#include "access/toasterapi.h"
 
 /*
  * Prepare to TOAST a tuple.
@@ -89,15 +83,19 @@ toast_tuple_init(ToastTupleContext *ttc)
 			{
 				/*
 				 * If the old value is custom-toasted, give the toaster's
-				 * update hook a chance first.  It may decide to reuse old
+				 * update routine a chance first.  It may decide to reuse old
 				 * chunks and just refresh the in-row pointer, regardless
 				 * of whether the new value is plain or already custom.
+				 *
+				 * dispatch_toaster_update returns (Datum) 0 if no toaster
+				 * is bound, the toaster mismatches, or tsr_update is not
+				 * implemented; in those cases we proceed with the normal
+				 * fall-through paths below.
 				 */
-				if (Toastapi_update_hook &&
-					!ttc->ttc_isnull[i] &&
+				if (!ttc->ttc_isnull[i] &&
 					VARATT_IS_CUSTOM(old_value) &&
 					(new_value_after_update =
-						Toastapi_update_hook(ttc->ttc_rel, i,
+						dispatch_toaster_update(ttc->ttc_rel, (AttrNumber) i,
 							ttc->ttc_values[i],
 							ttc->ttc_oldvalues[i],
 							ttc->ttc_am_options)) != (Datum) 0)
@@ -155,20 +153,26 @@ toast_tuple_init(ToastTupleContext *ttc)
 		else
 		{
 			Datum           new_value_after_copy;
+
 			/*
 			 * For INSERT simply get the new value
 			 */
 			new_value = (varlena *) DatumGetPointer(ttc->ttc_values[i]);
 
 			/*
-			 * Call custom TOAST insert function if available
+			 * Call custom TOAST copy function if available.  When the
+			 * new value is already CUSTOM-tagged and the column has a
+			 * toaster bound, give the toaster a chance to relocate
+			 * the storage across relations (CTAS, ALTER TABLE).
+			 * dispatch_toaster_copy returns (Datum) 0 when no toaster
+			 * is bound, the toasterid mismatches, or tsr_copy is not
+			 * implemented.
 			 */
 			if (att->attstorage == TYPSTORAGE_EXTERNAL &&
 				!ttc->ttc_isnull[i] &&
 				VARATT_IS_CUSTOM(new_value) &&
-				Toastapi_copy_hook &&
 				(new_value_after_copy =
-					Toastapi_copy_hook(ttc->ttc_rel, i,
+					dispatch_toaster_copy(ttc->ttc_rel, (AttrNumber) i,
 						ttc->ttc_values[i],
 						ttc->ttc_am_options)) != (Datum) 0)
 			{
@@ -350,11 +354,14 @@ toast_tuple_externalize(ToastTupleContext *ttc, int attribute, int maxDataLen, u
 	attr->tai_colflags |= TOASTCOL_IGNORE;
 
 /*
- * Call custom TOAST function (hook) if present
+ * Call the toaster provider (if any) via dispatch_toaster_toast,
+ * which resolves the routine for this column and forwards to
+ * tsr_toast.  Falls through to vanilla toast_save_datum when no
+ * toaster is bound.
  */
-	if (!Toastapi_toast_hook ||
-		(*value = Toastapi_toast_hook(ttc->ttc_rel, attribute,
-			old_value, maxDataLen, options)) == (Datum) 0)
+	if ((*value = dispatch_toaster_toast(ttc->ttc_rel, (AttrNumber) attribute,
+										 old_value, maxDataLen, options))
+		== (Datum) 0)
 	{
 		*value = toast_save_datum(ttc->ttc_rel, old_value,
 			attr->tai_oldexternal, options);
@@ -408,8 +415,8 @@ toast_tuple_cleanup(ToastTupleContext *ttc)
 				*/
 				if (VARATT_IS_CUSTOM(DatumGetPointer(ttc->ttc_oldvalues[i])))
 				{
-					if (Toastapi_delete_hook)
-						Toastapi_delete_hook(ttc->ttc_rel, i, ttc->ttc_oldvalues[i], false);
+					dispatch_toaster_delete(ttc->ttc_rel, (AttrNumber) i,
+											ttc->ttc_oldvalues[i], false);
 				}
 				else
 					toast_delete_datum(ttc->ttc_rel, ttc->ttc_oldvalues[i], false);
@@ -444,8 +451,7 @@ toast_delete_external(Relation rel, const Datum *values, const bool *isnull,
 			 */
 			if (VARATT_IS_CUSTOM(DatumGetPointer(value)))
 			{
-				if (Toastapi_delete_hook)
-					Toastapi_delete_hook(rel, i, value, is_speculative);
+				dispatch_toaster_delete(rel, (AttrNumber) i, value, is_speculative);
 			}
 			else if (VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
 				toast_delete_datum(rel, value, is_speculative);

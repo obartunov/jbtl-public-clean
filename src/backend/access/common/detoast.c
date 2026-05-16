@@ -16,18 +16,23 @@
 #include "access/detoast.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/toast_custom.h"
+#include "access/toast_hook.h"
 #include "access/toast_internals.h"
+#include "access/toasterapi.h"
 #include "common/int.h"
 #include "common/pg_lzcompress.h"
 #include "utils/expandeddatum.h"
 #include "utils/rel.h"
-#include "access/toast_hook.h"
 
 /*
  * TOAST API hook
+ *
+ * The six lifecycle hooks (toast/update/copy/delete/detoast/size) have
+ * been replaced by TsrRoutine dispatch through resolver hooks declared
+ * in access/toasterapi.h.  The type-specific jsonb_object_field hook
+ * remains: it is an operator fast path, not a TOAST lifecycle method.
  */
-Toastapi_detoast_hook_type Toastapi_detoast_hook = NULL;
-Toastapi_size_hook_type Toastapi_size_hook = NULL;
 Toastapi_jsonb_object_field_hook_type Toastapi_jsonb_object_field_hook = NULL;
 
 static varlena *toast_fetch_datum(varlena *attr);
@@ -37,21 +42,122 @@ static varlena *toast_fetch_datum_slice(varlena *attr,
 static varlena *toast_decompress_datum(varlena *attr);
 static varlena *toast_decompress_datum_slice(varlena *attr, int32 slicelength);
 
+/*
+ * resolve_toaster_for_custom_attr
+ *
+ * Read-side resolver for CUSTOM varlenas.  Look up the provider's
+ * routine by va_toasterid and validate it.  Returns the routine on
+ * success; ERRORs out on every failure mode — there is no silent
+ * fallback for a CUSTOM varlena whose provider is unavailable.
+ *
+ * Error contract:
+ *   - no provider loaded
+ *       -> ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE
+ *   - provider does not recognize the toasterid
+ *       -> ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE
+ *   - routine does not implement the method the caller needs
+ *       -> caller's responsibility (this helper does not check)
+ *
+ * The errhint for "no provider loaded" deliberately mentions both
+ * the runtime case (the operator forgot to add the extension to
+ * shared_preload_libraries) and the restore case (pg_restore reading
+ * CUSTOM data before the operator can adjust s_p_l).  By the time we
+ * are reading a CUSTOM varlena from the heap, it is too late to add
+ * to s_p_l for THIS query; the user must restart with the extension
+ * loaded.
+ *
+ * Read-side context contract: callers that need a ToasterContextData
+ * to pass to tsr_detoast MUST fill ONLY toasterid.  Other fields
+ * (rel, toastreloid, attnum, options) are not in scope on the read
+ * path and stay zero.  Provider's tsr_detoast MUST NOT read any
+ * field besides toasterid; doing so is a contract violation and
+ * will read zeros / null pointers.
+ */
+static const TsrRoutine *
+resolve_toaster_for_custom_attr(const struct varlena *attr, Oid *out_toasterid)
+{
+	Oid					toasterid;
+	const TsrRoutine   *routine;
+
+	Assert(VARATT_IS_CUSTOM(attr));
+
+	if (get_toaster_routine_for_id_hook == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("custom TOAST pointer encountered but no toaster "
+						"provider is loaded"),
+				 errhint("Add the toaster's extension to "
+						 "shared_preload_libraries and restart the server.  "
+						 "If this error appears during pg_restore, abort "
+						 "the restore, adjust shared_preload_libraries on "
+						 "the destination cluster, restart, and retry.")));
+
+	toasterid = VARATT_CUSTOM_GET_TOASTERID(attr);
+	routine = get_toaster_routine_for_id_hook(toasterid);
+	if (routine == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("custom TOAST pointer references unknown toaster "
+						"with OID %u", toasterid),
+				 errhint("The toaster provider extension that wrote this "
+						 "value is not registered.  Ensure the extension "
+						 "is installed and loaded.")));
+
+	*out_toasterid = toasterid;
+	return routine;
+}
+
+/*
+ * toast_custom_datum_size
+ *
+ * Report the size of a CUSTOM-tagged varlena.  CUSTOM varlenas
+ * self-identify via varatt_custom.va_toasterid; we resolve the
+ * provider's routine through get_toaster_routine_for_id_hook.
+ *
+ * If the resolved routine implements tsr_size, we dispatch to it.
+ * Otherwise we fall back to the format-only computation, which reads
+ * the size out of the varatt_custom header without involving the
+ * provider.  This fallback is sufficient for every existing
+ * descriptor; tsr_size remains in TsrRoutine as a slot for future
+ * toasters with non-format size semantics.
+ *
+ * Read-side error contract: if no provider is loaded, or if the
+ * varlena references an unknown toasterid, we ERROR out.  We do not
+ * silently fall back to anything else — a CUSTOM varlena in the heap
+ * with no provider to decode it is unrecoverable, not a silent miss.
+ */
 Size
 toast_custom_datum_size(const void *ptr, ToastPtrSizeType sz_type)
 {
-	Size		size;
+	Oid					toasterid;
+	const TsrRoutine   *routine;
 
-	Assert(VARATT_IS_CUSTOM(ptr));
+	routine = resolve_toaster_for_custom_attr((const struct varlena *) ptr,
+											  &toasterid);
 
-	if (!Toastapi_size_hook ||
-		!(size = Toastapi_size_hook(ptr, sz_type)))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("custom TOAST pointer but %s not defined",
-						"Toastapi_size_hook")));
+	if (routine->tsr_size_fn != NULL)
+	{
+		Size	size = routine->tsr_size_fn(ptr, sz_type);
 
-	return size;
+		if (size == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("toaster with OID %u returned zero size for "
+							"custom TOAST pointer", toasterid)));
+		return size;
+	}
+
+	/* Format-only fallback. */
+	if (sz_type == TPTR_DATUM_SIZE || sz_type == TPTR_STORAGE_SIZE)
+		return offsetof(varatt_custom, va_toasterdata) +
+			   VARATT_CUSTOM_GET_DATA_SIZE(ptr);
+	else if (sz_type == TPTR_RAW_SIZE)
+		return VARATT_CUSTOM_GET_DATA_RAW_SIZE(ptr);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("invalid ToastPtrSizeType %d", (int) sz_type)));
+	return 0;					/* keep compiler happy */
 }
 
 
@@ -73,14 +179,34 @@ detoast_external_attr(varlena *attr)
 	varlena    *result;
 
 	/*
-	* Custom TOAST pointer processing first
-	*/
+	 * Custom TOAST pointer processing first.  CUSTOM varlena
+	 * self-identifies via va_toasterid; we dispatch through
+	 * the resolver-by-id hook.  Strict error mode on read side
+	 * (see resolve_toaster_for_custom_attr for the contract).
+	 */
 	if (VARATT_IS_CUSTOM(attr))
 	{
-		if (!Toastapi_detoast_hook)
-			elog(ERROR, "Custom TOAST pointer but no detoast hook defined");
+		Oid					toasterid;
+		const TsrRoutine   *routine;
+		ToasterContextData	tcxt;
 
-		result = (struct varlena *) DatumGetPointer(Toastapi_detoast_hook(PointerGetDatum(attr), 0, -1));
+		routine = resolve_toaster_for_custom_attr(attr, &toasterid);
+		if (routine->tsr_detoast == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("toaster with OID %u does not implement "
+							"detoast", toasterid)));
+
+		/*
+		 * Read-side context: ONLY toasterid is populated.  Other fields
+		 * (rel, toastreloid, attnum, options) stay zero — they are not
+		 * in scope at detoast time and the provider's tsr_detoast MUST
+		 * NOT read them.  See resolve_toaster_for_custom_attr docblock.
+		 */
+		memset(&tcxt, 0, sizeof(tcxt));
+		tcxt.toasterid = toasterid;
+		result = (struct varlena *) DatumGetPointer(
+			routine->tsr_detoast(&tcxt, PointerGetDatum(attr), 0, -1));
 	}
 	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
@@ -264,14 +390,28 @@ detoast_attr_slice(varlena *attr,
 		slicelength = slicelimit = -1;
 
 	/*
-	* Custom TOAST pointer processing first
-	*/
+	 * Custom TOAST pointer processing first.  See detoast_external_attr
+	 * for the resolver-by-id contract.
+	 */
 	if (VARATT_IS_CUSTOM(attr))
 	{
-		if (!Toastapi_detoast_hook)
-			elog(ERROR, "custom TOAST pointer but no detoast hook defined");
+		Oid					toasterid;
+		const TsrRoutine   *routine;
+		ToasterContextData	tcxt;
 
-		return (struct varlena *) DatumGetPointer(Toastapi_detoast_hook(PointerGetDatum(attr), sliceoffset, slicelength));
+		routine = resolve_toaster_for_custom_attr(attr, &toasterid);
+		if (routine->tsr_detoast == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("toaster with OID %u does not implement "
+							"detoast", toasterid)));
+
+		/* Read-side context: only toasterid populated.  See helper. */
+		memset(&tcxt, 0, sizeof(tcxt));
+		tcxt.toasterid = toasterid;
+		return (struct varlena *) DatumGetPointer(
+			routine->tsr_detoast(&tcxt, PointerGetDatum(attr),
+								 sliceoffset, slicelength));
 	}
 	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{

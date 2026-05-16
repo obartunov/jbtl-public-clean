@@ -40,13 +40,6 @@
 
 PG_MODULE_MAGIC;
 
-static Toastapi_toast_hook_type toastapi_toast_hook = NULL;
-static Toastapi_detoast_hook_type toastapi_detoast_hook = NULL;
-static Toastapi_size_hook_type toastapi_size_hook = NULL;
-static Toastapi_copy_hook_type toastapi_copy_hook = NULL;
-static Toastapi_update_hook_type toastapi_update_hook = NULL;
-static Toastapi_delete_hook_type toastapi_delete_hook = NULL;
-
 /* FIXME handler oid stored instead of toaster oid in custom pointers */
 /*
  *	TOAST API v1.1 uses TOASTER_ID and stores Toaster handler name instead of OID
@@ -119,202 +112,14 @@ get_toaster_cache_for_attr(Relation rel, int attnum)
 	return memcpy(palloc(sizeof(*cache)), cache, sizeof(*cache));
 }
 
-static TsrRoutine *
-get_toaster_for_attr(Relation rel, int attnum, ToasterContext cxt)
-{
-	RelToastCache *cache = get_toaster_cache_for_attr(rel, attnum);
-
-	if (!cache)
-		return NULL;
-
-	if (cxt)
-	{
-		cxt->rel = rel;
-		cxt->toastreloid = rel->rd_rel->reltoastrelid;
-		cxt->toasterid = cache->toasterid;
-		cxt->attnum = attnum + 1;
-	}
-
-	return &cache->routine;
-}
-
-static Datum
-toastapi_toast(Relation rel, int attnum, Datum value, int max_inline_len, int options)
-{
-	ToasterContextData tcxt;
-	TsrRoutine *toaster = get_toaster_for_attr(rel, attnum, &tcxt);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	Form_pg_attribute att = TupleDescAttr(tupdesc, attnum);
-	ToastCompressionId cmid;
-
-	if (!toaster)
-		return (Datum) 0;
-
-	if (!OidIsValid(rel->rd_rel->reltoastrelid))
-		elog(ERROR, "toast relation is missing for toasted attribute %d of relation %u",
-			 attnum, RelationGetRelid(rel));
-
-	if (att->attstorage == TYPSTORAGE_PLAIN ||
-		att->attstorage == TYPSTORAGE_EXTERNAL)
-	{
-		cmid = TOAST_INVALID_COMPRESSION_ID;
-	}
-	else
-	{
-		switch (att->attcompression != InvalidCompressionMethod ? att->attcompression : default_toast_compression)
-		{
-			case TOAST_PGLZ_COMPRESSION:
-				cmid = TOAST_PGLZ_COMPRESSION_ID;
-				break;
-			case TOAST_LZ4_COMPRESSION:
-				cmid = TOAST_LZ4_COMPRESSION_ID;
-				break;
-			default:
-				Assert(false);
-				cmid = TOAST_INVALID_COMPRESSION_ID;
-				break;
-		}
-	}
-
-	return toaster->tsr_toast(&tcxt, value, value,
-							  max_inline_len, options,
-							  att->attstorage, cmid);
-}
-
-static Size
-toastapi_size(const void *ptr, ToastPtrSizeType sz_type)
-{
-	if (sz_type == TPTR_DATUM_SIZE ||
-		sz_type == TPTR_STORAGE_SIZE) /* FIXME */
-		return offsetof(varatt_custom, va_toasterdata) + VARATT_CUSTOM_GET_DATA_SIZE(ptr);
-	else if (sz_type == TPTR_RAW_SIZE)
-		return VARATT_CUSTOM_GET_DATA_RAW_SIZE(ptr);
-	else
-		elog(ERROR, "invalid toastapi_size() request");
-
-	return 0; /* avoid warning */
-}
-
-static TsrRoutine *
-get_toaster_for_ptr(Relation rel, int attnum, Datum toast_ptr, ToasterContext tcxt)
-{
-	struct varlena *custom_toast_ptr = (struct varlena *) DatumGetPointer(toast_ptr);
-	Oid			toasterid;
-	TsrRoutine *toaster = NULL;
-	RelToastCache *cache;
-
-	Assert(VARATT_IS_CUSTOM(custom_toast_ptr));
-	toasterid = VARATT_CUSTOM_GET_TOASTERID(custom_toast_ptr);
-
-	if (rel && attnum >= 0 &&
-		(cache = get_toaster_cache_for_attr(rel, attnum)) &&
-		cache->toasterid == toasterid)
-		toaster = &cache->routine;
-	else
-#ifdef TOASTER_HANDLER_OID_IS_TOASTER_ID
-		toaster = SearchTsrHandlerCache(toasterid);
-#else
-		toaster = SearchTsrCache(toasterid);
-#endif
-
-	if (tcxt)
-	{
-		tcxt->rel = rel;
-		tcxt->toasterid = toasterid;
-		tcxt->toastreloid = rel ? rel->rd_rel->reltoastrelid : InvalidOid;
-		tcxt->attnum = attnum + 1;
-	}
-
-	return toaster;
-}
-
-static Datum
-toastapi_detoast(Datum toast_ptr, int offset, int length)
-{
-	ToasterContextData tcxt;
-	TsrRoutine *toaster;
-
-#if 0 /* TODO */
-	if (VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(toast_ptr)))
-		return custom_detoast(toast_ptr, offset, length);
-#endif
-
-	toaster = get_toaster_for_ptr(NULL, -1, toast_ptr, &tcxt);
-
-	return toaster->tsr_detoast(&tcxt, toast_ptr, offset, length);
-}
-
-static Datum
-toastapi_update(Relation rel, int attnum,
-				Datum new_value, Datum old_value, int am_options)
-{
-	struct varlena *new_val = (struct varlena *) DatumGetPointer(new_value);
-	struct varlena *old_val = (struct varlena *) DatumGetPointer(old_value);
-	ToasterContextData tcxt;
-	TsrRoutine *toaster;
-	Oid			old_toasterid;
-
-	/* old_val must be CUSTOM (the column was already toaster-owned). */
-	Assert(VARATT_IS_CUSTOM(old_val));
-
-	old_toasterid = VARATT_CUSTOM_GET_TOASTERID(old_val);
-
-	/* If the new value is also CUSTOM, require matching toasterid. */
-	if (VARATT_IS_CUSTOM(new_val))
-	{
-		Oid new_toasterid = VARATT_CUSTOM_GET_TOASTERID(new_val);
-		if (new_toasterid != old_toasterid)
-			return (Datum) 0;
-	}
-
-	toaster = get_toaster_for_attr(rel, attnum, &tcxt);
-
-	/* toaster was reset or another toaster was set, retoast value */
-	if (!toaster || tcxt.toasterid != old_toasterid)
-		return (Datum) 0;
-
-	/* toaster does not support custom updates, retoast value */
-	if (!toaster->tsr_update)
-		return (Datum) 0;
-
-	return toaster->tsr_update(&tcxt, new_value, old_value, am_options);
-}
-
-static Datum
-toastapi_copy(Relation rel, int attnum, Datum value, int am_options)
-{
-	ToasterContextData tcxt;
-	TsrRoutine *toaster = get_toaster_for_attr(rel, attnum, &tcxt);
-	Oid			toasterid = VARATT_CUSTOM_GET_TOASTERID(DatumGetPointer(value));
-
-	/* detoast value, if toaster was changed or tsr_copy() is not defined */
-	if (!toaster || toasterid != tcxt.toasterid || !toaster->tsr_copy)
-		return (Datum) 0;
-
-	return toaster->tsr_copy(&tcxt, value, am_options);
-}
-
-static void
-toastapi_delete(Relation rel, int attnum, Datum value, bool is_speculative)
-{
-	ToasterContextData tcxt;
-	TsrRoutine *toaster = get_toaster_for_ptr(rel, attnum, value, &tcxt);
-
-	if (!toaster->tsr_delete)
-		return;
-
-	toaster->tsr_delete(&tcxt, value, is_speculative);
-}
-
 /*
  * Routine-struct resolver implementations — Option A (two-hook split).
  *
- * These are wired to get_toaster_id_for_rel_hook /
- * get_toaster_routine_for_id_hook at _PG_init.  They are introduced
- * alongside the TsrRoutine declaration in src/include/access/toasterapi.h.
- * In this commit the flat lifecycle hooks still drive core call sites;
- * the resolver path is exposed for regression coverage and for providers
- * that want to wire the new shape during the transition.
+ * Wired to get_toaster_id_for_rel_hook / get_toaster_routine_for_id_hook
+ * at _PG_init.  Core call sites dispatch toast/update/copy/delete by
+ * composing the two: rel-hook -> Oid -> id-hook -> routine.  Read side
+ * (detoast/size) uses get_toaster_routine_for_id_hook directly with the
+ * Oid taken from varatt_custom.va_toasterid.
  *
  * Lifetime contract: the returned pointer is valid for the immediate
  * call only.  Core must not retain it.  See access/toasterapi.h.
@@ -348,26 +153,13 @@ void _PG_init(void)
 				 errmsg("TOASTAPI module must be loaded as shared library."),
 				 errdetail("Add 'toastapi' into the shared_preload_libraries list.")));
 
-	toastapi_toast_hook = Toastapi_toast_hook;
-	toastapi_detoast_hook = Toastapi_detoast_hook;
-	toastapi_size_hook = Toastapi_size_hook;
-	toastapi_copy_hook = Toastapi_copy_hook;
-	toastapi_update_hook = Toastapi_update_hook;
-	toastapi_delete_hook = Toastapi_delete_hook;
-
-	Toastapi_toast_hook = toastapi_toast;
-	Toastapi_detoast_hook = toastapi_detoast;
-	Toastapi_size_hook = toastapi_size;
-	Toastapi_copy_hook = toastapi_copy;
-	Toastapi_update_hook = toastapi_update;
-	Toastapi_delete_hook = toastapi_delete;
-
 	/*
-	 * Install routine resolver hooks introduced for the TsrRoutine
-	 * dispatch path — Option A (two-hook split).  Until the
-	 * lifecycle-conversion patch flips core call sites to use them,
-	 * these are exposed only for the regression tests and for
-	 * future-compatible providers.
+	 * Install routine resolver hooks (Option A two-hook split).  Core
+	 * call sites dispatch toast/update/copy/delete by composing
+	 * id-hook(rel,attno) -> Oid -> routine-hook(Oid) -> routine.  Read
+	 * side dispatches detoast/size through routine-hook(Oid) with the
+	 * Oid taken from varatt_custom.va_toasterid.  The flat lifecycle
+	 * hooks are gone after this lifecycle-conversion patch.
 	 */
 	get_toaster_id_for_rel_hook = toastapi_get_id_for_rel;
 	get_toaster_routine_for_id_hook = toastapi_get_routine_for_id;

@@ -31,6 +31,7 @@
 #include "access/toast_helper.h"
 #include "access/toast_hook.h"
 #include "access/toast_internals.h"
+#include "access/toasterapi.h"
 #include "utils/fmgroids.h"
 
 
@@ -109,20 +110,38 @@ static void
 heap_toast_tuple_externalize(ToastTupleContext *ttc, int attno,
 							 int maxDataLen)
 {
-	int		max_inline_size;
-	int		size;
+	int		max_inline_size = 0;
 
-	if (Toastapi_toast_hook)
+	/*
+	 * Only reserve inline room for a CUSTOM pointer if THIS column has
+	 * a toaster bound to it.  Previously the heuristic keyed off "any
+	 * resolver hook installed", which gave every column on a database
+	 * with any loaded provider a smaller inline budget — penalising
+	 * non-CUSTOM columns whenever a provider was loaded.  Resolve the
+	 * column-specific toaster id via the rel-hook; only allocate the
+	 * inline budget when the id is valid.
+	 *
+	 * Note: the rel hook receives attno in the 0-based convention
+	 * established by the v1 dispatch helpers (dispatch_toaster_*).
+	 * AttrNumber is used as the wire type but values stay 0-based for
+	 * compatibility with the provider's internal cache lookup.
+	 */
+	if (get_toaster_id_for_rel_hook != NULL)
 	{
-		size = heap_compute_data_size_without_attr(ttc->ttc_rel->rd_att,
-												   ttc->ttc_values,
-												   ttc->ttc_isnull,
-												   attno);
+		Oid			toasterid;
 
-		max_inline_size = Max(0, maxDataLen - size);
+		toasterid = get_toaster_id_for_rel_hook(ttc->ttc_rel,
+												(AttrNumber) attno);
+		if (OidIsValid(toasterid))
+		{
+			int		size = heap_compute_data_size_without_attr(ttc->ttc_rel->rd_att,
+															   ttc->ttc_values,
+															   ttc->ttc_isnull,
+															   attno);
+
+			max_inline_size = Max(0, maxDataLen - size);
+		}
 	}
-	else
-		max_inline_size = 0;
 
 	toast_tuple_externalize(ttc, attno, max_inline_size, ttc->ttc_am_options);
 }

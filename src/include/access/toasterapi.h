@@ -180,8 +180,8 @@ typedef struct TsrRoutine
 
 	/*
 	 * Read-side size resolver.  May be NULL in 0003 (this commit);
-	 * 0004 makes it mandatory once the call sites flip from the flat
-	 * Toastapi_size_hook to resolver-by-id dispatch.
+	 * 0004 makes it mandatory once the call sites flip to
+	 * resolver-by-id dispatch.
 	 */
 	toaster_size_function		tsr_size_fn;
 } TsrRoutine;

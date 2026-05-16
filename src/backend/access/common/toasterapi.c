@@ -160,9 +160,50 @@ dispatch_toaster_toast(Relation rel, AttrNumber attnum, Datum value,
 }
 
 /*
- * Helper for write-side delete call sites.  Resolves the routine and
- * dispatches to tsr_delete.  Silent no-op if no toaster is bound, to
- * preserve current behavior on rows that predate the provider.
+ * Helper for write-side delete call sites.
+ *
+ * Resolution rule (review item: delete is value-identity, not
+ * column-binding only):
+ *
+ *   1. First try the column's current binding (Option A write-side
+ *      resolver).  This is the right answer in the common case
+ *      where the column is still bound to the toaster that wrote
+ *      the value.
+ *
+ *   2. If the rel-hook returns no routine BUT the value is CUSTOM,
+ *      fall back to value identity: resolve the routine through
+ *      the id-hook using VARATT_CUSTOM_GET_TOASTERID(value).  This
+ *      handles the case where the column was rebound or reset
+ *      (ALTER TABLE / reset_toaster) between write and delete:
+ *      the column's current binding no longer points at the
+ *      toaster that owns the existing storage, but the stored
+ *      value itself still carries va_toasterid identifying its
+ *      provider.  Without this fall-back, the old CUSTOM toast
+ *      chunks would leak.
+ *
+ *   3. If the value is CUSTOM and value-identity also fails to
+ *      resolve a provider (no provider loaded, or provider does
+ *      not recognise the toasterid), raise ERROR.  Silent leak of
+ *      CUSTOM storage when the provider identity is recorded but
+ *      cannot be reached is not acceptable; both call sites
+ *      (toast_tuple_cleanup, toast_delete_external) are inside
+ *      normal foreground DML and ROLLBACK reverts the
+ *      surrounding statement cleanly.
+ *
+ *   4. If the resolved routine does not implement tsr_delete,
+ *      silently return.  Providers that produce CUSTOM varlenas
+ *      pointing at external storage SHOULD implement tsr_delete,
+ *      but the tightening of that contract is out of scope for
+ *      this patch series; tracked separately.
+ *
+ * Conceptual rule (consistent with the rest of v2):
+ *   toast/write    -> column binding decides how to create storage
+ *   detoast/read   -> stored value identity decides how to read
+ *   delete         -> stored value identity decides how to delete
+ *                     (with column binding as a hot-path shortcut)
+ *   update         -> column binding decides whether provider-specific
+ *                     update is possible; fall-through still goes
+ *                     through delete (which uses value identity)
  */
 void
 dispatch_toaster_delete(Relation rel, AttrNumber attnum, Datum value,
@@ -171,8 +212,43 @@ dispatch_toaster_delete(Relation rel, AttrNumber attnum, Datum value,
 	ToasterContextData	tcxt;
 	const TsrRoutine   *routine;
 	Oid					toasterid;
+	struct varlena	   *val = (struct varlena *) DatumGetPointer(value);
 
+	/* 1. Try the column's current binding. */
 	routine = resolve_routine_for_rel(rel, attnum, &toasterid);
+
+	/* 2. Value-identity fall-back when binding does not resolve. */
+	if (routine == NULL && VARATT_IS_CUSTOM(val))
+	{
+		if (get_toaster_routine_for_id_hook == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("custom TOAST pointer needs delete but no "
+							"toaster provider is loaded"),
+					 errhint("Add the toaster's extension to "
+							 "shared_preload_libraries and restart "
+							 "the server.")));
+
+		toasterid = VARATT_CUSTOM_GET_TOASTERID(val);
+		routine = get_toaster_routine_for_id_hook(toasterid);
+		if (routine == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("custom TOAST pointer needs delete but references "
+							"unknown toaster with OID %u", toasterid),
+					 errhint("The toaster provider extension that wrote this "
+							 "value is not registered.  Ensure the extension "
+							 "is installed and loaded.")));
+
+		toasterapi_check_routine_size(routine);
+	}
+
+	/*
+	 * No routine for a non-CUSTOM value: this should not happen given
+	 * both call sites gate on VARATT_IS_CUSTOM, but stay defensive.
+	 * No routine for a CUSTOM value is unreachable past the block
+	 * above (we either resolved or ERROR'd).
+	 */
 	if (routine == NULL || routine->tsr_delete == NULL)
 		return;
 

@@ -2854,11 +2854,12 @@ jbtl_update(ToasterContext tcxt, Datum new_value, Datum old_value,
 	 * Byte-identical no-op short-circuit (must run BEFORE the diagnostic
 	 * counter and BEFORE any chain manipulation).
 	 *
-	 * The β bridge fires Toastapi_update_hook for any UPDATE where old
-	 * is CUSTOM, including UPDATEs that do not change the jsonb column at
-	 * all ("UPDATE t SET id = id") or set it byte-equal ("SET jb = jb").
-	 * In those cases core hands us new_v == old_v at the bytes level: the
-	 * heap row's new tuple still carries the same JBTL_POINTER varlena.
+	 * Core's dispatch_toaster_update fires tsr_update for any UPDATE
+	 * where old is CUSTOM, including UPDATEs that do not change the
+	 * jsonb column at all ("UPDATE t SET id = id") or set it byte-equal
+	 * ("SET jb = jb").  In those cases core hands us new_v == old_v at
+	 * the bytes level: the heap row's new tuple still carries the same
+	 * JBTL_POINTER varlena.
 	 *
 	 * The full "approve, delete old, keep new" path below would delete a
 	 * toast chain that the heap row still references — a lifecycle
