@@ -76,8 +76,8 @@ static varlena *toast_decompress_datum_slice(varlena *attr, int32 slicelength);
 static const TsrRoutine *
 resolve_toaster_for_custom_attr(const struct varlena *attr, Oid *out_toasterid)
 {
-	Oid					toasterid;
-	const TsrRoutine   *routine;
+	Oid			toasterid;
+	const		TsrRoutine *routine;
 
 	Assert(VARATT_IS_CUSTOM(attr));
 
@@ -129,15 +129,15 @@ resolve_toaster_for_custom_attr(const struct varlena *attr, Oid *out_toasterid)
 Size
 toast_custom_datum_size(const void *ptr, ToastPtrSizeType sz_type)
 {
-	Oid					toasterid;
-	const TsrRoutine   *routine;
+	Oid			toasterid;
+	const		TsrRoutine *routine;
 
 	routine = resolve_toaster_for_custom_attr((const struct varlena *) ptr,
 											  &toasterid);
 
 	if (routine->tsr_size_fn != NULL)
 	{
-		Size	size = routine->tsr_size_fn(ptr, sz_type);
+		Size		size = routine->tsr_size_fn(ptr, sz_type);
 
 		if (size == 0)
 			ereport(ERROR,
@@ -150,7 +150,7 @@ toast_custom_datum_size(const void *ptr, ToastPtrSizeType sz_type)
 	/* Format-only fallback. */
 	if (sz_type == TPTR_DATUM_SIZE || sz_type == TPTR_STORAGE_SIZE)
 		return offsetof(varatt_custom, va_toasterdata) +
-			   VARATT_CUSTOM_GET_DATA_SIZE(ptr);
+			VARATT_CUSTOM_GET_DATA_SIZE(ptr);
 	else if (sz_type == TPTR_RAW_SIZE)
 		return VARATT_CUSTOM_GET_DATA_RAW_SIZE(ptr);
 
@@ -179,16 +179,16 @@ detoast_external_attr(varlena *attr)
 	varlena    *result;
 
 	/*
-	 * Custom TOAST pointer processing first.  CUSTOM varlena
-	 * self-identifies via va_toasterid; we dispatch through
-	 * the resolver-by-id hook.  Strict error mode on read side
-	 * (see resolve_toaster_for_custom_attr for the contract).
+	 * Custom TOAST pointer processing first.  CUSTOM varlena self-identifies
+	 * via va_toasterid; we dispatch through the resolver-by-id hook.  Strict
+	 * error mode on read side (see resolve_toaster_for_custom_attr for the
+	 * contract).
 	 */
 	if (VARATT_IS_CUSTOM(attr))
 	{
-		Oid					toasterid;
-		const TsrRoutine   *routine;
-		ToasterContextData	tcxt;
+		Oid			toasterid;
+		const		TsrRoutine *routine;
+		ToasterContextData tcxt;
 
 		routine = resolve_toaster_for_custom_attr(attr, &toasterid);
 		if (routine->tsr_detoast == NULL)
@@ -198,15 +198,15 @@ detoast_external_attr(varlena *attr)
 							"detoast", toasterid)));
 
 		/*
-		 * Read-side context: ONLY toasterid is populated.  Other fields
-		 * (rel, toastreloid, attnum, options) stay zero — they are not
-		 * in scope at detoast time and the provider's tsr_detoast MUST
-		 * NOT read them.  See resolve_toaster_for_custom_attr docblock.
+		 * Read-side context: ONLY toasterid is populated.  Other fields (rel,
+		 * toastreloid, attnum, options) stay zero — they are not in scope
+		 * at detoast time and the provider's tsr_detoast MUST NOT read them.
+		 * See resolve_toaster_for_custom_attr docblock.
 		 */
 		memset(&tcxt, 0, sizeof(tcxt));
 		tcxt.toasterid = toasterid;
 		result = (struct varlena *) DatumGetPointer(
-			routine->tsr_detoast(&tcxt, PointerGetDatum(attr), 0, -1));
+													routine->tsr_detoast(&tcxt, PointerGetDatum(attr), 0, -1));
 	}
 	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
@@ -390,14 +390,14 @@ detoast_attr_slice(varlena *attr,
 		slicelength = slicelimit = -1;
 
 	/*
-	 * Custom TOAST pointer processing first.  See detoast_external_attr
-	 * for the resolver-by-id contract.
+	 * Custom TOAST pointer processing first.  See detoast_external_attr for
+	 * the resolver-by-id contract.
 	 */
 	if (VARATT_IS_CUSTOM(attr))
 	{
-		Oid					toasterid;
-		const TsrRoutine   *routine;
-		ToasterContextData	tcxt;
+		Oid			toasterid;
+		const		TsrRoutine *routine;
+		ToasterContextData tcxt;
 
 		routine = resolve_toaster_for_custom_attr(attr, &toasterid);
 		if (routine->tsr_detoast == NULL)
@@ -410,8 +410,8 @@ detoast_attr_slice(varlena *attr,
 		memset(&tcxt, 0, sizeof(tcxt));
 		tcxt.toasterid = toasterid;
 		return (struct varlena *) DatumGetPointer(
-			routine->tsr_detoast(&tcxt, PointerGetDatum(attr),
-								 sliceoffset, slicelength));
+												  routine->tsr_detoast(&tcxt, PointerGetDatum(attr),
+																	   sliceoffset, slicelength));
 	}
 	else if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{

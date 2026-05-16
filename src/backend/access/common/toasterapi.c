@@ -30,8 +30,8 @@
 #include "catalog/pg_attribute.h"
 #include "utils/rel.h"
 
-get_toaster_id_for_rel_hook_type		get_toaster_id_for_rel_hook = NULL;
-get_toaster_routine_for_id_hook_type	get_toaster_routine_for_id_hook = NULL;
+get_toaster_id_for_rel_hook_type get_toaster_id_for_rel_hook = NULL;
+get_toaster_routine_for_id_hook_type get_toaster_routine_for_id_hook = NULL;
 
 /*
  * Sanity-check the routine the provider just handed us.  We require
@@ -43,7 +43,7 @@ get_toaster_routine_for_id_hook_type	get_toaster_routine_for_id_hook = NULL;
  * (one Size compare) and is the only ABI marker we keep.
  */
 static inline void
-toasterapi_check_routine_size(const TsrRoutine *routine)
+toasterapi_check_routine_size(const TsrRoutine * routine)
 {
 	if (routine->tsr_size != sizeof(TsrRoutine))
 		elog(ERROR,
@@ -61,8 +61,8 @@ toasterapi_check_routine_size(const TsrRoutine *routine)
 static const TsrRoutine *
 resolve_routine_for_rel(Relation rel, AttrNumber attnum, Oid *out_toasterid)
 {
-	Oid				toasterid;
-	const TsrRoutine *routine;
+	Oid			toasterid;
+	const		TsrRoutine *routine;
 
 	*out_toasterid = InvalidOid;
 
@@ -103,12 +103,12 @@ Datum
 dispatch_toaster_toast(Relation rel, AttrNumber attnum, Datum value,
 					   int max_inline_size, int am_options)
 {
-	ToasterContextData	tcxt;
-	const TsrRoutine   *routine;
-	TupleDesc			tupdesc;
-	Form_pg_attribute	att;
-	ToastCompressionId	cmid;
-	Oid					toasterid;
+	ToasterContextData tcxt;
+	const		TsrRoutine *routine;
+	TupleDesc	tupdesc;
+	Form_pg_attribute att;
+	ToastCompressionId cmid;
+	Oid			toasterid;
 
 	routine = resolve_routine_for_rel(rel, attnum, &toasterid);
 	if (routine == NULL || routine->tsr_toast == NULL)
@@ -209,10 +209,10 @@ void
 dispatch_toaster_delete(Relation rel, AttrNumber attnum, Datum value,
 						bool is_speculative)
 {
-	ToasterContextData	tcxt;
-	const TsrRoutine   *routine;
-	Oid					toasterid;
-	struct varlena	   *val = (struct varlena *) DatumGetPointer(value);
+	ToasterContextData tcxt;
+	const		TsrRoutine *routine;
+	Oid			toasterid;
+	struct varlena *val = (struct varlena *) DatumGetPointer(value);
 
 	/* 1. Try the column's current binding. */
 	routine = resolve_routine_for_rel(rel, attnum, &toasterid);
@@ -244,10 +244,10 @@ dispatch_toaster_delete(Relation rel, AttrNumber attnum, Datum value,
 	}
 
 	/*
-	 * No routine for a non-CUSTOM value: this should not happen given
-	 * both call sites gate on VARATT_IS_CUSTOM, but stay defensive.
-	 * No routine for a CUSTOM value is unreachable past the block
-	 * above (we either resolved or ERROR'd).
+	 * No routine for a non-CUSTOM value: this should not happen given both
+	 * call sites gate on VARATT_IS_CUSTOM, but stay defensive. No routine for
+	 * a CUSTOM value is unreachable past the block above (we either resolved
+	 * or ERROR'd).
 	 */
 	if (routine == NULL || routine->tsr_delete == NULL)
 		return;
@@ -256,7 +256,7 @@ dispatch_toaster_delete(Relation rel, AttrNumber attnum, Datum value,
 	tcxt.rel = rel;
 	tcxt.toasterid = toasterid;
 	tcxt.toastreloid = OidIsValid(rel->rd_rel->reltoastrelid)
-					   ? rel->rd_rel->reltoastrelid : InvalidOid;
+		? rel->rd_rel->reltoastrelid : InvalidOid;
 	tcxt.attnum = (int) attnum + 1;
 
 	routine->tsr_delete(&tcxt, value, is_speculative);
@@ -282,12 +282,12 @@ Datum
 dispatch_toaster_update(Relation rel, AttrNumber attnum,
 						Datum new_value, Datum old_value, int am_options)
 {
-	ToasterContextData	tcxt;
-	const TsrRoutine   *routine;
-	struct varlena	   *new_val;
-	struct varlena	   *old_val;
-	Oid					old_toasterid;
-	Oid					col_toasterid;
+	ToasterContextData tcxt;
+	const		TsrRoutine *routine;
+	struct varlena *new_val;
+	struct varlena *old_val;
+	Oid			old_toasterid;
+	Oid			col_toasterid;
 
 	new_val = (struct varlena *) DatumGetPointer(new_value);
 	old_val = (struct varlena *) DatumGetPointer(old_value);
@@ -297,7 +297,7 @@ dispatch_toaster_update(Relation rel, AttrNumber attnum,
 
 	if (VARATT_IS_CUSTOM(new_val))
 	{
-		Oid new_toasterid = VARATT_CUSTOM_GET_TOASTERID(new_val);
+		Oid			new_toasterid = VARATT_CUSTOM_GET_TOASTERID(new_val);
 
 		if (new_toasterid != old_toasterid)
 			return (Datum) 0;
@@ -313,7 +313,7 @@ dispatch_toaster_update(Relation rel, AttrNumber attnum,
 	tcxt.rel = rel;
 	tcxt.toasterid = col_toasterid;
 	tcxt.toastreloid = OidIsValid(rel->rd_rel->reltoastrelid)
-					   ? rel->rd_rel->reltoastrelid : InvalidOid;
+		? rel->rd_rel->reltoastrelid : InvalidOid;
 	tcxt.attnum = (int) attnum + 1;
 	tcxt.options = am_options;
 
@@ -330,10 +330,10 @@ Datum
 dispatch_toaster_copy(Relation rel, AttrNumber attnum, Datum value,
 					  int am_options)
 {
-	ToasterContextData	tcxt;
-	const TsrRoutine   *routine;
-	Oid					col_toasterid;
-	Oid					value_toasterid;
+	ToasterContextData tcxt;
+	const		TsrRoutine *routine;
+	Oid			col_toasterid;
+	Oid			value_toasterid;
 
 	value_toasterid = VARATT_CUSTOM_GET_TOASTERID(DatumGetPointer(value));
 
@@ -346,7 +346,7 @@ dispatch_toaster_copy(Relation rel, AttrNumber attnum, Datum value,
 	tcxt.rel = rel;
 	tcxt.toasterid = col_toasterid;
 	tcxt.toastreloid = OidIsValid(rel->rd_rel->reltoastrelid)
-					   ? rel->rd_rel->reltoastrelid : InvalidOid;
+		? rel->rd_rel->reltoastrelid : InvalidOid;
 	tcxt.attnum = (int) attnum + 1;
 	tcxt.options = am_options;
 

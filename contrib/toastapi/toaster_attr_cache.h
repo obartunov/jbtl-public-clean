@@ -20,7 +20,7 @@
 #include "utils/rel.h"
 
 extern void ToasterAttrCacheInit(void);
-extern TsrRoutine *ToasterAttrCacheLookup(Relation rel, AttrNumber attnum,
+extern TsrRoutine * ToasterAttrCacheLookup(Relation rel, AttrNumber attnum,
 										   Oid *out_toasterid);
 
 #endif							/* TOASTER_ATTR_CACHE_H */

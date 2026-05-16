@@ -73,10 +73,10 @@ toastapi_get_id_for_rel(Relation rel, AttrNumber attnum)
 
 	/*
 	 * ToasterAttrCacheLookup is the HTAB-backed cache.  We only need the
-	 * toasterid for Option A; the routine pointer is resolved in the
-	 * second hop via get_toaster_routine_for_id_hook.  Discard the
-	 * routine; the lookup also caches negative results so the catalog
-	 * probe is amortised across statements.
+	 * toasterid for Option A; the routine pointer is resolved in the second
+	 * hop via get_toaster_routine_for_id_hook.  Discard the routine; the
+	 * lookup also caches negative results so the catalog probe is amortised
+	 * across statements.
 	 */
 	(void) ToasterAttrCacheLookup(rel, attnum, &toasterid);
 
@@ -86,10 +86,11 @@ toastapi_get_id_for_rel(Relation rel, AttrNumber attnum)
 static const TsrRoutine *
 toastapi_get_routine_for_id(Oid toasterid)
 {
-	return GetTsrRoutineByOid(toasterid, /*noerror=*/true);
+	return GetTsrRoutineByOid(toasterid, /* noerror= */ true);
 }
 
-void _PG_init(void)
+void
+_PG_init(void)
 {
 	/*
 	 * In order to create our shared memory area, we have to be loaded via
@@ -102,22 +103,22 @@ void _PG_init(void)
 				 errdetail("Add 'toastapi' into the shared_preload_libraries list.")));
 
 	/*
-	 * Initialise the per-backend (relid, attnum) -> TsrRoutine cache
-	 * and register its relcache invalidation callback eagerly.  Doing
-	 * this here, not lazily inside ToasterAttrCacheLookup, closes the
-	 * window where a relcache event could fire between hash_create
-	 * and CacheRegisterRelcacheCallback and leave the cache holding
-	 * stale entries.
+	 * Initialise the per-backend (relid, attnum) -> TsrRoutine cache and
+	 * register its relcache invalidation callback eagerly.  Doing this here,
+	 * not lazily inside ToasterAttrCacheLookup, closes the window where a
+	 * relcache event could fire between hash_create and
+	 * CacheRegisterRelcacheCallback and leave the cache holding stale
+	 * entries.
 	 */
 	ToasterAttrCacheInit();
 
 	/*
-	 * Install routine resolver hooks (Option A two-hook split).  Core
-	 * call sites dispatch toast/update/copy/delete by composing
-	 * id-hook(rel,attno) -> Oid -> routine-hook(Oid) -> routine.  Read
-	 * side dispatches detoast/size through routine-hook(Oid) with the
-	 * Oid taken from varatt_custom.va_toasterid.  The flat lifecycle
-	 * hooks are gone after this lifecycle-conversion patch.
+	 * Install routine resolver hooks (Option A two-hook split).  Core call
+	 * sites dispatch toast/update/copy/delete by composing id-hook(rel,attno)
+	 * -> Oid -> routine-hook(Oid) -> routine.  Read side dispatches
+	 * detoast/size through routine-hook(Oid) with the Oid taken from
+	 * varatt_custom.va_toasterid.  The flat lifecycle hooks are gone after
+	 * this lifecycle-conversion patch.
 	 */
 	get_toaster_id_for_rel_hook = toastapi_get_id_for_rel;
 	get_toaster_routine_for_id_hook = toastapi_get_routine_for_id;

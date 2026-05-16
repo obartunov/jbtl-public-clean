@@ -53,7 +53,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 		varlena    *old_value;
 		varlena    *new_value;
-		bool        need_detoast = true;
+		bool		need_detoast = true;
 
 		ttc->ttc_attr[i].tai_colflags = 0;
 		ttc->ttc_attr[i].tai_oldexternal = NULL;
@@ -75,6 +75,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 			 * If the old value is stored on disk, check if it has changed so
 			 * we have to delete it later.
 			 */
+
 			/*
 			 * Call custom TOAST update function if available
 			 */
@@ -84,21 +85,21 @@ toast_tuple_init(ToastTupleContext *ttc)
 				/*
 				 * If the old value is custom-toasted, give the toaster's
 				 * update routine a chance first.  It may decide to reuse old
-				 * chunks and just refresh the in-row pointer, regardless
-				 * of whether the new value is plain or already custom.
+				 * chunks and just refresh the in-row pointer, regardless of
+				 * whether the new value is plain or already custom.
 				 *
-				 * dispatch_toaster_update returns (Datum) 0 if no toaster
-				 * is bound, the toaster mismatches, or tsr_update is not
+				 * dispatch_toaster_update returns (Datum) 0 if no toaster is
+				 * bound, the toaster mismatches, or tsr_update is not
 				 * implemented; in those cases we proceed with the normal
 				 * fall-through paths below.
 				 */
 				if (!ttc->ttc_isnull[i] &&
 					VARATT_IS_CUSTOM(old_value) &&
 					(new_value_after_update =
-						dispatch_toaster_update(ttc->ttc_rel, (AttrNumber) i,
-							ttc->ttc_values[i],
-							ttc->ttc_oldvalues[i],
-							ttc->ttc_am_options)) != (Datum) 0)
+					 dispatch_toaster_update(ttc->ttc_rel, (AttrNumber) i,
+											 ttc->ttc_values[i],
+											 ttc->ttc_oldvalues[i],
+											 ttc->ttc_am_options)) != (Datum) 0)
 				{
 					if (new_value_after_update != ttc->ttc_values[i])
 					{
@@ -114,7 +115,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 					need_detoast = false;
 				}
 				else if (ttc->ttc_isnull[i] ||
-					!(VARATT_IS_EXTERNAL_ONDISK(new_value) || VARATT_IS_CUSTOM(new_value)))
+						 !(VARATT_IS_EXTERNAL_ONDISK(new_value) || VARATT_IS_CUSTOM(new_value)))
 				{
 					/*
 					 * The old external stored value isn't needed any more
@@ -124,13 +125,13 @@ toast_tuple_init(ToastTupleContext *ttc)
 					ttc->ttc_flags |= TOAST_NEEDS_DELETE_OLD;
 				}
 				else if (VARSIZE_EXTERNAL(old_value) == VARSIZE_EXTERNAL(new_value) &&
-					memcmp((char *) old_value, (char *) new_value,
-					VARSIZE_EXTERNAL(old_value)) == 0)
+						 memcmp((char *) old_value, (char *) new_value,
+								VARSIZE_EXTERNAL(old_value)) == 0)
 				{
 					/*
-					 * This attribute isn't changed by this update so
-					 * we reuse the original reference to the old value
-					 * in the new tuple.
+					 * This attribute isn't changed by this update so we reuse
+					 * the original reference to the old value in the new
+					 * tuple.
 					 */
 					if (VARATT_IS_EXTERNAL_ONDISK(new_value))
 						ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
@@ -142,8 +143,8 @@ toast_tuple_init(ToastTupleContext *ttc)
 				else
 				{
 					/*
-					 * The old external stored value isn't needed
-					 * any more after the update
+					 * The old external stored value isn't needed any more
+					 * after the update
 					 */
 					ttc->ttc_attr[i].tai_colflags |= TOASTCOL_NEEDS_DELETE_OLD;
 					ttc->ttc_flags |= TOAST_NEEDS_DELETE_OLD;
@@ -152,7 +153,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 		}
 		else
 		{
-			Datum           new_value_after_copy;
+			Datum		new_value_after_copy;
 
 			/*
 			 * For INSERT simply get the new value
@@ -160,21 +161,20 @@ toast_tuple_init(ToastTupleContext *ttc)
 			new_value = (varlena *) DatumGetPointer(ttc->ttc_values[i]);
 
 			/*
-			 * Call custom TOAST copy function if available.  When the
-			 * new value is already CUSTOM-tagged and the column has a
-			 * toaster bound, give the toaster a chance to relocate
-			 * the storage across relations (CTAS, ALTER TABLE).
-			 * dispatch_toaster_copy returns (Datum) 0 when no toaster
-			 * is bound, the toasterid mismatches, or tsr_copy is not
-			 * implemented.
+			 * Call custom TOAST copy function if available.  When the new
+			 * value is already CUSTOM-tagged and the column has a toaster
+			 * bound, give the toaster a chance to relocate the storage across
+			 * relations (CTAS, ALTER TABLE). dispatch_toaster_copy returns
+			 * (Datum) 0 when no toaster is bound, the toasterid mismatches,
+			 * or tsr_copy is not implemented.
 			 */
 			if (att->attstorage == TYPSTORAGE_EXTERNAL &&
 				!ttc->ttc_isnull[i] &&
 				VARATT_IS_CUSTOM(new_value) &&
 				(new_value_after_copy =
-					dispatch_toaster_copy(ttc->ttc_rel, (AttrNumber) i,
-						ttc->ttc_values[i],
-						ttc->ttc_am_options)) != (Datum) 0)
+				 dispatch_toaster_copy(ttc->ttc_rel, (AttrNumber) i,
+									   ttc->ttc_values[i],
+									   ttc->ttc_am_options)) != (Datum) 0)
 			{
 				if (new_value_after_copy != ttc->ttc_values[i])
 				{
@@ -224,7 +224,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 			 * PLAIN storage).  If necessary, we'll push it out as a new
 			 * external value below.
 			 */
-			if(VARATT_IS_EXTERNAL(new_value) && need_detoast)
+			if (VARATT_IS_EXTERNAL(new_value) && need_detoast)
 			{
 				ttc->ttc_attr[i].tai_oldexternal = new_value;
 				if (att->attstorage == TYPSTORAGE_PLAIN)
@@ -364,7 +364,7 @@ toast_tuple_externalize(ToastTupleContext *ttc, int attribute, int maxDataLen, u
 		== (Datum) 0)
 	{
 		*value = toast_save_datum(ttc->ttc_rel, old_value,
-			attr->tai_oldexternal, options);
+								  attr->tai_oldexternal, options);
 	}
 	if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
 		pfree(DatumGetPointer(old_value));
@@ -411,8 +411,8 @@ toast_tuple_cleanup(ToastTupleContext *ttc)
 			if ((attr->tai_colflags & TOASTCOL_NEEDS_DELETE_OLD) != 0)
 			{
 				/*
-				* Call TOAST API delete for custom pointer
-				*/
+				 * Call TOAST API delete for custom pointer
+				 */
 				if (VARATT_IS_CUSTOM(DatumGetPointer(ttc->ttc_oldvalues[i])))
 				{
 					dispatch_toaster_delete(ttc->ttc_rel, (AttrNumber) i,

@@ -54,14 +54,15 @@ typedef struct ToasterAttrCacheKey
 {
 	Oid			relid;
 	AttrNumber	attnum;
-} ToasterAttrCacheKey;
+}			ToasterAttrCacheKey;
 
 typedef struct ToasterAttrCacheEntry
 {
 	ToasterAttrCacheKey key;	/* HASH_BLOBS key */
 	Oid			toasterid;		/* InvalidOid means "no toaster bound" */
-	TsrRoutine	routine;		/* embedded copy; valid iff OidIsValid(toasterid) */
-} ToasterAttrCacheEntry;
+	TsrRoutine	routine;		/* embedded copy; valid iff
+								 * OidIsValid(toasterid) */
+}			ToasterAttrCacheEntry;
 
 static HTAB *toaster_attr_cache = NULL;
 
@@ -143,10 +144,10 @@ ToasterAttrCacheLookup(Relation rel, AttrNumber attnum, Oid *out_toasterid)
 	bool		found;
 
 	/*
-	 * Defensive: if _PG_init has not run (e.g., the provider was not
-	 * loaded via shared_preload_libraries), the cache is uninitialised
-	 * and we cannot look anything up.  _PG_init rejects that case,
-	 * but stay defensive against future call paths.
+	 * Defensive: if _PG_init has not run (e.g., the provider was not loaded
+	 * via shared_preload_libraries), the cache is uninitialised and we cannot
+	 * look anything up.  _PG_init rejects that case, but stay defensive
+	 * against future call paths.
 	 */
 	if (toaster_attr_cache == NULL)
 		return NULL;
@@ -167,8 +168,8 @@ ToasterAttrCacheLookup(Relation rel, AttrNumber attnum, Oid *out_toasterid)
 
 		/*
 		 * Catalog probe.  attopts_get_toaster_opts uses 1-based attnum
-		 * (pg_attribute semantics); our internal AttrNumber is 0-based
-		 * by v1 convention (see contrib/toastapi/README.toastapi).
+		 * (pg_attribute semantics); our internal AttrNumber is 0-based by v1
+		 * convention (see contrib/toastapi/README.toastapi).
 		 */
 		toasterid_str = attopts_get_toaster_opts(rel, attnum + 1,
 												 ATT_TOASTER_NAME);

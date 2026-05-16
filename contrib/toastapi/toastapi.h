@@ -77,11 +77,11 @@ do { \
 
 /* Functions in toastapi.c */
 extern PGDLLEXPORT void _PG_init(void);
-extern PGDLLEXPORT TsrRoutine *GetTsrRoutine(Oid tsrhandler);
-extern PGDLLEXPORT TsrRoutine *GetTsrRoutineByOid(Oid tsroid, bool noerror);
-extern PGDLLEXPORT TsrRoutine *SearchTsrCache(Oid tsroid);
-extern PGDLLEXPORT TsrRoutine *SearchTsrHandlerCache(Oid tsrhandleroid);
-extern PGDLLEXPORT bool	validateToaster(Oid toasteroid, Oid typeoid, char storage,
-							char compression, Oid amoid, bool false_ok);
+extern PGDLLEXPORT TsrRoutine * GetTsrRoutine(Oid tsrhandler);
+extern PGDLLEXPORT TsrRoutine * GetTsrRoutineByOid(Oid tsroid, bool noerror);
+extern PGDLLEXPORT TsrRoutine * SearchTsrCache(Oid tsroid);
+extern PGDLLEXPORT TsrRoutine * SearchTsrHandlerCache(Oid tsrhandleroid);
+extern PGDLLEXPORT bool validateToaster(Oid toasteroid, Oid typeoid, char storage,
+										char compression, Oid amoid, bool false_ok);
 
 #endif							/* TOASTAPI_H */

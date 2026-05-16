@@ -87,14 +87,14 @@
  */
 typedef struct ToasterContextData
 {
-	Relation		rel;
-	Oid				toasterid;
-	Oid				toastreloid;
-	int				attnum;
-	int				options;
-} ToasterContextData;
+	Relation	rel;
+	Oid			toasterid;
+	Oid			toastreloid;
+	int			attnum;
+	int			options;
+}			ToasterContextData;
 
-typedef ToasterContextData *ToasterContext;
+typedef ToasterContextData * ToasterContext;
 
 /*
  * Callback signatures.
@@ -169,22 +169,21 @@ typedef struct TsrRoutine
 	Size		tsr_size;		/* must equal sizeof(TsrRoutine) */
 
 	/* mandatory */
-	toaster_validate_function	tsr_validate;
-	toaster_toast_function		tsr_toast;
-	toaster_detoast_function	tsr_detoast;
+	toaster_validate_function tsr_validate;
+	toaster_toast_function tsr_toast;
+	toaster_detoast_function tsr_detoast;
 
 	/* optional — may be NULL */
-	toaster_update_function		tsr_update;
-	toaster_copy_function		tsr_copy;
-	toaster_delete_function		tsr_delete;
+	toaster_update_function tsr_update;
+	toaster_copy_function tsr_copy;
+	toaster_delete_function tsr_delete;
 
 	/*
-	 * Read-side size resolver.  May be NULL in 0003 (this commit);
-	 * 0004 makes it mandatory once the call sites flip to
-	 * resolver-by-id dispatch.
+	 * Read-side size resolver.  May be NULL in 0003 (this commit); 0004 makes
+	 * it mandatory once the call sites flip to resolver-by-id dispatch.
 	 */
-	toaster_size_function		tsr_size_fn;
-} TsrRoutine;
+	toaster_size_function tsr_size_fn;
+}			TsrRoutine;
 
 /*
  * Resolver hook types — Option A (two-hook split).
@@ -221,9 +220,9 @@ typedef const TsrRoutine *(*get_toaster_routine_for_id_hook_type) (Oid toasterid
  * _PG_init.  NULL when no provider is loaded.
  */
 extern PGDLLIMPORT get_toaster_id_for_rel_hook_type
-				   get_toaster_id_for_rel_hook;
+get_toaster_id_for_rel_hook;
 extern PGDLLIMPORT get_toaster_routine_for_id_hook_type
-				   get_toaster_routine_for_id_hook;
+get_toaster_routine_for_id_hook;
 
 /*
  * Core helpers for dispatching toast lifecycle through the resolver.
@@ -241,7 +240,7 @@ extern Datum dispatch_toaster_update(Relation rel, AttrNumber attnum,
 									 int am_options);
 extern Datum dispatch_toaster_copy(Relation rel, AttrNumber attnum,
 								   Datum value, int am_options);
-extern void  dispatch_toaster_delete(Relation rel, AttrNumber attnum,
-									 Datum value, bool is_speculative);
+extern void dispatch_toaster_delete(Relation rel, AttrNumber attnum,
+									Datum value, bool is_speculative);
 
 #endif							/* TOASTERAPI_H */

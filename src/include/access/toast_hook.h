@@ -58,6 +58,6 @@ typedef bool (*Toastapi_jsonb_object_field_hook_type) (Datum raw_jb,
 													   Datum *result);
 
 extern PGDLLIMPORT Toastapi_jsonb_object_field_hook_type
-			Toastapi_jsonb_object_field_hook;
+Toastapi_jsonb_object_field_hook;
 
 #endif							/* TOASTHOOK_H */
