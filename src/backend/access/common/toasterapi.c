@@ -277,6 +277,59 @@ dispatch_toaster_delete(Relation rel, AttrNumber attnum, Datum value,
  *
  * The first two guards match toastapi_update's original logic; this
  * keeps existing behavior byte-identical across the conversion.
+ *
+ * --- Silent fall-through on toaster mismatch (review item 17) ---
+ *
+ * The fall-through with no log line is intentional and documented
+ * here.  Four questions:
+ *
+ *   1. Why is fall-through correct?
+ *      The new value MUST be written somewhere.  When the column's
+ *      bound toaster has changed since the old row was written
+ *      (re-bind via ALTER TABLE / reset_toaster), or when new and
+ *      old identify different toasters, the bound toaster cannot
+ *      semantically handle the cross-toaster update.  Caller
+ *      proceeds to vanilla delete-and-retoast: delete the old
+ *      CUSTOM storage, write the new value through whatever
+ *      toaster (or vanilla) the column currently binds.
+ *
+ *   2. Why does read-side remain strict?
+ *      Read side decodes by va_toasterid in the value itself, not
+ *      by the column's current binding.  A CUSTOM varlena written
+ *      under toaster A still decodes through A on read even after
+ *      the column rebinds to B (or unbinds).  This is asymmetric
+ *      by design: writes follow the catalog binding, reads follow
+ *      the on-disk value's identity.  See header docblock.
+ *
+ *   3. Why is this not data loss?
+ *      The new value's storage is correctly written through the
+ *      vanilla path.  The old value's CUSTOM storage is cleaned
+ *      up by the caller via dispatch_toaster_delete on the OLD
+ *      value.  dispatch_toaster_delete resolves the routine by
+ *      value identity (va_toasterid) as a fall-back when the
+ *      column's current binding does not resolve to a routine,
+ *      so cleanup remains correct after re-binding or unbinding.
+ *      See dispatch_toaster_delete's contract.
+ *
+ *   4. What should an operator/developer expect?
+ *      After re-binding a column to a different toaster (or
+ *      unbinding), subsequent UPDATEs of rows previously written
+ *      under the old binding will:
+ *        - emit no special log/debug line about the binding switch
+ *          (silence is by design — these UPDATEs are routine);
+ *        - decode the old value correctly via va_toasterid;
+ *        - write the new value through the column's current
+ *          binding (vanilla or another CUSTOM toaster);
+ *        - rely on dispatch_toaster_delete being able to clean up
+ *          the old CUSTOM storage by value identity (see that
+ *          function's contract).
+ *
+ * If observability becomes important (e.g., to audit how many rows
+ * still carry the old binding), the right place to add it is not
+ * here but in a dedicated diagnostic view that counts CUSTOM
+ * varlenas by va_toasterid across heap relations.  Adding an
+ * elog(DEBUG2) here would require pinning client_min_messages in
+ * regression tests, which conflicts with existing test fixtures.
  */
 Datum
 dispatch_toaster_update(Relation rel, AttrNumber attnum,
