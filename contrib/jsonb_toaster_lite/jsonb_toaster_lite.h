@@ -38,7 +38,7 @@
 #include "utils/snapshot.h"
 #include "varatt.h"
 
-#include "varatt_custom.h"
+#include "access/toast_custom.h"
 
 
 /* ---- pointer mode tags (top 4 bits of the 32-bit custom-pointer header)

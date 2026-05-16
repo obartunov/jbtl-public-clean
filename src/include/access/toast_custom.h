@@ -1,21 +1,20 @@
 /*-------------------------------------------------------------------------
  *
- * varatt_custom.h
- *	  Pluggable TOAST API CUSTOM Toast Pointer definition and macros
+ * toast_custom.h
+ *	  CUSTOM-tagged TOAST pointer descriptor for Pluggable TOAST API.
  *
  *
  * Copyright (c) 2016-2023, Postgres Professional
  *
  * IDENTIFICATION
- * contrib/toastapi/varatt_custom.h
+ * src/include/access/toast_custom.h
  *
  *-------------------------------------------------------------------------
  */
 
-#ifndef VARATT_CUSTOM_H
-#define VARATT_CUSTOM_H
+#ifndef TOAST_CUSTOM_H
+#define TOAST_CUSTOM_H
 
-#include "postgres.h"
 #include "varatt.h"
 
 typedef struct uint32align16
@@ -75,4 +74,4 @@ typedef struct varatt_custom
 
 #define VARSIZE_CUSTOM(PTR)	VARATT_CUSTOM_SIZE(VARATT_CUSTOM_GET_DATA_SIZE(PTR))
 
-#endif
+#endif							/* TOAST_CUSTOM_H */

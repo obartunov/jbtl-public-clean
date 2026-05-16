@@ -30,7 +30,7 @@
 #include "utils/memutils.h"
 #include "varatt.h"
 
-#include "varatt_custom.h"
+#include "access/toast_custom.h"
 
 #include "jsonb_toaster_lite.h"
 
