@@ -100,7 +100,7 @@ VARTAG_IS_EXPANDED(vartag_external tag)
 
 /* Size of the data part of a "TOAST pointer" datum */
 static inline Size
-VARTAG_SIZE(vartag_external tag, const void *PTR)
+VARTAG_SIZE(vartag_external tag)
 {
 	if (tag == VARTAG_INDIRECT)
 		return sizeof(varatt_indirect);
@@ -108,8 +108,6 @@ VARTAG_SIZE(vartag_external tag, const void *PTR)
 		return sizeof(varatt_expanded);
 	else if (tag == VARTAG_ONDISK)
 		return sizeof(varatt_external);
-	else if (tag == VARTAG_CUSTOM)
-		return toast_custom_datum_size(PTR, TPTR_DATUM_SIZE);
 	else
 	{
 		Assert(false);
@@ -336,7 +334,12 @@ VARTAG_EXTERNAL(const void *PTR)
 static inline Size
 VARSIZE_EXTERNAL(const void *PTR)
 {
-	return VARHDRSZ_EXTERNAL + VARTAG_SIZE(VARTAG_EXTERNAL(PTR), PTR);
+	vartag_external tag = VARTAG_EXTERNAL(PTR);
+
+	if (tag == VARTAG_CUSTOM)
+		return VARHDRSZ_EXTERNAL + toast_custom_datum_size(PTR,
+														   TPTR_DATUM_SIZE);
+	return VARHDRSZ_EXTERNAL + VARTAG_SIZE(tag);
 }
 
 /* Start of data area of a "TOAST pointer" datum */
