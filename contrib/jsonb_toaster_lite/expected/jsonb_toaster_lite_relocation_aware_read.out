@@ -2,36 +2,57 @@
 -- jsonb_toaster_lite_relocation_aware_read
 --
 -- Deterministic correctness contract for the relocation-aware fast
--- path that the jsonb_object_field hook takes on
--- JBTL_POINTER_SUBTREE wrappers. Locks in the dispatch and value
--- shapes against future regressions.
+-- path that the jsonb_object_field hook takes on relocation-format
+-- wrappers (current internal mode tag: JBTL_POINTER_SUBTREE). Locks
+-- in the dispatch and value shapes against future regressions.
 --
 -- The benchmark suite (jsonb_p1_bench_suite_v0.9) exercises
 -- performance shape only; this test exercises edge cases that the
 -- benchmark does not reach.
 --
--- Naming policy: the test file uses "relocation" terminology in its
--- comments and identifiers. The legacy "subtree" name appears only
--- when citing exact existing symbols (the GUC
--- jsonb_toaster_lite.enable_subtree_storage and the
--- jbtl_subtree_refs catalog).
+-- Test policy (FORMAT_POLICY.md §13):
+--   1. Each setup section runs inside its own explicit transaction
+--      with SET LOCAL for compatibility GUCs, so test runs do not
+--      leak GUC state to other regression files.
+--   2. The compatibility threshold is pinned per section so the
+--      stored layout is deterministic and does not depend on the
+--      postgresql.conf default for jsonb_toaster_lite.subtree_spill_threshold.
+--   3. Each section asserts the actual stored layout (refs count
+--      against expected, wrapper size bucket) before interpreting
+--      read behaviour. Reads run in a separate transaction without
+--      any GUC set, which also exercises the reader's
+--      GUC-independence (FORMAT_POLICY.md §5).
+--
+-- Per-key layout assertions ("expected large keys map to out-of-line
+-- fragments; expected inline keys remain inline") would require a
+-- new C-level probe helper, because jbtl_subtree_refs records only
+-- (parent_oid, parent_valueid) -> (child_oid, child_valueid) and
+-- does not store the originating key name. This test stays at the
+-- row-level layout assertion (refs count, wrapper size bucket).
+-- See report on per-key test support as a follow-up.
+--
+-- Naming policy: comments use "relocation" terminology. Legacy
+-- "subtree" appears only when citing exact existing symbols (the GUC
+-- jsonb_toaster_lite.enable_subtree_storage, the prototype catalog
+-- jbtl_subtree_refs, and the prototype mode tag JBTL_POINTER_SUBTREE).
 --
 CREATE EXTENSION IF NOT EXISTS toastapi;
 NOTICE:  extension "toastapi" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS jsonb_toaster_lite;
 NOTICE:  extension "jsonb_toaster_lite" already exists, skipping
--- Test setup: every test creates its own table to keep state isolated.
-SET jsonb_toaster_lite.enable_subtree_storage = on;
-SET jsonb_sort_field_values = off;
 --
 -- Section 1: basic 4-key dataset (mimics the J01 benchmark cell).
 -- Two large arrays (relocated) + two small scalars (inline).
 --
+BEGIN;
+SET LOCAL jsonb_toaster_lite.enable_subtree_storage = on;
+SET LOCAL jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SET LOCAL jsonb_sort_field_values = off;
 CREATE TABLE r1_basic (id int PRIMARY KEY, jb jsonb);
-SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_basic', 'jb');
- set_toaster 
--------------
-       40990
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_basic', 'jb') > 0 AS toaster_attached;
+ toaster_attached 
+------------------
+ t
 (1 row)
 
 INSERT INTO r1_basic VALUES (1, jsonb_build_object(
@@ -40,17 +61,22 @@ INSERT INTO r1_basic VALUES (1, jsonb_build_object(
     'key3', 99,
     'key4', (SELECT jsonb_agg(g) FROM generate_series(1, 5000) g)
 ));
--- Confirm the wrapper engaged.
-SELECT pg_column_size(jb) < 1000 AS wrapper_small,  -- inline parent body only
+-- Layout assertion: 2 relocated values (key2, key4); wrapper holds
+-- inline part only (small bucket).
+SELECT pg_column_size(jb) < 1000 AS layout_wrapper_small,
        (SELECT count(*) FROM jbtl_subtree_refs
         WHERE parent_toastrelid =
-              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_basic')) AS refs
+              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_basic')) = 2
+            AS layout_relocated_count_is_2
 FROM r1_basic WHERE id = 1;
- wrapper_small | refs 
----------------+------
- t             |    2
+ layout_wrapper_small | layout_relocated_count_is_2 
+----------------------+-----------------------------
+ t                    | t
 (1 row)
 
+COMMIT;
+-- Reads in a fresh transaction, no compatibility GUC set: exercises
+-- the reader's GUC-independence (FORMAT_POLICY.md §5).
 -- Inline scalars: no fragment fetch required.
 SELECT jb -> 'key1' AS key1_value FROM r1_basic WHERE id = 1;
  key1_value 
@@ -105,14 +131,18 @@ SELECT (jb -> 'absent') IS NULL AS absent_is_null FROM r1_basic WHERE id = 1;
 
 DROP TABLE r1_basic;
 --
--- Section 2: heterogeneous inline value types alongside relocated values.
+-- Section 2: heterogeneous inline value types alongside a relocated value.
 -- All inline JEntry kinds must produce the correct JsonbValue.
 --
+BEGIN;
+SET LOCAL jsonb_toaster_lite.enable_subtree_storage = on;
+SET LOCAL jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SET LOCAL jsonb_sort_field_values = off;
 CREATE TABLE r1_types (id int PRIMARY KEY, jb jsonb);
-SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_types', 'jb');
- set_toaster 
--------------
-       40990
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_types', 'jb') > 0 AS toaster_attached;
+ toaster_attached 
+------------------
+ t
 (1 row)
 
 -- A single row that mixes:
@@ -132,17 +162,19 @@ INSERT INTO r1_types VALUES (1, jsonb_build_object(
     'a_inlarr',   '[1,2,3,"x"]'::jsonb,
     'a_large',    (SELECT jsonb_agg(g) FROM generate_series(1, 10000) g)
 ));
--- Wrapper engaged?
-SELECT pg_column_size(jb) < 2000 AS wrapper_small,
+-- Layout assertion: 1 relocated value (a_large); other 11 keys inline.
+SELECT pg_column_size(jb) < 2000 AS layout_wrapper_small,
        (SELECT count(*) FROM jbtl_subtree_refs
         WHERE parent_toastrelid =
-              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_types')) AS refs
+              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_types')) = 1
+            AS layout_relocated_count_is_1
 FROM r1_types WHERE id = 1;
- wrapper_small | refs 
----------------+------
- t             |    1
+ layout_wrapper_small | layout_relocated_count_is_1 
+----------------------+-----------------------------
+ t                    | t
 (1 row)
 
+COMMIT;
 -- Each inline type must round-trip correctly.
 SELECT jb -> 'a_null'      AS v_null,
        (jb -> 'a_null') IS NOT DISTINCT FROM 'null'::jsonb AS is_json_null
@@ -212,7 +244,7 @@ SELECT jb -> 'a_inlarr'    AS v_inlarr FROM r1_types WHERE id = 1;
  [1, 2, 3, "x"]
 (1 row)
 
--- Out-of-line value (single key 'a_large' is the one relocated value):
+-- Out-of-line value:
 SELECT jsonb_array_length(jb -> 'a_large') AS v_large_len FROM r1_types WHERE id = 1;
  v_large_len 
 -------------
@@ -235,11 +267,15 @@ DROP TABLE r1_types;
 -- The binary search uses length-then-memcmp; ensure UTF-8 bytes
 -- compare correctly.
 --
+BEGIN;
+SET LOCAL jsonb_toaster_lite.enable_subtree_storage = on;
+SET LOCAL jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SET LOCAL jsonb_sort_field_values = off;
 CREATE TABLE r1_utf8 (id int PRIMARY KEY, jb jsonb);
-SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_utf8', 'jb');
- set_toaster 
--------------
-       40990
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_utf8', 'jb') > 0 AS toaster_attached;
+ toaster_attached 
+------------------
+ t
 (1 row)
 
 INSERT INTO r1_utf8 VALUES (1, jsonb_build_object(
@@ -248,6 +284,19 @@ INSERT INTO r1_utf8 VALUES (1, jsonb_build_object(
     'ключ_длинный',  77,
     'big_blob', (SELECT jsonb_agg(g) FROM generate_series(1, 10000) g)
 ));
+-- Layout assertion: 1 relocated value (big_blob); 3 UTF-8 keys inline.
+SELECT pg_column_size(jb) < 1000 AS layout_wrapper_small,
+       (SELECT count(*) FROM jbtl_subtree_refs
+        WHERE parent_toastrelid =
+              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_utf8')) = 1
+            AS layout_relocated_count_is_1
+FROM r1_utf8 WHERE id = 1;
+ layout_wrapper_small | layout_relocated_count_is_1 
+----------------------+-----------------------------
+ t                    | t
+(1 row)
+
+COMMIT;
 SELECT jb -> 'ключ' AS cyrillic_key FROM r1_utf8 WHERE id = 1;
  cyrillic_key 
 --------------
@@ -282,11 +331,15 @@ DROP TABLE r1_utf8;
 --
 -- Section 4: long keys (boundary of the key comparator).
 --
+BEGIN;
+SET LOCAL jsonb_toaster_lite.enable_subtree_storage = on;
+SET LOCAL jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SET LOCAL jsonb_sort_field_values = off;
 CREATE TABLE r1_longkey (id int PRIMARY KEY, jb jsonb);
-SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_longkey', 'jb');
- set_toaster 
--------------
-       40990
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_longkey', 'jb') > 0 AS toaster_attached;
+ toaster_attached 
+------------------
+ t
 (1 row)
 
 INSERT INTO r1_longkey VALUES (1, jsonb_build_object(
@@ -295,6 +348,21 @@ INSERT INTO r1_longkey VALUES (1, jsonb_build_object(
     'short_key', 33,
     'large', (SELECT jsonb_agg(g) FROM generate_series(1, 10000) g)
 ));
+-- Layout assertion: 1 relocated value (large); 3 keys inline. The
+-- 250-byte key names live inside the inline part, so the wrapper
+-- size budget is wider than the 4-key J01 baseline.
+SELECT pg_column_size(jb) < 2000 AS layout_wrapper_small,
+       (SELECT count(*) FROM jbtl_subtree_refs
+        WHERE parent_toastrelid =
+              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_longkey')) = 1
+            AS layout_relocated_count_is_1
+FROM r1_longkey WHERE id = 1;
+ layout_wrapper_small | layout_relocated_count_is_1 
+----------------------+-----------------------------
+ t                    | t
+(1 row)
+
+COMMIT;
 SELECT jb -> repeat('a', 250) AS long_a FROM r1_longkey WHERE id = 1;
  long_a 
 --------
@@ -323,34 +391,62 @@ DROP TABLE r1_longkey;
 --
 -- Section 5: many-key object — exercise binary search at depth.
 --
+-- Note: the current relocation writer does not engage SUBTREE on a
+-- many-key object with one large value (the cost model does not favour
+-- it). To keep this section meaningful for the binary-search depth
+-- coverage of the shared key-lookup helper, run with relocation OFF
+-- and assert no refs — the binary search then exercises the
+-- inline-style fast path on a 101-key object.
+--
+BEGIN;
+SET LOCAL jsonb_toaster_lite.enable_subtree_storage = off;
+SET LOCAL jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SET LOCAL jsonb_sort_field_values = off;
 CREATE TABLE r1_manykeys (id int PRIMARY KEY, jb jsonb);
-SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_manykeys', 'jb');
- set_toaster 
--------------
-       40990
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_manykeys', 'jb') > 0 AS toaster_attached;
+ toaster_attached 
+------------------
+ t
 (1 row)
 
+-- Build a 101-key object: 100 sequential keys k_0001..k_0100, plus
+-- one LARGE array. lpad gives a true zero-padded key; format('%04s')
+-- pads with spaces and would give "k_   1", not "k_0001".
 INSERT INTO r1_manykeys
-SELECT 1, jsonb_object_agg(format('k_%04s', g), g) ||
+SELECT 1, jsonb_object_agg('k_' || lpad(g::text, 4, '0'), g) ||
           jsonb_build_object('LARGE', (SELECT jsonb_agg(s) FROM generate_series(1, 10000) s))
 FROM generate_series(1, 100) g;
+-- Layout assertion: relocation OFF, refs must be zero. The binary
+-- search below runs in the inline-style fast path (the refactored
+-- jbtl_find_key_in_object helper).
+SELECT (SELECT count(*) FROM jbtl_subtree_refs
+        WHERE parent_toastrelid =
+              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_manykeys')) = 0
+            AS layout_no_relocation
+FROM r1_manykeys WHERE id = 1;
+ layout_no_relocation 
+----------------------
+ t
+(1 row)
+
+COMMIT;
 -- First key (alphabetically), middle, last; plus the large key.
 SELECT jb -> 'k_0001'  AS k_first FROM r1_manykeys WHERE id = 1;
  k_first 
 ---------
- 
+ 1
 (1 row)
 
 SELECT jb -> 'k_0050'  AS k_middle FROM r1_manykeys WHERE id = 1;
  k_middle 
 ----------
- 
+ 50
 (1 row)
 
 SELECT jb -> 'k_0100'  AS k_last FROM r1_manykeys WHERE id = 1;
  k_last 
 --------
- 
+ 100
 (1 row)
 
 SELECT jsonb_array_length(jb -> 'LARGE') AS k_large_len FROM r1_manykeys WHERE id = 1;
@@ -372,15 +468,18 @@ FROM r1_manykeys WHERE id = 1;
 DROP TABLE r1_manykeys;
 --
 -- Section 6: parity with the inline-style fast path (no relocation).
--- Disable subtree storage and re-run a subset to confirm the
--- inline-style fast path still behaves correctly after the refactor.
+-- Disable relocation storage and confirm the inline-style fast path
+-- behaves correctly after the refactor.
 --
-SET jsonb_toaster_lite.enable_subtree_storage = off;
+BEGIN;
+SET LOCAL jsonb_toaster_lite.enable_subtree_storage = off;
+SET LOCAL jsonb_toaster_lite.subtree_spill_threshold = 4096;
+SET LOCAL jsonb_sort_field_values = off;
 CREATE TABLE r1_inline (id int PRIMARY KEY, jb jsonb);
-SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_inline', 'jb');
- set_toaster 
--------------
-       40990
+SELECT pgpro_toast.set_toaster('jsonb_toaster_lite', 'public.r1_inline', 'jb') > 0 AS toaster_attached;
+ toaster_attached 
+------------------
+ t
 (1 row)
 
 INSERT INTO r1_inline VALUES (1, jsonb_build_object(
@@ -389,16 +488,20 @@ INSERT INTO r1_inline VALUES (1, jsonb_build_object(
     'c', true,
     'd', (SELECT jsonb_agg(g) FROM generate_series(1, 2000) g)  -- big enough to toast
 ));
--- Wrapper should be inline-style, NOT relocation.
+-- Layout assertion: relocation OFF, so refs must be zero. The 'd'
+-- array is still TOAST-eligible, but the wrapper-format does not
+-- use relocation when the compatibility GUC is off.
 SELECT (SELECT count(*) FROM jbtl_subtree_refs
         WHERE parent_toastrelid =
-              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_inline')) AS refs_should_be_zero
+              (SELECT reltoastrelid FROM pg_class WHERE relname='r1_inline')) = 0
+            AS layout_no_relocation
 FROM r1_inline WHERE id = 1;
- refs_should_be_zero 
----------------------
-                   0
+ layout_no_relocation 
+----------------------
+ t
 (1 row)
 
+COMMIT;
 SELECT jb -> 'a' AS a_value FROM r1_inline WHERE id = 1;
  a_value 
 ---------
@@ -430,6 +533,3 @@ SELECT (jb -> 'missing') IS NULL AS d_miss FROM r1_inline WHERE id = 1;
 (1 row)
 
 DROP TABLE r1_inline;
--- Reset GUCs.
-SET jsonb_toaster_lite.enable_subtree_storage = on;
-SET jsonb_sort_field_values = off;
