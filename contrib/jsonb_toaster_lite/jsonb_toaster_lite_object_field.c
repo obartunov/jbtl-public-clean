@@ -1149,6 +1149,299 @@ jbtl_object_field_probe(PG_FUNCTION_ARGS)
 
 
 /*
+ * jbtl_relocation_aware_object_field
+ *
+ *	R1 prototype: relocation-aware object_field fast path for the
+ *	JBTL_POINTER_SUBTREE wrapper. The parent body is inline in the
+ *	CUSTOM varlena's data area; we never re-fetch it. We walk the
+ *	parent's JEntries + (optional) KVMap to find the requested key
+ *	and then branch by the matched JEntry's type:
+ *
+ *	  missing key            → return NULL (caller emits SQL NULL).
+ *	  inline scalar / inline → build JsonbValue directly from inline
+ *	                           bytes; no out-of-line fetch.
+ *	  relocated value        → decode the inline JbtlToastedContainerPointer,
+ *	                           fetch exactly ONE out-of-line fragment via
+ *	                           jbtl_toast_fetch_full_plain, return as
+ *	                           jbvBinary.
+ *
+ *	out_fallback semantics mirror jbtl_toast_fetch_object_field:
+ *	set to true and return NULL when the input shape is malformed
+ *	in a way the slow detoast path can still handle. Clear-corruption
+ *	cases (bad relocation payload size, zero ext size) ERROR with
+ *	ERRCODE_DATA_CORRUPTED to match the existing assembly path's
+ *	convention (jsonb_toaster_lite.c:1732-1751).
+ *
+ *	Lifetime: the returned JsonbValue may reference bytes inside the
+ *	caller's raw datum (for inline values) or inside a palloc'd
+ *	fragment buffer (for relocated values). In both cases
+ *	JsonbValueToJsonb copies the bytes into a fresh varlena, so
+ *	caller need not pfree the fragment.
+ *
+ *	Per the relocation writer's invariant at
+ *	jsonb_toaster_lite.c:1563-1566, fragments are plain jsonb with
+ *	no nested relocation, so jbvBinary referencing a fetched fragment
+ *	body is well-formed for the SQL output path.
+ */
+static JsonbValue *
+jbtl_relocation_aware_object_field(struct varlena *raw,
+								   const char *key, int keylen,
+								   bool *out_fallback)
+{
+	char	   *payload;
+	int32		payload_size;
+	char	   *parent_body;
+	int32		parent_size;
+	JsonbContainer *root;
+	int			N;
+	JEntry	   *children;
+	char	   *base_addr;
+	void	   *kvmap_ptr;
+	int			kvmap_entry_size;
+	bool		has_kvmap;
+	int			data_area_offset;
+	int			key_area_end;
+	int			stop_low,
+				stop_high;
+	int			found_idx = -1;
+	int			physical_value_idx;
+	JEntry		value_jentry;
+	uint32		value_offset_in_data;
+	int32		value_len;
+	char	   *value_bytes;
+	int			pad;
+	int			i;
+	JsonbValue *result;
+
+	*out_fallback = false;
+
+	/*
+	 * Caller (the hook) has already verified the wrapper mode is
+	 * JBTL_POINTER_SUBTREE; we go straight to the payload.
+	 */
+	payload = JBTL_CUSTOM_PTR_GET_DATA(raw);
+	payload_size = (int32) JBTL_CUSTOM_PTR_GET_DATA_SIZE(raw);
+
+	/*
+	 * Version dispatch — same logic as jbtl_detoast SUBTREE case at
+	 * jsonb_toaster_lite.c:1600-1620.  v1 has a JbtlSubtreeHeader
+	 * prefix; v0 (legacy fixture) starts directly with the parent
+	 * body.
+	 */
+	if (payload_size >= (int32) sizeof(JbtlSubtreeHeader) &&
+		(uint8) payload[0] == JBTL_SUBTREE_HEADER_V1)
+	{
+		const JbtlSubtreeHeader *hdr = (const JbtlSubtreeHeader *) payload;
+
+		if (hdr->header_size != sizeof(JbtlSubtreeHeader))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("jsonb_toaster_lite: SUBTREE v1 header_size mismatch (%u vs %zu) in relocation-aware object_field",
+							hdr->header_size,
+							sizeof(JbtlSubtreeHeader))));
+		parent_body = payload + hdr->header_size;
+		parent_size = payload_size - hdr->header_size;
+	}
+	else
+	{
+		parent_body = payload;
+		parent_size = payload_size;
+	}
+
+	if (parent_size < (int32) sizeof(uint32))
+	{
+		*out_fallback = true;
+		return NULL;
+	}
+
+	root = (JsonbContainer *) parent_body;
+	if (!JsonContainerIsObject(root))
+	{
+		/* jb -> 'key' on a non-object: defer to core's NULL handling. */
+		*out_fallback = true;
+		return NULL;
+	}
+
+	N = JsonContainerSize(root);
+	if (N <= 0)
+		return NULL;			/* empty object: missing key */
+
+	children = root->children;
+	has_kvmap = JsonContainerHasKVMap(root);
+	kvmap_entry_size = has_kvmap ? JSONB_KVMAP_ENTRY_SIZE(N) : 0;
+
+	/*
+	 * Data area starts after header (4 bytes) + 2N JEntries + INTALIGN'd
+	 * KVMap. Same offset computation the assembly path uses at
+	 * jsonb_toaster_lite.c:1683-1687.
+	 */
+	data_area_offset =
+		(int) sizeof(uint32) +
+		2 * N * (int) sizeof(JEntry) +
+		INTALIGN(N * kvmap_entry_size);
+
+	/* Verify parent body covers header + JEntries + KVMap + keys. */
+	key_area_end = data_area_offset;
+	for (i = 0; i < N; i++)
+		key_area_end += getJsonbLength(root, i);
+
+	if (parent_size < key_area_end)
+	{
+		*out_fallback = true;
+		return NULL;
+	}
+
+	kvmap_ptr = has_kvmap
+		? (void *) (parent_body + sizeof(uint32) + 2 * N * sizeof(JEntry))
+		: NULL;
+	base_addr = parent_body + data_area_offset;
+
+	/*
+	 * Binary search for the key. Same comparison ordering as core's
+	 * static lengthCompareJsonbString (jsonb_util.c:442-481): shorter
+	 * strings sort before longer ones, equal-length compares memcmp.
+	 */
+	stop_low = 0;
+	stop_high = N;
+	while (stop_low < stop_high)
+	{
+		int			mid = stop_low + (stop_high - stop_low) / 2;
+		const char *cand_val = base_addr + getJsonbOffset(root, mid);
+		int			cand_len = getJsonbLength(root, mid);
+		int			diff = jbtl_compare_jsonb_string(cand_val, cand_len,
+													  key, keylen);
+
+		if (diff == 0)
+		{
+			found_idx = mid;
+			break;
+		}
+		if (diff < 0)
+			stop_low = mid + 1;
+		else
+			stop_high = mid;
+	}
+
+	if (found_idx < 0)
+		return NULL;			/* missing key — no fragment fetch */
+
+	/*
+	 * Resolve to physical value index. value JEntries occupy
+	 * [N, 2N) and KVMap (if present) gives the indirection.
+	 */
+	physical_value_idx =
+		jbtl_kvmap_entry(kvmap_ptr, kvmap_entry_size, found_idx) + N;
+
+	value_jentry = children[physical_value_idx];
+	value_offset_in_data = getJsonbOffset(root, physical_value_idx);
+	value_len = (int32) getJsonbLength(root, physical_value_idx);
+	value_bytes = base_addr + value_offset_in_data;
+	pad = INTALIGN(value_offset_in_data) - value_offset_in_data;
+
+	/* Branch by JEntry type. */
+	if (JBTL_JBE_ISCONTAINER_PTR(value_jentry))
+	{
+		/*
+		 * Relocated value. value_bytes points at the inline
+		 * JbtlToastedContainerPointer record (JEntry header byte +
+		 * embedded full-on-disk varatt_external). Mirror the assembly
+		 * path's decode at jsonb_toaster_lite.c:1730-1751.
+		 */
+		const JbtlToastedContainerPointer *ptr;
+		struct varatt_external ext;
+		struct varlena *fragment;
+		int32		fragment_payload;
+
+		if (value_len < (int32) (sizeof(JEntry) + TOAST_POINTER_SIZE))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("jsonb_toaster_lite: ISCONTAINER_PTR payload too small (%d) in relocation-aware object_field",
+							value_len)));
+
+		ptr = (const JbtlToastedContainerPointer *) value_bytes;
+		VARATT_EXTERNAL_GET_POINTER(ext, ptr->data);
+
+		if (!VARATT_EXTERNAL_GET_EXTSIZE(ext))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("jsonb_toaster_lite: SUBTREE child has zero ext size in relocation-aware object_field")));
+
+		/*
+		 * Fetch the one requested out-of-line fragment. Same MVCC-safe
+		 * fetcher the assembly path uses at jsonb_toaster_lite.c:1759.
+		 * Children are plain jsonb (no nested relocation), per the
+		 * writer invariant at jsonb_toaster_lite.c:1563-1566.
+		 */
+		fragment = jbtl_toast_fetch_full_plain(&ext, NULL);
+		fragment_payload = (int32) VARSIZE(fragment) - VARHDRSZ;
+
+		result = (JsonbValue *) palloc(sizeof(JsonbValue));
+		result->type = jbvBinary;
+		result->val.binary.data = (JsonbContainer *) VARDATA(fragment);
+		result->val.binary.len = fragment_payload;
+		return result;
+	}
+
+	/* Inline value. Mirror core fillJsonbValue (jsonb_util.c:530-572). */
+	result = (JsonbValue *) palloc(sizeof(JsonbValue));
+
+	if (JBE_ISNULL(value_jentry))
+	{
+		result->type = jbvNull;
+	}
+	else if (JBE_ISSTRING(value_jentry))
+	{
+		result->type = jbvString;
+		result->val.string.val = value_bytes;
+		result->val.string.len = value_len;
+		Assert(result->val.string.len >= 0);
+	}
+	else if (JBE_ISNUMERIC(value_jentry))
+	{
+		/*
+		 * Numerics are INTALIGN'd. Skip the pad bytes the writer
+		 * inserted before the Numeric struct.
+		 */
+		result->type = jbvNumeric;
+		result->val.numeric = (Numeric) (value_bytes + pad);
+	}
+	else if (JBE_ISBOOL_TRUE(value_jentry))
+	{
+		result->type = jbvBool;
+		result->val.boolean = true;
+	}
+	else if (JBE_ISBOOL_FALSE(value_jentry))
+	{
+		result->type = jbvBool;
+		result->val.boolean = false;
+	}
+	else if (JBE_ISCONTAINER(value_jentry))
+	{
+		/*
+		 * Inline (non-relocated) nested container. Same handling as
+		 * core fillJsonbValue's else branch: jbvBinary into the
+		 * inline bytes, accounting for the alignment pad. The parent
+		 * body lives inside the caller's CUSTOM varlena, which has
+		 * executor per-tuple lifetime; JsonbValueToJsonb in the hook
+		 * copies the bytes before that scope ends.
+		 */
+		result->type = jbvBinary;
+		result->val.binary.data = (JsonbContainer *) (value_bytes + pad);
+		result->val.binary.len = value_len - pad;
+	}
+	else
+	{
+		/* Unknown JEntry type. Defensive: fall back, not ERROR. */
+		pfree(result);
+		*out_fallback = true;
+		return NULL;
+	}
+
+	return result;
+}
+
+
+/*
  * jbtl_jsonb_object_field_hook_fn
  *
  *	Core dispatch-hook callback for jsonb_object_field on
@@ -1160,6 +1453,14 @@ jbtl_object_field_probe(PG_FUNCTION_ARGS)
  *	rejection or fast-path-internal fallback signal). The callback
  *	must NOT call back into jsonb_object_field or any other core
  *	fallback wrapper: core handles that itself once we return false.
+ *
+ *	R1 prototype dispatch:
+ *	  JBTL_POINTER_SUBTREE → jbtl_relocation_aware_object_field
+ *	                         (parent body inline; at most one
+ *	                          out-of-line fragment is fetched).
+ *	  other CUSTOM modes   → existing slice-aware fast path via
+ *	                         jbtl_unwrap_to_toast_pointer +
+ *	                         jbtl_toast_fetch_object_field.
  */
 bool
 jbtl_jsonb_object_field_hook_fn(Datum raw_jb, text *key,
@@ -1180,6 +1481,36 @@ jbtl_jsonb_object_field_hook_fn(Datum raw_jb, text *key,
 	 * reject.
 	 */
 	Assert(VARATT_IS_CUSTOM(raw));
+
+	/*
+	 * Peek the wrapper mode tag. For JBTL_POINTER_SUBTREE we take the
+	 * relocation-aware path that reads the inline parent body and
+	 * fetches at most one out-of-line fragment. For all other CUSTOM
+	 * modes we keep the original slice-aware fast path.
+	 */
+	mode = JBTL_CUSTOM_PTR_GET_HEADER(raw) & JBTL_POINTER_TYPE_MASK;
+
+	if (mode == JBTL_POINTER_SUBTREE)
+	{
+		jbv = jbtl_relocation_aware_object_field(raw,
+												 VARDATA_ANY(key),
+												 VARSIZE_ANY_EXHDR(key),
+												 &fallback);
+		if (fallback)
+			return false;
+
+		if (jbv == NULL)
+		{
+			*isnull = true;
+			*result = (Datum) 0;
+		}
+		else
+		{
+			*isnull = false;
+			*result = PointerGetDatum(JsonbValueToJsonb(jbv));
+		}
+		return true;
+	}
 
 	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr, &diff_info))
 		return false;
