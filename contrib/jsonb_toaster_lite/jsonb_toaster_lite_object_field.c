@@ -65,6 +65,86 @@
 
 
 /*
+ * ERROR vs fallback policy for object_field fast paths
+ * ----------------------------------------------------
+ *
+ *	Both fast paths in this file (inline-style slice fetch and
+ *	relocation-aware inline-body read) signal "give up and let the
+ *	slow detoast path handle this" by setting *out_fallback=true and
+ *	returning NULL. They signal "this is data corruption visible at
+ *	the wrapper layer" by ereport(ERROR, ERRCODE_DATA_CORRUPTED).
+ *
+ *	The split is:
+ *
+ *	  Fallback (NOT an ERROR):
+ *	    - any structural malformation the slow path can also detect:
+ *	      truncated parent body, container header that doesn't fit,
+ *	      JEntry array that doesn't fit, key area that doesn't fit,
+ *	      v1 SUBTREE header_size mismatch, unknown JEntry type, etc.
+ *	    - non-object root containers
+ *	    - nested-container values in the inline-style path (out of
+ *	      scope by design; not a corruption signal)
+ *
+ *	  ERROR (ERRCODE_DATA_CORRUPTED):
+ *	    - clear data corruption that the writer-side admission rules
+ *	      forbid: e.g. an ISCONTAINER_PTR JEntry whose payload is
+ *	      smaller than (sizeof(JEntry) + TOAST_POINTER_SIZE), or a
+ *	      relocation pointer with zero ext size. These cannot be
+ *	      produced by any valid writer code path, so the fast path
+ *	      reports them at point of detection.
+ *
+ *	Rationale: the slow path (jbtl_detoast and friends) is the
+ *	canonical ERROR-raising point for structural corruption because
+ *	it has full context (it materialises the whole body, can show the
+ *	offending offsets, and can be enabled selectively via GUC). The
+ *	fast paths exist to make the common case cheap; they should not
+ *	be the place where corrupt-row diagnostics are produced.
+ *
+ *	The exception (ISCONTAINER_PTR / ext size) is for malformations
+ *	that the slow path itself raises at the same point in the data,
+ *	so issuing the ERROR earlier (here) costs the user nothing in
+ *	context quality and saves the cost of full assembly.
+ */
+
+
+/*
+ * jbtl_object_field_unwrap_kind
+ *
+ *	Tag for the discriminated unwrap result used by the
+ *	jsonb_object_field hook. The hook never inspects wrapper-format
+ *	identifiers (mode tags, header bytes) directly; it dispatches on
+ *	this tag. The unwrap layer is the single source of truth on
+ *	wrapper kinds.
+ */
+typedef enum JbtlObjectFieldUnwrapKind
+{
+	JBTL_OF_UNWRAP_NONE,			/* not handled by this extension's fast paths */
+	JBTL_OF_UNWRAP_INLINE_STYLE,	/* parent body lives in toast chunks; slice fast path */
+	JBTL_OF_UNWRAP_RELOCATION,		/* parent body is inline in the wrapper data area */
+}			JbtlObjectFieldUnwrapKind;
+
+/*
+ * jbtl_object_field_unwrap_result
+ *
+ *	Per-kind state filled in by jbtl_object_field_unwrap. Only the
+ *	subset of fields associated with the active `kind` is valid.
+ */
+typedef struct JbtlObjectFieldUnwrapResult
+{
+	JbtlObjectFieldUnwrapKind kind;
+
+	/* Valid only when kind == JBTL_OF_UNWRAP_INLINE_STYLE. */
+	uint32		inline_mode;
+	struct varatt_external inline_ext;
+	JbtlDiffInfo inline_diff_info;
+
+	/* Valid only when kind == JBTL_OF_UNWRAP_RELOCATION. */
+	char	   *parent_body;
+	int32		parent_size;
+}			JbtlObjectFieldUnwrapResult;
+
+
+/*
  * jbtl_compare_jsonb_string
  *
  *	Same ordering as core's static lengthCompareJsonbString:
@@ -99,6 +179,182 @@ jbtl_kvmap_entry(const void *kvmap_ptr, int entry_size, int index)
 	if (entry_size == 2)
 		return ((const uint16 *) kvmap_ptr)[index];
 	return ((const int32 *) kvmap_ptr)[index];
+}
+
+
+/*
+ * jbtl_object_data_area_offset
+ *
+ *	Single source of truth for the data-area-offset formula in a
+ *	jsonb object body:
+ *
+ *	    sizeof(uint32)                  -- container header
+ *	  + 2 * N * sizeof(JEntry)          -- key + value JEntries
+ *	  + INTALIGN(N * kvmap_entry_size)  -- optional KVMap region
+ *
+ *	Also reports the KVMap presence flags so callers can compute
+ *	kvmap_ptr without re-deriving them. This formula appears in three
+ *	places in the writer/reader (jbtl_detoast SUBTREE assembly,
+ *	inline-style slice fast path, relocation-aware fast path); they
+ *	must agree.
+ */
+static int
+jbtl_object_data_area_offset(JsonbContainer *root,
+							 bool *out_has_kvmap,
+							 int *out_kvmap_entry_size)
+{
+	int			N = JsonContainerSize(root);
+	bool		has_kvmap = JsonContainerHasKVMap(root);
+	int			entry_size = has_kvmap ? JSONB_KVMAP_ENTRY_SIZE(N) : 0;
+
+	if (out_has_kvmap)
+		*out_has_kvmap = has_kvmap;
+	if (out_kvmap_entry_size)
+		*out_kvmap_entry_size = entry_size;
+
+	return (int) sizeof(uint32)
+		+ 2 * N * (int) sizeof(JEntry)
+		+ INTALIGN(N * entry_size);
+}
+
+
+/*
+ * jbtl_find_key_in_object
+ *
+ *	Binary-search for `key` within a jsonb object's key area, using
+ *	the same length-then-lex comparator core uses internally.
+ *
+ *	Parameters:
+ *	  root            jsonb container header. Must satisfy
+ *	                  JsonContainerIsObject(root) and
+ *	                  JsonContainerSize(root) > 0. The function reads
+ *	                  JEntries via root->children directly.
+ *	  base_addr       points to the first byte of the data area
+ *	                  (where the keys live).
+ *	  kvmap_ptr,
+ *	  kvmap_entry_size
+ *	                  KVMap state from jbtl_object_data_area_offset;
+ *	                  pass NULL/0 for the no-map case.
+ *	  key, keylen     requested key bytes (not NUL-terminated).
+ *
+ *	Returns the physical value JEntry index in [N, 2N) on hit, or -1
+ *	on miss. The caller decides what to do with the matched value.
+ *
+ *	Precondition: parent body bytes covered by JEntries + KVMap + key
+ *	area must be valid memory; the caller is responsible for the
+ *	bounds check upstream. This function does not validate offsets.
+ */
+static int
+jbtl_find_key_in_object(JsonbContainer *root,
+						char *base_addr,
+						void *kvmap_ptr, int kvmap_entry_size,
+						const char *key, int keylen)
+{
+	int			N = JsonContainerSize(root);
+	int			stop_low = 0;
+	int			stop_high = N;
+	int			found_idx = -1;
+
+	while (stop_low < stop_high)
+	{
+		int			mid = stop_low + (stop_high - stop_low) / 2;
+		const char *cand_val = base_addr + getJsonbOffset(root, mid);
+		int			cand_len = getJsonbLength(root, mid);
+		int			diff = jbtl_compare_jsonb_string(cand_val, cand_len,
+													 key, keylen);
+
+		if (diff == 0)
+		{
+			found_idx = mid;
+			break;
+		}
+		if (diff < 0)
+			stop_low = mid + 1;
+		else
+			stop_high = mid;
+	}
+	if (found_idx < 0)
+		return -1;
+
+	return jbtl_kvmap_entry(kvmap_ptr, kvmap_entry_size, found_idx) + N;
+}
+
+
+/*
+ * jbtl_fill_inline_jsonb_value
+ *
+ *	Construct a JsonbValue from a JEntry header word and the raw
+ *	inline value bytes that follow it. Mirrors core's static
+ *	fillJsonbValue at src/backend/utils/adt/jsonb_util.c, on the
+ *	inline-only subset needed at fast-path layer (no toasted-container
+ *	expansion).
+ *
+ *	`value_bytes` points to the JEntry's value at its unpadded offset
+ *	within the data area. INTALIGN-needing payloads (Numeric, inline
+ *	container) sit at `value_bytes + pad`; the caller must precompute
+ *	pad = INTALIGN(unpadded_offset) - unpadded_offset.
+ *
+ *	The result references `value_bytes` for string / numeric /
+ *	container payloads, so the caller is responsible for either
+ *	copying the bytes (JsonbValueToJsonb does this) or keeping
+ *	`value_bytes` alive for the JsonbValue's lifetime.
+ *
+ *	Returns true if the JEntry kind is recognised. Returns false
+ *	otherwise; the caller should fall back. This is not an ERROR
+ *	signal — an unrecognised JEntry kind may indicate a future
+ *	on-disk extension the slow path knows how to handle.
+ */
+static bool
+jbtl_fill_inline_jsonb_value(JEntry value_jentry,
+							 char *value_bytes,
+							 int32 value_len,
+							 int pad,
+							 JsonbValue *out)
+{
+	if (JBE_ISNULL(value_jentry))
+	{
+		out->type = jbvNull;
+	}
+	else if (JBE_ISSTRING(value_jentry))
+	{
+		out->type = jbvString;
+		out->val.string.val = value_bytes;
+		out->val.string.len = value_len;
+		Assert(out->val.string.len >= 0);
+	}
+	else if (JBE_ISNUMERIC(value_jentry))
+	{
+		out->type = jbvNumeric;
+		out->val.numeric = (Numeric) (value_bytes + pad);
+	}
+	else if (JBE_ISBOOL_TRUE(value_jentry))
+	{
+		out->type = jbvBool;
+		out->val.boolean = true;
+	}
+	else if (JBE_ISBOOL_FALSE(value_jentry))
+	{
+		out->type = jbvBool;
+		out->val.boolean = false;
+	}
+	else if (JBE_ISCONTAINER(value_jentry))
+	{
+		/*
+		 * Inline (non-relocated) nested container. The bytes starting
+		 * at INTALIGN(unpadded_offset) form a JsonbContainer of length
+		 * value_len - pad. The inline-style fast path short-circuits
+		 * containers earlier (out of scope by design); the
+		 * relocation-aware path does support them here.
+		 */
+		out->type = jbvBinary;
+		out->val.binary.data = (JsonbContainer *) (value_bytes + pad);
+		out->val.binary.len = value_len - pad;
+	}
+	else
+	{
+		return false;
+	}
+	return true;
 }
 
 
@@ -253,9 +509,6 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	int			key_area_end;
 	void	   *kvmap_ptr;
 	char	   *base_addr;
-	int			stop_low,
-				stop_high,
-				found_idx;
 	int32		physical_value_idx;
 	JEntry		value_jentry;
 	uint32		value_offset_in_data;
@@ -338,13 +591,12 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 	kvmap_entry_size = has_kvmap ? JSONB_KVMAP_ENTRY_SIZE(N) : 0;
 
 	/*
-	 * KVMap is INTALIGN'd in the on-disk layout (writer pads with
-	 * zeros to ALIGNOF_INT after the raw kvmap_entry_size * N bytes).
-	 * core's initKVMap returns INTALIGN(N * entry_size) past the
-	 * JEntries. We must do the same when computing where the data
-	 * area starts.
+	 * KVMap is INTALIGN'd in the on-disk layout. Use the shared
+	 * jbtl_object_data_area_offset helper so this fast path agrees
+	 * with the relocation-aware fast path and the writer side on the
+	 * layout formula.
 	 */
-	min_prefix = (int) sizeof(uint32) + 8 * N + INTALIGN(N * kvmap_entry_size);
+	min_prefix = jbtl_object_data_area_offset(jc, NULL, NULL);
 
 	/*
 	 * Step 3: ensure prefix covers JEntries + KVMap. Refetch if not.
@@ -435,42 +687,21 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 		}
 	}
 
-	/* Step 5: binary-search for the key. */
+	/* Step 5: binary-search for the key. Delegated to shared helper. */
 	kvmap_ptr = has_kvmap ? body + sizeof(uint32) + 8 * N : NULL;
 	base_addr = body + min_prefix;
 
-	stop_low = 0;
-	stop_high = N;
-	found_idx = -1;
-	while (stop_low < stop_high)
-	{
-		int			mid = stop_low + (stop_high - stop_low) / 2;
-		const char *cand_val = base_addr + getJsonbOffset(jc, mid);
-		int			cand_len = getJsonbLength(jc, mid);
-		int			diff = jbtl_compare_jsonb_string(cand_val, cand_len,
-													key, keylen);
+	physical_value_idx = jbtl_find_key_in_object(jc, base_addr,
+												 kvmap_ptr, kvmap_entry_size,
+												 key, keylen);
 
-		if (diff == 0)
-		{
-			found_idx = mid;
-			break;
-		}
-		if (diff < 0)
-			stop_low = mid + 1;
-		else
-			stop_high = mid;
-	}
-
-	if (found_idx < 0)
+	if (physical_value_idx < 0)
 	{
 		/* key not found, but fast path completed */
 		goto out;
 	}
 
-	/* Step 6: KVMap-redirect to physical value index. */
-	physical_value_idx =
-		jbtl_kvmap_entry(kvmap_ptr, kvmap_entry_size, found_idx) + N;
-
+	/* Step 6: matched value JEntry already includes the KVMap redirect. */
 	value_jentry = jc->children[physical_value_idx];
 	value_offset_in_data = getJsonbOffset(jc, physical_value_idx);
 	value_len = getJsonbLength(jc, physical_value_idx);
@@ -663,49 +894,18 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 					   diff_info->diff_len);
 			}
 
-		/* Step 9: construct the JsonbValue. */
+		/* Step 9: construct the JsonbValue via shared helper. */
 		result = (JsonbValue *) palloc(sizeof(JsonbValue));
 
-		if (JBE_ISNULL(value_jentry))
-		{
-			result->type = jbvNull;
-		}
-		else if (JBE_ISSTRING(value_jentry))
+		if (!jbtl_fill_inline_jsonb_value(value_jentry, value_bytes,
+										  value_len, (int) pad, result))
 		{
 			/*
-			 * Strings get no alignment padding; pad is 0 here. The
-			 * JsonbValue points directly at our fetched bytes. Caller
-			 * is responsible for materializing into stable memory before
-			 * the prefix/value buffer goes out of scope.
+			 * Unrecognised JEntry kind. The inline-style path filters
+			 * out container values at Step 7; reaching here means a
+			 * future on-disk extension (or corruption). Fall back.
 			 */
-			result->type = jbvString;
-			result->val.string.val = value_bytes;
-			result->val.string.len = value_len;
-		}
-		else if (JBE_ISNUMERIC(value_jentry))
-		{
-			/*
-			 * Numerics are INTALIGN'd; skip pad bytes at the front of
-			 * the fetched value buffer. pad was computed as
-			 * INTALIGN(value_offset_in_data) - value_offset_in_data,
-			 * so value_bytes + pad lands exactly on the Numeric struct.
-			 */
-			result->type = jbvNumeric;
-			result->val.numeric = (Numeric) (value_bytes + pad);
-		}
-		else if (JBE_ISBOOL_TRUE(value_jentry))
-		{
-			result->type = jbvBool;
-			result->val.boolean = true;
-		}
-		else if (JBE_ISBOOL_FALSE(value_jentry))
-		{
-			result->type = jbvBool;
-			result->val.boolean = false;
-		}
-		else
-		{
-			/* Should be unreachable; defensive fallback. */
+			pfree(result);
 			*out_fallback = true;
 			goto out;
 		}
@@ -1151,103 +1351,66 @@ jbtl_object_field_probe(PG_FUNCTION_ARGS)
 /*
  * jbtl_relocation_aware_object_field
  *
- *	R1 prototype: relocation-aware object_field fast path for the
- *	JBTL_POINTER_SUBTREE wrapper. The parent body is inline in the
- *	CUSTOM varlena's data area; we never re-fetch it. We walk the
- *	parent's JEntries + (optional) KVMap to find the requested key
- *	and then branch by the matched JEntry's type:
+ *	Relocation-aware fast path for jsonb -> 'key'. The wrapper-format
+ *	unwrap has already been done by jbtl_object_field_unwrap, which
+ *	stripped the JbtlSubtreeHeader and exposed the inline parent body
+ *	and its size. This helper owns the body-level work:
  *
- *	  missing key            → return NULL (caller emits SQL NULL).
- *	  inline scalar / inline → build JsonbValue directly from inline
- *	                           bytes; no out-of-line fetch.
- *	  relocated value        → decode the inline JbtlToastedContainerPointer,
- *	                           fetch exactly ONE out-of-line fragment via
- *	                           jbtl_toast_fetch_full_plain, return as
- *	                           jbvBinary.
+ *	  1. bounds-check the container header, JEntry array, KVMap, and
+ *	     key area before any unsafe reads (see in-line notes);
+ *	  2. binary-search for the requested key in the parent body's key
+ *	     area, with no toast I/O, using jbtl_find_key_in_object;
+ *	  3. dispatch on the matched value JEntry:
+ *	       - missing                         -> NULL (no fragment fetch)
+ *	       - inline scalar / inline container -> JsonbValue from
+ *	         the inline bytes (no fragment fetch), via
+ *	         jbtl_fill_inline_jsonb_value
+ *	       - JBTL_JBE_ISCONTAINER_PTR        -> fetch exactly one
+ *	         out-of-line fragment via jbtl_toast_fetch_full_plain.
  *
- *	out_fallback semantics mirror jbtl_toast_fetch_object_field:
- *	set to true and return NULL when the input shape is malformed
- *	in a way the slow detoast path can still handle. Clear-corruption
- *	cases (bad relocation payload size, zero ext size) ERROR with
- *	ERRCODE_DATA_CORRUPTED to match the existing assembly path's
- *	convention (jsonb_toaster_lite.c:1732-1751).
+ *	Returns the JsonbValue on success, NULL on missing key or
+ *	fallback. *out_fallback is set to true exactly when the caller
+ *	should let the slow detoast path handle the input.
  *
- *	Lifetime: the returned JsonbValue may reference bytes inside the
- *	caller's raw datum (for inline values) or inside a palloc'd
- *	fragment buffer (for relocated values). In both cases
- *	JsonbValueToJsonb copies the bytes into a fresh varlena, so
- *	caller need not pfree the fragment.
+ *	Sorted-keys invariant: object keys in a jsonb body are sorted by
+ *	jbtl_compare_jsonb_string (same order core's jsonb writer
+ *	emits). The relocation writer copies the original key area
+ *	byte-identically, so the sort order is preserved on disk. The
+ *	binary search relies on this invariant; it is documented at the
+ *	helper jbtl_find_key_in_object and re-stated here.
  *
- *	Per the relocation writer's invariant at
- *	jsonb_toaster_lite.c:1563-1566, fragments are plain jsonb with
- *	no nested relocation, so jbvBinary referencing a fetched fragment
- *	body is well-formed for the SQL output path.
+ *	ERROR vs fallback: structural malformations (truncated body,
+ *	JEntry-array overrun, key-area overrun, unrecognised JEntry kind)
+ *	signal fallback. Clear data corruption that the writer-side
+ *	admission rules forbid — ISCONTAINER_PTR payload smaller than
+ *	(sizeof(JEntry) + TOAST_POINTER_SIZE), zero ext size — raises
+ *	ERRCODE_DATA_CORRUPTED. See the file-level ERROR-vs-fallback
+ *	policy block at the top of this file.
  */
 static JsonbValue *
-jbtl_relocation_aware_object_field(struct varlena *raw,
+jbtl_relocation_aware_object_field(char *parent_body, int32 parent_size,
 								   const char *key, int keylen,
 								   bool *out_fallback)
 {
-	char	   *payload;
-	int32		payload_size;
-	char	   *parent_body;
-	int32		parent_size;
 	JsonbContainer *root;
 	int			N;
-	JEntry	   *children;
-	char	   *base_addr;
-	void	   *kvmap_ptr;
-	int			kvmap_entry_size;
-	bool		has_kvmap;
 	int			data_area_offset;
+	bool		has_kvmap;
+	int			kvmap_entry_size;
+	void	   *kvmap_ptr;
+	char	   *base_addr;
 	int			key_area_end;
-	int			stop_low,
-				stop_high;
-	int			found_idx = -1;
-	int			physical_value_idx;
+	int			found_idx;
 	JEntry		value_jentry;
 	uint32		value_offset_in_data;
 	int32		value_len;
 	char	   *value_bytes;
-	int			pad;
-	int			i;
 	JsonbValue *result;
+	int			i;
 
 	*out_fallback = false;
 
-	/*
-	 * Caller (the hook) has already verified the wrapper mode is
-	 * JBTL_POINTER_SUBTREE; we go straight to the payload.
-	 */
-	payload = JBTL_CUSTOM_PTR_GET_DATA(raw);
-	payload_size = (int32) JBTL_CUSTOM_PTR_GET_DATA_SIZE(raw);
-
-	/*
-	 * Version dispatch — same logic as jbtl_detoast SUBTREE case at
-	 * jsonb_toaster_lite.c:1600-1620.  v1 has a JbtlSubtreeHeader
-	 * prefix; v0 (legacy fixture) starts directly with the parent
-	 * body.
-	 */
-	if (payload_size >= (int32) sizeof(JbtlSubtreeHeader) &&
-		(uint8) payload[0] == JBTL_SUBTREE_HEADER_V1)
-	{
-		const JbtlSubtreeHeader *hdr = (const JbtlSubtreeHeader *) payload;
-
-		if (hdr->header_size != sizeof(JbtlSubtreeHeader))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("jsonb_toaster_lite: SUBTREE v1 header_size mismatch (%u vs %zu) in relocation-aware object_field",
-							hdr->header_size,
-							sizeof(JbtlSubtreeHeader))));
-		parent_body = payload + hdr->header_size;
-		parent_size = payload_size - hdr->header_size;
-	}
-	else
-	{
-		parent_body = payload;
-		parent_size = payload_size;
-	}
-
+	/* (a) Container header fits. */
 	if (parent_size < (int32) sizeof(uint32))
 	{
 		*out_fallback = true;
@@ -1255,9 +1418,10 @@ jbtl_relocation_aware_object_field(struct varlena *raw,
 	}
 
 	root = (JsonbContainer *) parent_body;
+
 	if (!JsonContainerIsObject(root))
 	{
-		/* jb -> 'key' on a non-object: defer to core's NULL handling. */
+		/* Non-object root: out of scope; slow path handles it. */
 		*out_fallback = true;
 		return NULL;
 	}
@@ -1266,24 +1430,27 @@ jbtl_relocation_aware_object_field(struct varlena *raw,
 	if (N <= 0)
 		return NULL;			/* empty object: missing key */
 
-	children = root->children;
-	has_kvmap = JsonContainerHasKVMap(root);
-	kvmap_entry_size = has_kvmap ? JSONB_KVMAP_ENTRY_SIZE(N) : 0;
+	data_area_offset = jbtl_object_data_area_offset(root, &has_kvmap,
+													&kvmap_entry_size);
 
 	/*
-	 * Data area starts after header (4 bytes) + 2N JEntries + INTALIGN'd
-	 * KVMap. Same offset computation the assembly path uses at
-	 * jsonb_toaster_lite.c:1683-1687.
+	 * (b) Bound-check the JEntry array AND the optional KVMap region
+	 * BEFORE walking JEntries to compute key area length. Without
+	 * this guard, the length-summing loop below could call
+	 * getJsonbLength(root, i) on JEntry indices that point past the
+	 * end of parent_body. This is the §4.10 fix from the prototype
+	 * review.
 	 */
-	data_area_offset =
-		(int) sizeof(uint32) +
-		2 * N * (int) sizeof(JEntry) +
-		INTALIGN(N * kvmap_entry_size);
+	if (parent_size < data_area_offset)
+	{
+		*out_fallback = true;
+		return NULL;
+	}
 
-	/* Verify parent body covers header + JEntries + KVMap + keys. */
+	/* (c) Sum key lengths; safe now because JEntry array is bounded. */
 	key_area_end = data_area_offset;
 	for (i = 0; i < N; i++)
-		key_area_end += getJsonbLength(root, i);
+		key_area_end += (int) getJsonbLength(root, i);
 
 	if (parent_size < key_area_end)
 	{
@@ -1292,71 +1459,41 @@ jbtl_relocation_aware_object_field(struct varlena *raw,
 	}
 
 	kvmap_ptr = has_kvmap
-		? (void *) (parent_body + sizeof(uint32) + 2 * N * sizeof(JEntry))
+		? (void *) (parent_body + sizeof(uint32) + 2 * N * (int) sizeof(JEntry))
 		: NULL;
 	base_addr = parent_body + data_area_offset;
 
-	/*
-	 * Binary search for the key. Same comparison ordering as core's
-	 * static lengthCompareJsonbString (jsonb_util.c:442-481): shorter
-	 * strings sort before longer ones, equal-length compares memcmp.
-	 */
-	stop_low = 0;
-	stop_high = N;
-	while (stop_low < stop_high)
-	{
-		int			mid = stop_low + (stop_high - stop_low) / 2;
-		const char *cand_val = base_addr + getJsonbOffset(root, mid);
-		int			cand_len = getJsonbLength(root, mid);
-		int			diff = jbtl_compare_jsonb_string(cand_val, cand_len,
-													  key, keylen);
-
-		if (diff == 0)
-		{
-			found_idx = mid;
-			break;
-		}
-		if (diff < 0)
-			stop_low = mid + 1;
-		else
-			stop_high = mid;
-	}
-
+	/* Locate the key. */
+	found_idx = jbtl_find_key_in_object(root, base_addr,
+										kvmap_ptr, kvmap_entry_size,
+										key, keylen);
 	if (found_idx < 0)
 		return NULL;			/* missing key — no fragment fetch */
 
-	/*
-	 * Resolve to physical value index. value JEntries occupy
-	 * [N, 2N) and KVMap (if present) gives the indirection.
-	 */
-	physical_value_idx =
-		jbtl_kvmap_entry(kvmap_ptr, kvmap_entry_size, found_idx) + N;
-
-	value_jentry = children[physical_value_idx];
-	value_offset_in_data = getJsonbOffset(root, physical_value_idx);
-	value_len = (int32) getJsonbLength(root, physical_value_idx);
+	value_jentry = root->children[found_idx];
+	value_offset_in_data = getJsonbOffset(root, found_idx);
+	value_len = (int32) getJsonbLength(root, found_idx);
 	value_bytes = base_addr + value_offset_in_data;
-	pad = INTALIGN(value_offset_in_data) - value_offset_in_data;
 
-	/* Branch by JEntry type. */
+	/* (d) Final bounds check: value bytes must lie within parent body. */
+	if ((int32) (value_bytes - parent_body) + value_len > parent_size)
+	{
+		*out_fallback = true;
+		return NULL;
+	}
+
+	/* Relocation pointer: fetch exactly one out-of-line fragment. */
 	if (JBTL_JBE_ISCONTAINER_PTR(value_jentry))
 	{
-		/*
-		 * Relocated value. value_bytes points at the inline
-		 * JbtlToastedContainerPointer record (JEntry header byte +
-		 * embedded full-on-disk varatt_external). Mirror the assembly
-		 * path's decode at jsonb_toaster_lite.c:1730-1751.
-		 */
 		const JbtlToastedContainerPointer *ptr;
 		struct varatt_external ext;
 		struct varlena *fragment;
-		int32		fragment_payload;
 
 		if (value_len < (int32) (sizeof(JEntry) + TOAST_POINTER_SIZE))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("jsonb_toaster_lite: ISCONTAINER_PTR payload too small (%d) in relocation-aware object_field",
-							value_len)));
+					 errmsg("jsonb_toaster_lite: relocation pointer payload too small (%d bytes) for key \"%.*s\"",
+							value_len, keylen, key)));
 
 		ptr = (const JbtlToastedContainerPointer *) value_bytes;
 		VARATT_EXTERNAL_GET_POINTER(ext, ptr->data);
@@ -1364,80 +1501,273 @@ jbtl_relocation_aware_object_field(struct varlena *raw,
 		if (!VARATT_EXTERNAL_GET_EXTSIZE(ext))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("jsonb_toaster_lite: SUBTREE child has zero ext size in relocation-aware object_field")));
+					 errmsg("jsonb_toaster_lite: relocation pointer has zero ext size for key \"%.*s\"",
+							keylen, key)));
 
 		/*
-		 * Fetch the one requested out-of-line fragment. Same MVCC-safe
-		 * fetcher the assembly path uses at jsonb_toaster_lite.c:1759.
-		 * Children are plain jsonb (no nested relocation), per the
-		 * writer invariant at jsonb_toaster_lite.c:1563-1566.
+		 * Same MVCC-safe fetcher the slow assembly path uses; visibility
+		 * is inherited from the executor's snapshot via the caller's
+		 * transaction context. Children are plain jsonb (no nested
+		 * relocation), per the relocation writer's invariant in
+		 * jsonb_toaster_lite.c (jbtl_try_spill_subtree).
 		 */
 		fragment = jbtl_toast_fetch_full_plain(&ext, NULL);
-		fragment_payload = (int32) VARSIZE(fragment) - VARHDRSZ;
 
-		result = (JsonbValue *) palloc(sizeof(JsonbValue));
-		result->type = jbvBinary;
-		result->val.binary.data = (JsonbContainer *) VARDATA(fragment);
-		result->val.binary.len = fragment_payload;
+		/*
+		 * Strip the original-layout INTALIGN pad at the start of the
+		 * fragment. The writer at jbtl_try_spill_subtree copies
+		 * `vlen = spill_len[j]` bytes starting from the value's
+		 * UNPADDED offset in the source body. core's writer convention
+		 * embeds the alignment pad inside the JEntry length, so the
+		 * first 0..3 bytes of the stored fragment are zero pad bytes,
+		 * followed by the actual JsonbContainer header. Probe to find
+		 * the container start: a valid container header has at least
+		 * one of JB_FOBJECT, JB_FARRAY, JB_FSCALAR set in the high
+		 * nibble.
+		 */
+		{
+			char	   *frag_data = VARDATA(fragment);
+			int			frag_len = (int) (VARSIZE(fragment) - VARHDRSZ);
+			int			frag_pad;
+			bool		found = false;
+
+			for (frag_pad = 0; frag_pad < 4 && frag_pad < frag_len; frag_pad++)
+			{
+				uint32		hdr;
+
+				if (frag_len - frag_pad < (int) sizeof(uint32))
+					break;
+				memcpy(&hdr, frag_data + frag_pad, sizeof(uint32));
+				if ((hdr & (JB_FOBJECT | JB_FARRAY | JB_FSCALAR)) != 0)
+				{
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+			{
+				/*
+				 * No valid container header in the first 4 bytes of the
+				 * fragment. Either the writer produced something unexpected,
+				 * or this is genuine corruption. Fall back; the slow detoast
+				 * path handles fragment assembly with full validation.
+				 */
+				pfree(fragment);
+				*out_fallback = true;
+				return NULL;
+			}
+
+			result = (JsonbValue *) palloc(sizeof(JsonbValue));
+			result->type = jbvBinary;
+			result->val.binary.data = (JsonbContainer *) (frag_data + frag_pad);
+			result->val.binary.len = frag_len - frag_pad;
+		}
 		return result;
 	}
 
-	/* Inline value. Mirror core fillJsonbValue (jsonb_util.c:530-572). */
-	result = (JsonbValue *) palloc(sizeof(JsonbValue));
+	/*
+	 * Inline value. Determine actual pad before constructing the
+	 * JsonbValue.
+	 *
+	 * Pad rule mismatch (writer/reader): the relocation writer at
+	 * jsonb_toaster_lite.c:jbtl_try_spill_subtree copies non-spilled
+	 * value bytes verbatim from the original parent body into the
+	 * new (post-spill) body. The original parent body followed core's
+	 * convertJsonbObject convention: each Numeric/Container value
+	 * has its alignment pad embedded INSIDE the JEntry length. The
+	 * pad bytes (zero-filled) sit at the start of the value slot;
+	 * the actual varlena/container header sits at
+	 * value_bytes + original_pad.
+	 *
+	 * In the post-spill body, the JEntry array and the running
+	 * offset are recomputed (because the spilled container's payload
+	 * shrinks to a 22-byte pointer), so the JEntry's NEW logical
+	 * offset within the data area may differ in alignment from its
+	 * ORIGINAL offset. Computing pad from the new offset via
+	 * INTALIGN(new_offset) - new_offset gives the wrong value
+	 * whenever the spill operation displaces the value across an
+	 * alignment boundary.
+	 *
+	 * Robust strategy: probe both candidate positions (pad=0 and
+	 * pad=INTALIGN-derived) and pick the one whose decoded payload
+	 * matches the JEntry length exactly. For Numeric this means
+	 * VARSIZE(varlena) == value_len - pad. For inline Container this
+	 * means the JsonbContainer header has valid type bits. If
+	 * neither position validates, fall back.
+	 */
+	{
+		int			candidate_pad =
+			INTALIGN(value_offset_in_data) - value_offset_in_data;
+		int			pad = 0;
+		bool		pad_resolved = false;
 
-	if (JBE_ISNULL(value_jentry))
-	{
-		result->type = jbvNull;
-	}
-	else if (JBE_ISSTRING(value_jentry))
-	{
-		result->type = jbvString;
-		result->val.string.val = value_bytes;
-		result->val.string.len = value_len;
-		Assert(result->val.string.len >= 0);
-	}
-	else if (JBE_ISNUMERIC(value_jentry))
-	{
-		/*
-		 * Numerics are INTALIGN'd. Skip the pad bytes the writer
-		 * inserted before the Numeric struct.
-		 */
-		result->type = jbvNumeric;
-		result->val.numeric = (Numeric) (value_bytes + pad);
-	}
-	else if (JBE_ISBOOL_TRUE(value_jentry))
-	{
-		result->type = jbvBool;
-		result->val.boolean = true;
-	}
-	else if (JBE_ISBOOL_FALSE(value_jentry))
-	{
-		result->type = jbvBool;
-		result->val.boolean = false;
-	}
-	else if (JBE_ISCONTAINER(value_jentry))
-	{
-		/*
-		 * Inline (non-relocated) nested container. Same handling as
-		 * core fillJsonbValue's else branch: jbvBinary into the
-		 * inline bytes, accounting for the alignment pad. The parent
-		 * body lives inside the caller's CUSTOM varlena, which has
-		 * executor per-tuple lifetime; JsonbValueToJsonb in the hook
-		 * copies the bytes before that scope ends.
-		 */
-		result->type = jbvBinary;
-		result->val.binary.data = (JsonbContainer *) (value_bytes + pad);
-		result->val.binary.len = value_len - pad;
-	}
-	else
-	{
-		/* Unknown JEntry type. Defensive: fall back, not ERROR. */
-		pfree(result);
-		*out_fallback = true;
-		return NULL;
+		if (JBE_ISNUMERIC(value_jentry))
+		{
+			/*
+			 * Numeric is a 4-byte-header varlena (core's writer always
+			 * emits the full header form for Numeric in jsonb).
+			 * Validate by matching VARSIZE to the remaining length.
+			 */
+			if (value_len >= (int32) VARHDRSZ &&
+				VARATT_IS_4B(value_bytes) &&
+				(int32) VARSIZE(value_bytes) == value_len)
+			{
+				pad = 0;
+				pad_resolved = true;
+			}
+			else if (candidate_pad > 0 &&
+					 value_len >= candidate_pad + (int32) VARHDRSZ &&
+					 VARATT_IS_4B(value_bytes + candidate_pad) &&
+					 (int32) VARSIZE(value_bytes + candidate_pad)
+					 == value_len - candidate_pad)
+			{
+				pad = candidate_pad;
+				pad_resolved = true;
+			}
+		}
+		else if (JBE_ISCONTAINER(value_jentry))
+		{
+			/*
+			 * Inline container header (uint32). Valid containers have
+			 * JB_FOBJECT, JB_FARRAY, or JB_FSCALAR bits set.
+			 */
+			uint32		hdr_candidate;
+
+			if (value_len >= (int32) sizeof(uint32))
+			{
+				memcpy(&hdr_candidate, value_bytes, sizeof(uint32));
+				if ((hdr_candidate &
+					 (JB_FOBJECT | JB_FARRAY | JB_FSCALAR)) != 0)
+				{
+					pad = 0;
+					pad_resolved = true;
+				}
+			}
+			if (!pad_resolved && candidate_pad > 0 &&
+				value_len >= candidate_pad + (int32) sizeof(uint32))
+			{
+				memcpy(&hdr_candidate, value_bytes + candidate_pad,
+					   sizeof(uint32));
+				if ((hdr_candidate &
+					 (JB_FOBJECT | JB_FARRAY | JB_FSCALAR)) != 0)
+				{
+					pad = candidate_pad;
+					pad_resolved = true;
+				}
+			}
+		}
+		else
+		{
+			/* String / Bool / Null: no pad. */
+			pad_resolved = true;
+		}
+
+		if (!pad_resolved)
+		{
+			/* Can't decode at either candidate position. Slow path
+			 * handles it correctly via full assembly. */
+			*out_fallback = true;
+			return NULL;
+		}
+
+		result = (JsonbValue *) palloc(sizeof(JsonbValue));
+		if (!jbtl_fill_inline_jsonb_value(value_jentry, value_bytes,
+										  value_len, pad, result))
+		{
+			/* Unrecognised JEntry kind: future on-disk extension? */
+			pfree(result);
+			*out_fallback = true;
+			return NULL;
+		}
 	}
 
 	return result;
+}
+
+
+/*
+ * jbtl_object_field_unwrap
+ *
+ *	Single dispatch point for the jsonb_object_field hook. Classifies
+ *	the wrapper kind once and exposes the relevant per-kind state
+ *	through a tagged result. The hook does NOT peek the mode tag
+ *	itself; this function is the only place wrapper-format identifiers
+ *	are read in the dispatch flow.
+ *
+ *	For the relocation kind, the JbtlSubtreeHeader (v1) prefix is
+ *	stripped here so that downstream consumers (the relocation-aware
+ *	fast path) see only the parent jsonb body. A v0 fixture wrapper
+ *	(no header) is handled transparently.
+ *
+ *	Per the file-level ERROR-vs-fallback policy, malformed v1 headers
+ *	(header_size mismatch) and any other wrapper-layer structural
+ *	problems are signalled as JBTL_OF_UNWRAP_NONE so the slow path
+ *	can detect them and ERROR with full context.
+ */
+static void
+jbtl_object_field_unwrap(struct varlena *raw,
+						 JbtlObjectFieldUnwrapResult *out)
+{
+	uint32		mode_tag;
+
+	Assert(VARATT_IS_CUSTOM(raw));
+	memset(out, 0, sizeof(*out));
+
+	mode_tag = JBTL_CUSTOM_PTR_GET_HEADER(raw) & JBTL_POINTER_TYPE_MASK;
+
+	if (mode_tag == JBTL_POINTER_SUBTREE)
+	{
+		char	   *payload = JBTL_CUSTOM_PTR_GET_DATA(raw);
+		int32		payload_size = (int32) JBTL_CUSTOM_PTR_GET_DATA_SIZE(raw);
+
+		/*
+		 * v1 has a JbtlSubtreeHeader prefix; v0 fixture starts at the
+		 * body directly. We field-load `version` rather than reading
+		 * payload[0] as uint8 so the dispatch is robust against any
+		 * future reordering of JbtlSubtreeHeader fields.
+		 */
+		if (payload_size >= (int32) sizeof(JbtlSubtreeHeader) &&
+			((const JbtlSubtreeHeader *) payload)->version
+			== JBTL_SUBTREE_HEADER_V1)
+		{
+			const JbtlSubtreeHeader *hdr = (const JbtlSubtreeHeader *) payload;
+
+			if (hdr->header_size != sizeof(JbtlSubtreeHeader))
+			{
+				/*
+				 * v1 header_size disagrees with the struct size we
+				 * compiled against. The slow detoast path performs the
+				 * same check and will raise ERRCODE_DATA_CORRUPTED with
+				 * full row context. Fall back here.
+				 */
+				out->kind = JBTL_OF_UNWRAP_NONE;
+				return;
+			}
+			out->parent_body = payload + hdr->header_size;
+			out->parent_size = payload_size - hdr->header_size;
+		}
+		else
+		{
+			out->parent_body = payload;
+			out->parent_size = payload_size;
+		}
+		out->kind = JBTL_OF_UNWRAP_RELOCATION;
+		return;
+	}
+
+	/*
+	 * All other modes go through the existing inline-style unwrap,
+	 * which handles JBTL_POINTER, JBTL_POINTER_COMPRESSED_CHUNKS, and
+	 * JBTL_POINTER_DIFF, and rejects anything else.
+	 */
+	if (jbtl_unwrap_to_toast_pointer(raw,
+									 &out->inline_mode,
+									 &out->inline_ext,
+									 &out->inline_diff_info))
+		out->kind = JBTL_OF_UNWRAP_INLINE_STYLE;
+	else
+		out->kind = JBTL_OF_UNWRAP_NONE;
 }
 
 
@@ -1454,74 +1784,56 @@ jbtl_relocation_aware_object_field(struct varlena *raw,
  *	must NOT call back into jsonb_object_field or any other core
  *	fallback wrapper: core handles that itself once we return false.
  *
- *	R1 prototype dispatch:
- *	  JBTL_POINTER_SUBTREE → jbtl_relocation_aware_object_field
- *	                         (parent body inline; at most one
- *	                          out-of-line fragment is fetched).
- *	  other CUSTOM modes   → existing slice-aware fast path via
- *	                         jbtl_unwrap_to_toast_pointer +
- *	                         jbtl_toast_fetch_object_field.
+ *	Dispatch is driven entirely by jbtl_object_field_unwrap's tagged
+ *	return. The hook does not inspect wrapper-format identifiers
+ *	(mode tags, header bytes) directly; the unwrap layer is the
+ *	single source of truth on wrapper kinds.
  */
 bool
 jbtl_jsonb_object_field_hook_fn(Datum raw_jb, text *key,
 								bool *isnull, Datum *result)
 {
 	struct varlena *raw = (struct varlena *) DatumGetPointer(raw_jb);
-	uint32		mode;
-	struct varatt_external ext_ptr;
-	JbtlDiffInfo diff_info;
-	JsonbValue *jbv;
+	JbtlObjectFieldUnwrapResult unwrap;
+	JsonbValue *jbv = NULL;
 	bool		fallback = false;
 
 	/*
 	 * Dispatch contract: core's jsonb_object_field gates this callback
 	 * on VARATT_IS_CUSTOM(raw). Assert it here so any future caller
 	 * that bypasses the dispatch site trips a debug build immediately
-	 * rather than relying on jbtl_unwrap_to_toast_pointer's silent
-	 * reject.
+	 * rather than relying on the unwrap layer's silent reject.
 	 */
 	Assert(VARATT_IS_CUSTOM(raw));
 
-	/*
-	 * Peek the wrapper mode tag. For JBTL_POINTER_SUBTREE we take the
-	 * relocation-aware path that reads the inline parent body and
-	 * fetches at most one out-of-line fragment. For all other CUSTOM
-	 * modes we keep the original slice-aware fast path.
-	 */
-	mode = JBTL_CUSTOM_PTR_GET_HEADER(raw) & JBTL_POINTER_TYPE_MASK;
+	jbtl_object_field_unwrap(raw, &unwrap);
 
-	if (mode == JBTL_POINTER_SUBTREE)
+	switch (unwrap.kind)
 	{
-		jbv = jbtl_relocation_aware_object_field(raw,
-												 VARDATA_ANY(key),
-												 VARSIZE_ANY_EXHDR(key),
-												 &fallback);
-		if (fallback)
+		case JBTL_OF_UNWRAP_NONE:
 			return false;
 
-		if (jbv == NULL)
-		{
-			*isnull = true;
-			*result = (Datum) 0;
-		}
-		else
-		{
-			*isnull = false;
-			*result = PointerGetDatum(JsonbValueToJsonb(jbv));
-		}
-		return true;
+		case JBTL_OF_UNWRAP_INLINE_STYLE:
+			jbv = jbtl_toast_fetch_object_field(
+				&unwrap.inline_ext,
+				unwrap.inline_mode,
+				unwrap.inline_mode == JBTL_POINTER_DIFF
+					? &unwrap.inline_diff_info : NULL,
+				VARDATA_ANY(key),
+				VARSIZE_ANY_EXHDR(key),
+				NULL, NULL, NULL, NULL,
+				&fallback,
+				NULL);
+			break;
+
+		case JBTL_OF_UNWRAP_RELOCATION:
+			jbv = jbtl_relocation_aware_object_field(unwrap.parent_body,
+													 unwrap.parent_size,
+													 VARDATA_ANY(key),
+													 VARSIZE_ANY_EXHDR(key),
+													 &fallback);
+			break;
 	}
-
-	if (!jbtl_unwrap_to_toast_pointer(raw, &mode, &ext_ptr, &diff_info))
-		return false;
-
-	jbv = jbtl_toast_fetch_object_field(&ext_ptr, mode,
-										mode == JBTL_POINTER_DIFF ? &diff_info : NULL,
-										VARDATA_ANY(key),
-										VARSIZE_ANY_EXHDR(key),
-										NULL, NULL, NULL, NULL,
-										&fallback,
-										NULL);
 
 	if (fallback)
 		return false;
