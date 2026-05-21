@@ -210,10 +210,20 @@ The matrix is therefore consistent with the spec's predictions:
 The harness's body sizes at ids 1, 10, 25, 50 (raw column-size
 226 B, 502 B, 142 B, 869 B) are all **inline** — under the
 TOAST tuple threshold. The transition to external happens between
-id=50 and id=60. So the matrix's "mid-size buffer regression
-region" reported in `PREFIX_LOCALITY_VS_RELOCATION.md` Test 2 is
-actually at id ≥ 60 in this harness, not at the column-size
-range 2.6 KB – 25 KB.
+id=50 and id=60. id ≥ 60 corresponds exactly to col_size ≥ 2.6 KB
+(verified directly against the harness table: id=60 on-disk
+2586 B, id=75 on-disk 14005 B, id=80 on-disk 24815 B, id=100
+on-disk 247092 B). The "mid-size buffer regression region"
+reported in `PREFIX_LOCALITY_VS_RELOCATION.md` Test 2 is the
+same range, named with body sizes instead of harness ids.
+
+Caveat on `pg_column_size_dataset` in the raw CSV: for J-cells
+(JBTL toaster bound) this metric returns the size of the TOAST
+pointer (~36 bytes), not the underlying body, because JBTL stores
+the data in its own structure. For F-cells and P-cells the
+metric returns the on-disk size of the body itself. Reading this
+metric across cells without per-cell separation produces the
+wrong calibration; per-cell separation is required.
 
 Reading the matrix in this corrected light:
 
