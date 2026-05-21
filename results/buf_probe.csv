@@ -1,0 +1,17 @@
+label,case,name,expected,Shared Hit Blocks,Shared Read Blocks,Local Hit Blocks,Local Read Blocks,Temp Read Blocks,Temp Written Blocks
+post-F1,INLINE_arrow,inline jb -> 'a',inline-no-engage,2,0,0,0,0,0
+post-F1,INLINE_text,inline jb ->> 'b',inline-no-engage,2,0,0,0,0,0
+post-F1,B_uncompr_prefix,"uncompr ext, prefix-resident k1 (Case B-ish)",FOUND,27,0,0,0,0,0
+post-F1,B_uncompr_past,"uncompr ext, past-prefix k3 (Case B)",FOUND,29,0,0,0,0,0
+post-F1,A_compr_prefix,"compr ext, prefix-resident k1 (Case A)",FOUND,27,0,0,0,0,0
+post-F1,C_compr_past,"compr ext, past-prefix k3 (Case C, FALLBACK)",FALLBACK,29,0,0,0,0,0
+post-F1,MISS_compr,"compr ext, missing key",MISSING,27,0,0,0,0,0
+post-F1,NESTED_fallback,"compr ext, nested container value",FALLBACK,30,0,0,0,0,0
+pre-F1,INLINE_arrow,inline jb -> 'a',inline-no-engage,2,0,0,0,0,0
+pre-F1,INLINE_text,inline jb ->> 'b',inline-no-engage,2,0,0,0,0,0
+pre-F1,B_uncompr_prefix,"uncompr ext, prefix-resident k1 (Case B-ish)",FOUND,27,0,0,0,0,0
+pre-F1,B_uncompr_past,"uncompr ext, past-prefix k3 (Case B)",FOUND,29,0,0,0,0,0
+pre-F1,A_compr_prefix,"compr ext, prefix-resident k1 (Case A)",FOUND,27,0,0,0,0,0
+pre-F1,C_compr_past,"compr ext, past-prefix k3 (Case C, FALLBACK)",FALLBACK,29,0,0,0,0,0
+pre-F1,MISS_compr,"compr ext, missing key",MISSING,27,0,0,0,0,0
+pre-F1,NESTED_fallback,"compr ext, nested container value",FALLBACK,30,0,0,0,0,0
