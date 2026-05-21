@@ -5,19 +5,27 @@ Author of review: @r2d2, wearing the upstream-reviewer hat
                   reading this for the first time, with no
                   prior context from the design docs).
 
-Code under review: commit 28c8b7fa5c, plus the JBTL audit in
-                   079e0b382d.
+Code under review: original implementation commit d3bd1a9d90 on
+                   the clean branch (was 28c8b7fa5c before the
+                   r2d2/layer1-sliced-read → r2d2/layer1-sliced-read-clean
+                   rebase). Plus the JBTL audit in c02a37a08a (was
+                   079e0b382d).
 
-**Status update (post fix-cycle):**
-  - D1 — **fixed** in commit b4a8f043df (header-doc contract).
-  - D2 — **fixed** in commit b4a8f043df (enum signature).
-  - D3 — **fixed** in commit b088abdafd (regression suite).
-  - S2 — **fixed** in commit b4a8f043df (StaticAssertDecl).
-  - S3 — **partially fixed** in commit b4a8f043df (the void-cast
+**Status update (post fix-cycle, clean-branch hashes):**
+  - D1 — **fixed** in commit c05ddb3182 (header-doc contract).
+  - D2 — **fixed** in commit c05ddb3182 (enum signature).
+  - D3 — **fixed** in commit f9015a62ff (regression suite).
+  - S2 — **fixed** in commit c05ddb3182 (StaticAssertDecl).
+  - S3 — **partially fixed** in commit c05ddb3182 (the void-cast
     idiom was removed as a fall-out of the D1+D2 cleanup; the
     memory-ownership note was relocated above the allocation
     site as recommended).
   - S1, M1-M7 — **deferred** to a follow-up cleanup commit.
+
+The textual content of each commit is unchanged from the prior
+branch; only the SHAs differ because the new base on
+origin/r1-relocation-aware-read excludes the 7 preparatory
+relocation / Layer 2 doc commits.
 
 Scope: code only. Documentation review is a separate exercise
        and the docs read well — that does not relax code

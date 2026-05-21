@@ -1,10 +1,29 @@
 # Layer 1 — cover letter for code review
 
-Branch: `r2d2/layer1-sliced-read`
-Base:   pgsql-master HEAD
+Branch: `r2d2/layer1-sliced-read-clean`
+Base:   `origin/r1-relocation-aware-read` (commit 39101c17e8, in
+        `github.com/obartunov/jbtl-public-clean`)
+Tip:    b4e20c025e
 Status: LAYER1_READY_FOR_CODE_REVIEW
 Scope:  `jsonb -> 'key'` and `jsonb ->> 'key'`
         — subscripting deferred to a named follow-up.
+
+## Branch convention
+
+This branch is the Layer-1-only review surface (13 commits). The
+parent branch `origin/r1-relocation-aware-read` carries the
+relocation / Layer 2 design backlog including:
+
+  - `PRODUCTION_RELOCATION_SOURCE_MAPPING.md`
+  - `RELOCATION_DELETE_OWNERSHIP.md`
+  - `PREFIX_LOCALITY_VS_RELOCATION.md`
+  - other earlier prefix-locality and sort-default analyses
+
+Inline references to those files inside Layer 1 docs (e.g. spec
+§ pointers, result-doc tests) are intentional cross-context
+pointers, not in-branch links. They resolve in the parent
+branch. The Layer 1 reviewer does not need to follow them to
+evaluate Layer 1.
 
 ## What this patch does
 
