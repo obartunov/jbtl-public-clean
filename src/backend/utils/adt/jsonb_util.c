@@ -26,6 +26,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
+#include "utils/jsonb_internal.h"
 #include "utils/memutils.h"
 #include "utils/varlena.h"
 
@@ -488,7 +489,7 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
 }
 
 /*
- * Layer-1 sliced-read helper for top-level jsonb -> 'key' lookups.
+ * Sliced-read helper for top-level jsonb -> 'key' lookups.
  *
  *	getKeyJsonValueFromExternal answers a key lookup on an external on-disk
  *	jsonb varlena without detoasting the whole body, by fetching a structural
@@ -502,8 +503,8 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
  *	JSONB_KEY_LOOKUP_FALLBACK return so the caller falls through to the
  *	existing full-detoast path unchanged.
  *
- *	See docs/SLICED_JSONB_READ.md for the design and src/include/utils/jsonb.h
- *	for the exported contract (memory ownership, return-value semantics).
+ *	See docs/SLICED_JSONB_READ.md for the design and
+ *	src/include/utils/jsonb_internal.h for the exported contract.
  *
  *	Parameters:
  *	  raw          un-detoasted column Datum (caller must NOT call
@@ -511,16 +512,26 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
  *	               can never apply).
  *	  keyVal,keyLen requested key, as in getKeyJsonValueFromContainer.
  *	  res          out-parameter scalar JsonbValue, palloc'd by caller
- *	               (cannot be NULL). Written only on JSONB_KEY_LOOKUP_FOUND.
+ *	               (cannot be NULL). Written only on JSONB_KEY_LOOKUP_FOUND;
+ *	               the contents are self-contained — any internal TOAST-slice
+ *	               memory is freed before return.
  *
  *	Returns one of:
  *	  JSONB_KEY_LOOKUP_FOUND     scalar found, written to *res
  *	  JSONB_KEY_LOOKUP_MISSING   key proven absent from object
  *	  JSONB_KEY_LOOKUP_FALLBACK  helper cannot answer; caller falls back
  *
- *	Corruption (JEntry walk past body size, header_size mismatch, etc.) is
- *	raised as ERRCODE_DATA_CORRUPTED; the slow path raises the same on the
- *	same bytes.
+ *	On detected physical inconsistency (JEntry walk past body size, header
+ *	size mismatch, short slice fetch) the helper raises
+ *	ERRCODE_DATA_CORRUPTED. The pre-existing slow path does not perform
+ *	equivalent bounds checks against the on-disk body size, so on the same
+ *	corrupt bytes it may segfault, return undefined data, or rarely succeed
+ *	by accident. Layer 1 therefore tightens corruption detection — a
+ *	behaviour change for production rows that are already corrupt.
+ *
+ *	All size arithmetic uses int64 intermediates so that no int32 wrap can
+ *	bypass a bounds check on a forged container header (e.g. a header
+ *	declaring N close to JB_CMASK_MAX with the KVMap flag set).
  */
 
 /* Initial prefix slice in bytes; smaller than one TOAST chunk so the
@@ -538,29 +549,43 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	struct varlena *attr;
 	struct varlena *prefix = NULL;
 	varatt_external toast_pointer;
-	int32		body_size;		/* uncompressed body size */
-	int32		prefix_size;
+	int64		body_size;		/* uncompressed body size */
+	int64		prefix_size;
 	bool		is_compressed;
 	char	   *body;
-	int32		body_len;
+	int64		body_len;
 	JsonbContainer *jc;
-	int			N;
+	uint32		N;
 	bool		has_kvmap;
 	int			kvmap_entry_size;
-	int32		header_size;
-	int32		kvmap_bytes;
-	int32		min_prefix;
-	int32		key_area_end;
+	int64		header_size;
+	int64		kvmap_bytes;
+	int64		min_prefix;
+	int64		key_area_end;
 	JsonbKVMap	kvmap;
 	char	   *base_addr;
-	int			i;
+	uint32		i;
 	int32		stopLow,
 				stopHigh;
-	int			physical_value_idx;
+	int32		physical_value_idx = -1;
 	JEntry		value_jentry;
 	uint32		value_offset_in_data;
-	int32		value_len;
-	int32		value_byte_end_in_body;
+	int64		value_len;
+	int64		value_byte_end_in_body;
+
+	/*
+	 * All size arithmetic below uses int64 intermediates so that no int32
+	 * wrap can bypass a bounds check on a forged container header. The
+	 * worst case (N close to JB_CMASK_MAX, has_kvmap=true) would produce
+	 * a min_prefix of ~3.2 GB which overflows int32 to a large negative
+	 * value and silently passes a naive "min_prefix > body_size" test.
+	 * int64 arithmetic forces the corruption check to fire.
+	 *
+	 * body_size, slice-length and slice-offset arguments to
+	 * detoast_attr_slice are downcast to int32 only after the relevant
+	 * bounds checks have already proved the value is ≤ body_size, which
+	 * is itself bounded by va_rawsize (int32).
+	 */
 
 	/* Layer 1 acts only on external on-disk varlenas. Inline / packed /
 	 * already-detoasted datums fall through to the existing path, which
@@ -572,36 +597,44 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 	is_compressed = VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer);
-	/* Uncompressed body size = va_rawsize - VARHDRSZ. For uncompressed
+
+	/*
+	 * Uncompressed body size = va_rawsize - VARHDRSZ. For uncompressed
 	 * external this equals the on-disk extsize; for compressed external
 	 * it is the post-decompression size and is what JEntry offsets index
 	 * into. detoast_attr_slice with sliceoffset=0 takes slicelength in
-	 * these same uncompressed-body units. */
-	body_size = (int32) toast_pointer.va_rawsize - (int32) VARHDRSZ;
+	 * these same uncompressed-body units.
+	 *
+	 * Computing in int64 from the start guards against a corrupt
+	 * va_rawsize that would otherwise wrap during subtraction.
+	 */
+	body_size = (int64) toast_pointer.va_rawsize - (int64) VARHDRSZ;
 
-	/* Pathologically small body: not worth slicing; let the slow path
-	 * handle it. The minimum jsonb body has a 4-byte header. */
-	if (body_size < (int32) sizeof(uint32))
+	/* Pathologically small or negative body: not worth slicing; let the
+	 * slow path handle it. The minimum jsonb body has a 4-byte header. */
+	if (body_size < (int64) sizeof(uint32))
 		return JSONB_KEY_LOOKUP_FALLBACK;
 
 	/*
 	 * Stage 1: fetch initial prefix. detoast_attr_slice handles both
-	 * uncompressed and compressed externals at sliceoffset == 0.
+	 * uncompressed and compressed externals at sliceoffset == 0. The
+	 * slice-length argument is int32, but here prefix_size is bounded by
+	 * JSONB_SLICED_READ_INITIAL_PREFIX (1024), so the downcast is safe.
 	 */
 	prefix_size = JSONB_SLICED_READ_INITIAL_PREFIX;
 	if (prefix_size > body_size)
 		prefix_size = body_size;
 
-	prefix = detoast_attr_slice(attr, 0, prefix_size);
+	prefix = detoast_attr_slice(attr, 0, (int32) prefix_size);
 	body = VARDATA(prefix);
-	body_len = (int32) VARSIZE(prefix) - (int32) VARHDRSZ;
+	body_len = (int64) VARSIZE(prefix) - (int64) VARHDRSZ;
 
 	/*
 	 * Stage 2: parse container header. Need at least 4 bytes for the
 	 * header itself; treat shorter results as not handled (slow path
 	 * will surface the real reason).
 	 */
-	if (body_len < (int32) sizeof(uint32))
+	if (body_len < (int64) sizeof(uint32))
 	{
 		pfree(prefix);
 		return JSONB_KEY_LOOKUP_FALLBACK;
@@ -624,38 +657,49 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 		return JSONB_KEY_LOOKUP_MISSING;
 	}
 
+	/*
+	 * Compute the structural-prefix size: 4-byte container header, 2N
+	 * JEntries (one per key, one per value), plus an INTALIGN'd KVMap if
+	 * the writer emitted one. All in int64. With N as a 28-bit field and
+	 * 4-byte KVMap entries, the worst-case sum reaches ~3.2 GB — well
+	 * beyond int32 — so int64 here is necessary, not stylistic.
+	 */
 	has_kvmap = JsonContainerHasKVMap(jc);
 	kvmap_entry_size = has_kvmap ? JSONB_KVMAP_ENTRY_SIZE(N) : 0;
-	header_size = (int32) sizeof(uint32) + 2 * N * (int32) sizeof(JEntry);
-	kvmap_bytes = has_kvmap ? INTALIGN(N * kvmap_entry_size) : 0;
+	header_size = (int64) sizeof(uint32)
+		+ (int64) 2 * (int64) N * (int64) sizeof(JEntry);
+	kvmap_bytes = has_kvmap ? INTALIGN((int64) N * (int64) kvmap_entry_size) : 0;
 	min_prefix = header_size + kvmap_bytes;
 
 	/* Sanity: min_prefix must fit within body_size; if not, the body is
-	 * corrupt. Raise rather than mask. */
+	 * corrupt. Raise rather than mask. With int64 arithmetic this check
+	 * cannot be bypassed by a forged-N wraparound. */
 	if (min_prefix > body_size)
 	{
 		pfree(prefix);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("corrupted jsonb: container header + JEntries + KVMap (%d bytes) exceed value size (%d bytes)",
-						min_prefix, body_size)));
+				 errmsg("corrupted jsonb: container header + JEntries + KVMap (%lld bytes) exceed value size (%lld bytes)",
+						(long long) min_prefix, (long long) body_size)));
 	}
 
 	/*
 	 * Stage 3: ensure prefix covers JEntries + optional KVMap. Refetch if
-	 * the initial 1024-byte slice was too small (large N).
+	 * the initial 1024-byte slice was too small (large N). The slice
+	 * length is computed in int64 and bounded by body_size before being
+	 * downcast to int32 for the detoast_attr_slice argument.
 	 */
 	if (body_len < min_prefix)
 	{
-		int32		better_size = min_prefix + 4096;
+		int64		better_size = min_prefix + 4096;
 
 		if (better_size > body_size)
 			better_size = body_size;
 
 		pfree(prefix);
-		prefix = detoast_attr_slice(attr, 0, better_size);
+		prefix = detoast_attr_slice(attr, 0, (int32) better_size);
 		body = VARDATA(prefix);
-		body_len = (int32) VARSIZE(prefix) - (int32) VARHDRSZ;
+		body_len = (int64) VARSIZE(prefix) - (int64) VARHDRSZ;
 		jc = (JsonbContainer *) body;
 
 		if (body_len < min_prefix)
@@ -663,23 +707,27 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 			pfree(prefix);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("corrupted jsonb: extended slice (%d bytes) did not cover container metadata (%d bytes)",
-							body_len, min_prefix)));
+					 errmsg("corrupted jsonb: extended slice (%lld bytes) did not cover container metadata (%lld bytes)",
+							(long long) body_len, (long long) min_prefix)));
 		}
 	}
 
 	/*
 	 * Stage 4: compute key_area_end and ensure prefix covers the key area.
 	 * Key lengths come from JEntries 0..N-1, which are in the prefix now.
+	 * Both the accumulator and each individual klen are widened to int64
+	 * so a single oversized JEntry length cannot wrap the comparison.
 	 */
 	key_area_end = min_prefix;
 	for (i = 0; i < N; i++)
 	{
-		uint32		klen = getJsonbLength(jc, i);
+		int64		klen = (int64) getJsonbLength(jc, i);
 
-		key_area_end += (int32) klen;
-		/* Overflow guard against a corrupt JEntry array. */
-		if (key_area_end < min_prefix || key_area_end > body_size)
+		key_area_end += klen;
+		/* Bounds check against body_size. With int64 there is no
+		 * accumulator wraparound; we still range-check klen itself for
+		 * defensive symmetry. */
+		if (klen < 0 || key_area_end > body_size)
 		{
 			pfree(prefix);
 			ereport(ERROR,
@@ -690,15 +738,15 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 
 	if (body_len < key_area_end)
 	{
-		int32		better_size = key_area_end;
+		int64		better_size = key_area_end;
 
 		if (better_size > body_size)
 			better_size = body_size;
 
 		pfree(prefix);
-		prefix = detoast_attr_slice(attr, 0, better_size);
+		prefix = detoast_attr_slice(attr, 0, (int32) better_size);
 		body = VARDATA(prefix);
-		body_len = (int32) VARSIZE(prefix) - (int32) VARHDRSZ;
+		body_len = (int64) VARSIZE(prefix) - (int64) VARHDRSZ;
 		jc = (JsonbContainer *) body;
 
 		if (body_len < key_area_end)
@@ -706,8 +754,8 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 			pfree(prefix);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("corrupted jsonb: extended slice (%d bytes) did not cover key area (%d bytes)",
-							body_len, key_area_end)));
+					 errmsg("corrupted jsonb: extended slice (%lld bytes) did not cover key area (%lld bytes)",
+							(long long) body_len, (long long) key_area_end)));
 		}
 	}
 
@@ -716,12 +764,14 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	 * calling getKeyJsonValueFromContainer) so the loop bounds itself to
 	 * the JEntry array we already have, and so the inner getJsonbOffset
 	 * / getJsonbLength calls only touch the prefix bytes.
+	 *
+	 * N is bounded by JB_CMASK (28 bits) so the cast to int32 is safe.
 	 */
 	base_addr = (char *) initKVMap(&kvmap, (char *) &jc->children[2 * N],
 								   N, has_kvmap);
 
 	stopLow = 0;
-	stopHigh = N;
+	stopHigh = (int32) N;
 	while (stopLow < stopHigh)
 	{
 		int32		stopMiddle = stopLow + (stopHigh - stopLow) / 2;
@@ -738,7 +788,7 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 		if (difference == 0)
 		{
 			/* Found the key. Resolve physical value index via KVMap. */
-			physical_value_idx = JSONB_KVMAP_ENTRY(&kvmap, stopMiddle) + N;
+			physical_value_idx = JSONB_KVMAP_ENTRY(&kvmap, stopMiddle) + (int32) N;
 			goto found;
 		}
 		else if (difference < 0)
@@ -754,11 +804,11 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 found:
 	/*
 	 * Stage 6: read value JEntry; reject nested containers (v0 scalar-only)
-	 * and the half-body heuristic.
+	 * and the conservative half-body cap.
 	 */
 	value_jentry = jc->children[physical_value_idx];
 	value_offset_in_data = getJsonbOffset(jc, physical_value_idx);
-	value_len = (int32) getJsonbLength(jc, physical_value_idx);
+	value_len = (int64) getJsonbLength(jc, physical_value_idx);
 
 	if (JBE_ISCONTAINER(value_jentry))
 	{
@@ -768,11 +818,15 @@ found:
 	}
 
 	/*
-	 * Heuristic: if the value occupies more than half the body, the slice
-	 * fetch would overlap most of the prefix anyway; a full detoast is
-	 * cheaper. Skip the helper.
+	 * Conservative empirical cap: when the value is large enough that a
+	 * separate slice fetch would cover a substantial fraction of the body,
+	 * the full-detoast path is competitive or better. The 1/2 threshold is
+	 * intentionally pessimistic — for uncompressed external bodies the
+	 * actual break-even is significantly higher and would need measurement
+	 * against TOAST_MAX_CHUNK_SIZE to derive. Finer tuning is deferred
+	 * until we have a benchmark showing the cap matters.
 	 */
-	if ((int64) value_len * 2 > (int64) body_size)
+	if (value_len * 2 > body_size)
 	{
 		pfree(prefix);
 		return JSONB_KEY_LOOKUP_FALLBACK;
@@ -792,25 +846,16 @@ found:
 	 *
 	 *	Therefore fetch_len is just value_len. No extra padding bytes need
 	 *	to be fetched on top.
-	 *
-	 *	Memory ownership note: on JSONB_KEY_LOOKUP_FOUND we intentionally
-	 *	leave `prefix` and `value_slice` allocated in CurrentMemoryContext.
-	 *	fillJsonbValue may store pointers into them (jbvString payload,
-	 *	INTALIGN'd numerics), and the caller's contract (jsonb.h) requires
-	 *	the caller to materialise the result via JsonbValueToJsonb /
-	 *	JsonbValueAsText before the memory context is reset. This matches
-	 *	the slow path, where the detoasted body lives in the same context
-	 *	and is reclaimed at reset time.
 	 */
 	{
-		int32		fetch_len = value_len;
-		int32		value_start_in_body = min_prefix + (int32) value_offset_in_data;
+		int64		fetch_len = value_len;
+		int64		value_start_in_body = min_prefix + (int64) value_offset_in_data;
 		char	   *value_bytes;
 		struct varlena *value_slice = NULL;
 
 		value_byte_end_in_body = value_start_in_body + fetch_len;
 
-		/* Bounds check against body_size. */
+		/* Bounds check against body_size. int64 arithmetic; no wrap. */
 		if (value_byte_end_in_body > body_size)
 		{
 			pfree(prefix);
@@ -836,10 +881,16 @@ found:
 		}
 		else
 		{
-			/* Uncompressed external: arbitrary slice is fine. */
-			value_slice = detoast_attr_slice(attr, value_start_in_body,
-											 fetch_len);
-			if ((int32) VARSIZE(value_slice) - (int32) VARHDRSZ < fetch_len)
+			/*
+			 * Uncompressed external: arbitrary slice is fine. The
+			 * downcasts to int32 are safe because value_start_in_body and
+			 * fetch_len are both ≤ body_size, which is bounded by
+			 * va_rawsize (int32).
+			 */
+			value_slice = detoast_attr_slice(attr,
+											 (int32) value_start_in_body,
+											 (int32) fetch_len);
+			if ((int64) VARSIZE(value_slice) - (int64) VARHDRSZ < fetch_len)
 			{
 				pfree(value_slice);
 				pfree(prefix);
@@ -864,9 +915,53 @@ found:
 						   value_offset_in_data, res);
 		}
 
-		/* prefix and value_slice are intentionally not freed here — see
-		 * the memory-ownership note above. They are reclaimed when the
-		 * caller's memory context resets. */
+		/*
+		 * Stage 9: deep-copy the scalar payload out of the slice buffers
+		 * and free the slices, so *res is self-contained on return. This
+		 * makes the helper's contract independent of TOAST-slice lifetime
+		 * and bounds per-row memory residue by the value size rather than
+		 * by the prefix + value-slice sizes.
+		 */
+		switch (res->type)
+		{
+			case jbvString:
+				{
+					char	   *copy = (char *) palloc(res->val.string.len);
+
+					memcpy(copy, res->val.string.val, res->val.string.len);
+					res->val.string.val = copy;
+					break;
+				}
+			case jbvNumeric:
+				{
+					Size		nsize = VARSIZE_ANY(res->val.numeric);
+					Numeric		ncopy = (Numeric) palloc(nsize);
+
+					memcpy(ncopy, res->val.numeric, nsize);
+					res->val.numeric = ncopy;
+					break;
+				}
+			case jbvBool:
+			case jbvNull:
+				/* No payload; nothing to copy. */
+				break;
+			default:
+				/*
+				 * fillJsonbValue should not produce other scalar types
+				 * from on-disk jsonb. Defensive: free our slices and tell
+				 * the caller to fall through to the slow path, which will
+				 * either produce a result or surface the underlying
+				 * problem itself.
+				 */
+				if (value_slice)
+					pfree(value_slice);
+				pfree(prefix);
+				return JSONB_KEY_LOOKUP_FALLBACK;
+		}
+
+		if (value_slice)
+			pfree(value_slice);
+		pfree(prefix);
 
 		return JSONB_KEY_LOOKUP_FOUND;
 	}

@@ -500,51 +500,12 @@ extern JsonbValue *getKeyJsonValueFromContainer(JsonbContainer *container,
 												JsonbValue *res);
 
 /*
- * Layer 1 sliced read — TOAST-aware key lookup that avoids
- * detoasting the whole jsonb body for a single scalar key.
- *
- * Return value tells the caller exactly what happened:
- *
- *   JSONB_KEY_LOOKUP_FOUND
- *       *res holds the scalar value. For jbvString and jbvNumeric
- *       the JsonbValue may contain pointers into a TOAST-slice
- *       buffer that is palloc'd in CurrentMemoryContext. The
- *       caller MUST materialise the result via JsonbValueToJsonb
- *       / JsonbValueAsText (or equivalent deep-copy) BEFORE any
- *       operation that resets or switches the memory context,
- *       including staging the value across executor step
- *       boundaries.
- *
- *   JSONB_KEY_LOOKUP_MISSING
- *       The key was proven absent from the object. *res is
- *       untouched. The caller should return SQL NULL.
- *
- *   JSONB_KEY_LOOKUP_FALLBACK
- *       The helper cannot answer (inline / non-external Datum,
- *       non-object root, nested-container value, value past
- *       prefix on compressed external, value exceeding the
- *       half-body heuristic). *res is untouched. The caller
- *       should fall through to the existing PG_DETOAST_DATUM +
- *       getKeyJsonValueFromContainer path.
- *
- * The helper may also raise ERRCODE_DATA_CORRUPTED on physical
- * inconsistency (JEntry walk past body size, header size
- * mismatch, short slice fetch). The slow path raises the same
- * on the same bytes.
- *
- * See docs/SLICED_JSONB_READ.md for the design rationale.
+ * The sliced-read helper getKeyJsonValueFromExternal() used by
+ * jsonb_object_field / jsonb_object_field_text is intentionally NOT
+ * declared here. Its prototype lives in utils/jsonb_internal.h because
+ * it is an implementation-detail helper shared between jsonb_util.c
+ * and jsonfuncs.c, not a stable API for out-of-tree callers.
  */
-typedef enum JsonbKeyLookupResult
-{
-	JSONB_KEY_LOOKUP_FOUND,
-	JSONB_KEY_LOOKUP_MISSING,
-	JSONB_KEY_LOOKUP_FALLBACK,
-} JsonbKeyLookupResult;
-
-extern JsonbKeyLookupResult getKeyJsonValueFromExternal(Datum raw,
-														const char *keyVal,
-														int keyLen,
-														JsonbValue *res);
 
 extern JsonbValue *getIthJsonbValueFromContainer(JsonbContainer *container,
 												 uint32 i);
