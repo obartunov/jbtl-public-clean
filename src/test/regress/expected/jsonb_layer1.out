@@ -1,0 +1,264 @@
+--
+-- Layer 1: jsonb sliced read regression
+--
+-- Exercises every branch of getKeyJsonValueFromExternal and its
+-- fall-through path. Verifies result equality between the helper
+-- path and the existing slow path. Does NOT measure performance;
+-- per-build buffer counts and latencies are not test material.
+--
+-- Each test names the case from docs/SLICED_JSONB_READ.md §7
+-- fallback table and the spec §10.2 acceptance Cases A/B/C.
+-- ============================================================
+-- Case 1: inline body — gate must bypass the helper cleanly.
+-- jsonb objects under TOAST_TUPLE_THRESHOLD stay inline; the
+-- helper's VARATT_IS_EXTERNAL_ONDISK check returns FALLBACK and
+-- the existing path handles them unchanged.
+-- ============================================================
+CREATE TABLE l1_inline (id int PRIMARY KEY, jb jsonb);
+INSERT INTO l1_inline VALUES
+    (1, '{"a": 1, "b": "x", "c": null, "d": true}'::jsonb);
+SELECT jb -> 'a'         AS get_a   FROM l1_inline WHERE id = 1;
+ get_a 
+-------
+ 1
+(1 row)
+
+SELECT jb -> 'missing'   AS get_m   FROM l1_inline WHERE id = 1;
+ get_m 
+-------
+ 
+(1 row)
+
+SELECT jb ->> 'a'        AS arrow_a FROM l1_inline WHERE id = 1;
+ arrow_a 
+---------
+ 1
+(1 row)
+
+SELECT jb ->> 'b'        AS arrow_b FROM l1_inline WHERE id = 1;
+ arrow_b 
+---------
+ x
+(1 row)
+
+SELECT jb ->> 'c'        AS arrow_c FROM l1_inline WHERE id = 1;  -- null
+ arrow_c 
+---------
+ 
+(1 row)
+
+SELECT jb ->> 'd'        AS arrow_d FROM l1_inline WHERE id = 1;
+ arrow_d 
+---------
+ true
+(1 row)
+
+DROP TABLE l1_inline;
+-- ============================================================
+-- Case 2: external uncompressed — Case B prefix-resident scalar.
+-- attstorage = external prevents compression; the body sits as
+-- raw bytes in TOAST. Layer 1 fetches the structural prefix and
+-- serves k1 directly from it.
+-- ============================================================
+CREATE TABLE l1_ext_uncompr (id int PRIMARY KEY, jb jsonb);
+ALTER TABLE l1_ext_uncompr ALTER COLUMN jb SET STORAGE EXTERNAL;
+INSERT INTO l1_ext_uncompr VALUES
+    (1, jsonb_build_object(
+        'k1', 'small_at_start',
+        'k2', repeat('M', 60000),
+        'k3', 'small_at_end'));
+SELECT jb ->> 'k1' AS ext_uncompr_prefix FROM l1_ext_uncompr WHERE id = 1;
+ ext_uncompr_prefix 
+--------------------
+ small_at_start
+(1 row)
+
+-- ============================================================
+-- Case 3: external uncompressed, value past prefix — Case B
+-- past-prefix variant. Helper does a second detoast_attr_slice
+-- at the value's byte offset.
+-- ============================================================
+SELECT jb ->> 'k3' AS ext_uncompr_past FROM l1_ext_uncompr WHERE id = 1;
+ ext_uncompr_past 
+------------------
+ small_at_end
+(1 row)
+
+-- ============================================================
+-- Case 9: numeric value near body end — bug-2 regression.
+-- The writer's JEntry length already includes alignment pad;
+-- the helper must NOT add pad again to fetch_len. A failure
+-- here re-introduces the ERRCODE_DATA_CORRUPTED "value extent
+-- runs past value size" that pre-fix cold-cache testing
+-- exposed.
+-- ============================================================
+INSERT INTO l1_ext_uncompr VALUES
+    (2, jsonb_build_object(
+        'k1', 'small',
+        'k2', repeat('M', 60000),
+        'k3', 42));
+SELECT jb ->> 'k3'              AS bug2_arrow   FROM l1_ext_uncompr WHERE id = 2;
+ bug2_arrow 
+------------
+ 42
+(1 row)
+
+SELECT (jb ->> 'k3')::int * 2   AS bug2_arith   FROM l1_ext_uncompr WHERE id = 2;
+ bug2_arith 
+------------
+         84
+(1 row)
+
+SELECT jb -> 'k3'               AS bug2_jsonb   FROM l1_ext_uncompr WHERE id = 2;
+ bug2_jsonb 
+------------
+ 42
+(1 row)
+
+DROP TABLE l1_ext_uncompr;
+-- ============================================================
+-- Case 4: external compressed, prefix-resident scalar — Case A.
+-- attstorage = extended (default) lets the planner pick TOAST
+-- compression. Use highly repetitive payload so pglz/lz4
+-- actually compresses. k1 sits at the start of the data area,
+-- inside the 1024-byte structural prefix.
+-- ============================================================
+CREATE TABLE l1_ext_compr (id int PRIMARY KEY, jb jsonb);
+-- default STORAGE = EXTENDED
+INSERT INTO l1_ext_compr VALUES
+    (1, jsonb_build_object(
+        'k1', 'tiny',
+        'k2', repeat('A', 500000),
+        'k3', 'tail'));
+SELECT jb ->> 'k1' AS compr_prefix FROM l1_ext_compr WHERE id = 1;
+ compr_prefix 
+--------------
+ tiny
+(1 row)
+
+-- ============================================================
+-- Case 5: external compressed, value past prefix — Case C
+-- fallback. detoast_attr_slice rejects non-prefix slices of
+-- compressed externals, so the helper returns FALLBACK and the
+-- existing path does the full detoast. Result must still match.
+-- ============================================================
+SELECT jb ->> 'k3' AS compr_past FROM l1_ext_compr WHERE id = 1;
+ compr_past 
+------------
+ tail
+(1 row)
+
+-- ============================================================
+-- Case 6: nested container value — Layer 1 v0 rejects container
+-- JEntries (spec §6 stage 7). The full path returns the
+-- container as jsonb; result must match.
+-- ============================================================
+INSERT INTO l1_ext_compr VALUES
+    (2, jsonb_build_object(
+        'k1', 'a',
+        'k2', repeat('B', 500000),
+        'nested', '{"deep": "value", "list": [1, 2, 3]}'::jsonb));
+SELECT jb -> 'nested'                  AS nested_obj  FROM l1_ext_compr WHERE id = 2;
+              nested_obj              
+--------------------------------------
+ {"deep": "value", "list": [1, 2, 3]}
+(1 row)
+
+SELECT jb -> 'nested' ->> 'deep'       AS nested_deep FROM l1_ext_compr WHERE id = 2;
+ nested_deep 
+-------------
+ value
+(1 row)
+
+SELECT jb -> 'nested' -> 'list'        AS nested_list FROM l1_ext_compr WHERE id = 2;
+ nested_list 
+-------------
+ [1, 2, 3]
+(1 row)
+
+-- ============================================================
+-- Case 7: value > half body — half-body heuristic fallback.
+-- A value occupying more than half the body would force the
+-- value-slice fetch to overlap the structural prefix fetch;
+-- full detoast is cheaper. Helper returns FALLBACK; result
+-- must match.
+-- ============================================================
+INSERT INTO l1_ext_compr VALUES
+    (3, jsonb_build_object(
+        'big',  repeat('C', 500000),
+        'tiny', 'after_big'));
+SELECT length(jb ->> 'big') AS big_len  FROM l1_ext_compr WHERE id = 3;
+ big_len 
+---------
+  500000
+(1 row)
+
+SELECT jb ->> 'tiny'         AS tiny_v   FROM l1_ext_compr WHERE id = 3;
+  tiny_v   
+-----------
+ after_big
+(1 row)
+
+-- ============================================================
+-- Case 8: missing key on external — MISSING return path. The
+-- helper completes the bsearch and returns NULL to the caller
+-- without falling back. User-visible: SQL NULL.
+-- ============================================================
+SELECT jb -> 'no_such_key'   AS miss_jsonb FROM l1_ext_compr WHERE id = 1;
+ miss_jsonb 
+------------
+ 
+(1 row)
+
+SELECT jb ->> 'no_such_key'  AS miss_text  FROM l1_ext_compr WHERE id = 1;
+ miss_text 
+-----------
+ 
+(1 row)
+
+-- ============================================================
+-- Sort-on path: with jsonb_sort_field_values = on, the writer
+-- emits KVMap and physically orders values by ascending size.
+-- Short scalars (k1, k3) move ahead of the long k2, so k3's
+-- value lands in the structural prefix. Layer 1 then serves k3
+-- from the prefix (Case A) on the same logical body.
+-- ============================================================
+SET jsonb_sort_field_values = on;
+CREATE TABLE l1_ext_sort_on (id int PRIMARY KEY, jb jsonb);
+INSERT INTO l1_ext_sort_on VALUES
+    (1, jsonb_build_object(
+        'k1', 'tiny',
+        'k2', repeat('A', 500000),
+        'k3', 'tail'));
+SET jsonb_sort_field_values = off;
+SELECT jb ->> 'k3' AS sort_on_prefix FROM l1_ext_sort_on WHERE id = 1;
+ sort_on_prefix 
+----------------
+ tail
+(1 row)
+
+SELECT jb ->> 'k1' AS sort_on_k1     FROM l1_ext_sort_on WHERE id = 1;
+ sort_on_k1 
+------------
+ tiny
+(1 row)
+
+DROP TABLE l1_ext_sort_on;
+DROP TABLE l1_ext_compr;
+-- ============================================================
+-- Corruption case: skipped here intentionally.
+--
+-- The helper raises ERRCODE_DATA_CORRUPTED on physical
+-- inconsistency (JEntry walk past body, short slice fetch).
+-- Reproducing this requires either (a) bytea-cast-to-jsonb of
+-- a hand-crafted corrupt body, which is fragile across builds
+-- and would mask real test failures with format-version drift,
+-- or (b) hex-edited heap files, which are not regression-suite
+-- material.
+--
+-- The slow path raises ERRCODE_DATA_CORRUPTED on the same
+-- bytes, so any production user who hits this case gets the
+-- same diagnostic from either path. The helper does not
+-- introduce a new error class — it only raises the existing
+-- ones earlier in the call chain.
+-- ============================================================
