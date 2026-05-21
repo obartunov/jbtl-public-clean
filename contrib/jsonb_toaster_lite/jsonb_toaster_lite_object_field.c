@@ -811,8 +811,49 @@ jbtl_toast_fetch_object_field(struct varatt_external *toast_pointer,
 		 *	for them.
 		 */
 		{
+			/*
+			 * AUDIT — latent over-fetch on numerics, harmless here.
+			 *
+			 *	The writer in convertJsonbScalar() for jbvNumeric stores
+			 *	  *header = JENTRY_ISNUMERIC | (padlen + numlen)
+			 *	i.e. value_len ALREADY includes the alignment pad. The
+			 *	expression below adds pad again, so fetch_len overshoots
+			 *	the actual value range by `pad` bytes (0..3) for numeric
+			 *	values. Strings/bool/null have pad == 0 and are unaffected.
+			 *
+			 *	This is benign in JBTL because:
+			 *	  1. jbtl_fetch_slice_dispatch does not bounds-check the
+			 *	     returned slice strictly; reading up to 3 extra bytes
+			 *	     past the value's end yields harmless padding bytes;
+			 *	  2. fillJsonbValue() locates the payload at
+			 *	     INTALIGN(value_offset_in_data) and reads exactly
+			 *	     numlen = value_len - padlen bytes from there — the
+			 *	     extra pad bytes from the over-fetch are never read.
+			 *
+			 *	The production Layer 1 helper has STRICT bounds-check on
+			 *	the fetched slice (see getKeyJsonValueFromExternal in
+			 *	src/backend/utils/adt/jsonb_util.c). It exposes the bug
+			 *	as ERRCODE_DATA_CORRUPTED on cold-cache compressed-external
+			 *	bodies whose value lies near the body end. The production
+			 *	fix is fetch_len = value_len (no pad).
+			 *
+			 *	If anyone tightens jbtl_fetch_slice_dispatch in the future
+			 *	to refuse returning fewer bytes than requested or to error
+			 *	on past-attrsize reads, this site WILL break. The Assert
+			 *	below fires only in development builds and only when the
+			 *	over-fetch would step past the body end — a clear signal
+			 *	to switch to fetch_len = value_len.
+			 *
+			 *	Not fixing in JBTL because doing so would shift recorded
+			 *	J-cell numbers in published matrices by 0..1 buffer pages
+			 *	per call (chunk-alignment-dependent). The latent bug is
+			 *	now documented; future maintainers have the trail.
+			 */
 			uint32		pad = INTALIGN(value_offset_in_data) - value_offset_in_data;
 			int32		fetch_len = (int32) (value_len + pad);
+
+			Assert(min_prefix + (int) value_offset_in_data + (int32) value_len
+				   <= (int32) attrsize);
 
 			value_byte_end_in_body =
 				min_prefix + (int) value_offset_in_data + fetch_len;
