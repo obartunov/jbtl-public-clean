@@ -498,11 +498,12 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
  *
  *	The helper handles scalar values only (string / numeric / bool / null).
  *	Nested-container values, in-place inline jsonb, non-external varlenas,
- *	non-object roots, and a few other cases are signalled as "not handled"
- *	via *out_handled = false, so the caller can fall through to the existing
- *	full-detoast path unchanged.
+ *	non-object roots, and a few other cases are signalled via the
+ *	JSONB_KEY_LOOKUP_FALLBACK return so the caller falls through to the
+ *	existing full-detoast path unchanged.
  *
- *	See docs/SLICED_JSONB_READ.md for the design.
+ *	See docs/SLICED_JSONB_READ.md for the design and src/include/utils/jsonb.h
+ *	for the exported contract (memory ownership, return-value semantics).
  *
  *	Parameters:
  *	  raw          un-detoasted column Datum (caller must NOT call
@@ -510,26 +511,29 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
  *	               can never apply).
  *	  keyVal,keyLen requested key, as in getKeyJsonValueFromContainer.
  *	  res          out-parameter scalar JsonbValue, palloc'd by caller
- *	               (cannot be NULL).
- *	  out_handled  set true if the helper produced a definitive answer
- *	               (found scalar OR proven-missing key); set false if the
- *	               caller must fall back to the existing detoast path.
+ *	               (cannot be NULL). Written only on JSONB_KEY_LOOKUP_FOUND.
  *
- *	Returns the JsonbValue when found, NULL when key is proven missing
- *	(out_handled = true) or when not handled (out_handled = false).
+ *	Returns one of:
+ *	  JSONB_KEY_LOOKUP_FOUND     scalar found, written to *res
+ *	  JSONB_KEY_LOOKUP_MISSING   key proven absent from object
+ *	  JSONB_KEY_LOOKUP_FALLBACK  helper cannot answer; caller falls back
  *
- *	Corruption (JEntry walk past attrsize, header_size mismatch, etc.) is
+ *	Corruption (JEntry walk past body size, header_size mismatch, etc.) is
  *	raised as ERRCODE_DATA_CORRUPTED; the slow path raises the same on the
  *	same bytes.
  */
 
 /* Initial prefix slice in bytes; smaller than one TOAST chunk so the
- * structural-only fast path costs one chunk fetch. */
+ * structural-only fast path costs one chunk fetch. The static assert
+ * makes the constraint visible if TOAST_MAX_CHUNK_SIZE ever changes
+ * (BLCKSZ-dependent at compile time). */
 #define JSONB_SLICED_READ_INITIAL_PREFIX 1024
+StaticAssertDecl(JSONB_SLICED_READ_INITIAL_PREFIX < TOAST_MAX_CHUNK_SIZE,
+				 "JSONB_SLICED_READ_INITIAL_PREFIX must fit in one TOAST chunk");
 
-JsonbValue *
+JsonbKeyLookupResult
 getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
-							JsonbValue *res, bool *out_handled)
+							JsonbValue *res)
 {
 	struct varlena *attr;
 	struct varlena *prefix = NULL;
@@ -558,15 +562,13 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	int32		value_len;
 	int32		value_byte_end_in_body;
 
-	*out_handled = false;
-
 	/* Layer 1 acts only on external on-disk varlenas. Inline / packed /
 	 * already-detoasted datums fall through to the existing path, which
 	 * is cheap on them anyway. We also skip indirect (in-memory short-cut)
 	 * varlenas — those are rare and not worth a special case here. */
 	attr = (struct varlena *) DatumGetPointer(raw);
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
-		return NULL;
+		return JSONB_KEY_LOOKUP_FALLBACK;
 
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 	is_compressed = VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer);
@@ -580,7 +582,7 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	/* Pathologically small body: not worth slicing; let the slow path
 	 * handle it. The minimum jsonb body has a 4-byte header. */
 	if (body_size < (int32) sizeof(uint32))
-		return NULL;
+		return JSONB_KEY_LOOKUP_FALLBACK;
 
 	/*
 	 * Stage 1: fetch initial prefix. detoast_attr_slice handles both
@@ -602,7 +604,7 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	if (body_len < (int32) sizeof(uint32))
 	{
 		pfree(prefix);
-		return NULL;
+		return JSONB_KEY_LOOKUP_FALLBACK;
 	}
 
 	jc = (JsonbContainer *) body;
@@ -611,7 +613,7 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	if (!JsonContainerIsObject(jc))
 	{
 		pfree(prefix);
-		return NULL;
+		return JSONB_KEY_LOOKUP_FALLBACK;
 	}
 
 	N = JsonContainerSize(jc);
@@ -619,8 +621,7 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 	{
 		/* Empty object: key cannot be present. Definitive answer. */
 		pfree(prefix);
-		*out_handled = true;
-		return NULL;
+		return JSONB_KEY_LOOKUP_MISSING;
 	}
 
 	has_kvmap = JsonContainerHasKVMap(jc);
@@ -748,8 +749,7 @@ getKeyJsonValueFromExternal(Datum raw, const char *keyVal, int keyLen,
 
 	/* Key not in object: definitive miss. */
 	pfree(prefix);
-	*out_handled = true;
-	return NULL;
+	return JSONB_KEY_LOOKUP_MISSING;
 
 found:
 	/*
@@ -764,7 +764,7 @@ found:
 	{
 		/* Nested container value: out of scope for Layer 1 v0. */
 		pfree(prefix);
-		return NULL;
+		return JSONB_KEY_LOOKUP_FALLBACK;
 	}
 
 	/*
@@ -775,7 +775,7 @@ found:
 	if ((int64) value_len * 2 > (int64) body_size)
 	{
 		pfree(prefix);
-		return NULL;
+		return JSONB_KEY_LOOKUP_FALLBACK;
 	}
 
 	/*
@@ -792,6 +792,15 @@ found:
 	 *
 	 *	Therefore fetch_len is just value_len. No extra padding bytes need
 	 *	to be fetched on top.
+	 *
+	 *	Memory ownership note: on JSONB_KEY_LOOKUP_FOUND we intentionally
+	 *	leave `prefix` and `value_slice` allocated in CurrentMemoryContext.
+	 *	fillJsonbValue may store pointers into them (jbvString payload,
+	 *	INTALIGN'd numerics), and the caller's contract (jsonb.h) requires
+	 *	the caller to materialise the result via JsonbValueToJsonb /
+	 *	JsonbValueAsText before the memory context is reset. This matches
+	 *	the slow path, where the detoasted body lives in the same context
+	 *	and is reclaimed at reset time.
 	 */
 	{
 		int32		fetch_len = value_len;
@@ -823,7 +832,7 @@ found:
 			 * prefix; we cannot serve it cheaply. Fall back.
 			 */
 			pfree(prefix);
-			return NULL;
+			return JSONB_KEY_LOOKUP_FALLBACK;
 		}
 		else
 		{
@@ -855,24 +864,11 @@ found:
 						   value_offset_in_data, res);
 		}
 
-		/*
-		 * fillJsonbValue may store a pointer into synth_base for jbvString
-		 * (no copy) and into INTALIGN'd numerics. Both live in our slice
-		 * memory (prefix or value_slice). The caller's contract on res is
-		 * the same as for the existing slow path's vbuf: the bytes are
-		 * valid for the duration of the call frame, and JsonbValueToJsonb
-		 * / JsonbValueAsText copies them out. So we must NOT free the
-		 * backing slice here — defer to memory context cleanup.
-		 *
-		 * Note: this matches the existing slow path, where the body
-		 * lives in detoasted memory that is also not pfree'd between
-		 * fillJsonbValue and JsonbValueToJsonb.
-		 */
-		(void) value_slice;		/* deliberately retained, not freed */
-		(void) prefix;			/* same */
+		/* prefix and value_slice are intentionally not freed here — see
+		 * the memory-ownership note above. They are reclaimed when the
+		 * caller's memory context resets. */
 
-		*out_handled = true;
-		return res;
+		return JSONB_KEY_LOOKUP_FOUND;
 	}
 }
 

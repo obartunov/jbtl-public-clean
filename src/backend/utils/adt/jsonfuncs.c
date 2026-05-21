@@ -918,20 +918,21 @@ jsonb_object_field(PG_FUNCTION_ARGS)
 		{
 			text	   *hkey = PG_GETARG_TEXT_PP(1);
 			JsonbValue	sv;
-			bool		handled = false;
-			JsonbValue *sres;
+			JsonbKeyLookupResult lr;
 
-			sres = getKeyJsonValueFromExternal(raw,
-											   VARDATA_ANY(hkey),
-											   VARSIZE_ANY_EXHDR(hkey),
-											   &sv, &handled);
-			if (handled)
+			lr = getKeyJsonValueFromExternal(raw,
+											 VARDATA_ANY(hkey),
+											 VARSIZE_ANY_EXHDR(hkey),
+											 &sv);
+			switch (lr)
 			{
-				if (sres == NULL)
+				case JSONB_KEY_LOOKUP_FOUND:
+					PG_RETURN_JSONB_P(JsonbValueToJsonb(&sv));
+				case JSONB_KEY_LOOKUP_MISSING:
 					PG_RETURN_NULL();
-				PG_RETURN_JSONB_P(JsonbValueToJsonb(sres));
+				case JSONB_KEY_LOOKUP_FALLBACK:
+					break;	/* fall through to existing full-detoast path */
 			}
-			/* not handled — fall through to existing full-detoast path */
 		}
 	}
 
@@ -993,20 +994,23 @@ jsonb_object_field_text(PG_FUNCTION_ARGS)
 		{
 			text	   *hkey = PG_GETARG_TEXT_PP(1);
 			JsonbValue	sv;
-			bool		handled = false;
-			JsonbValue *sres;
+			JsonbKeyLookupResult lr;
 
-			sres = getKeyJsonValueFromExternal(raw,
-											   VARDATA_ANY(hkey),
-											   VARSIZE_ANY_EXHDR(hkey),
-											   &sv, &handled);
-			if (handled)
+			lr = getKeyJsonValueFromExternal(raw,
+											 VARDATA_ANY(hkey),
+											 VARSIZE_ANY_EXHDR(hkey),
+											 &sv);
+			switch (lr)
 			{
-				if (sres == NULL || sres->type == jbvNull)
+				case JSONB_KEY_LOOKUP_FOUND:
+					if (sv.type == jbvNull)
+						PG_RETURN_NULL();
+					PG_RETURN_TEXT_P(JsonbValueAsText(&sv));
+				case JSONB_KEY_LOOKUP_MISSING:
 					PG_RETURN_NULL();
-				PG_RETURN_TEXT_P(JsonbValueAsText(sres));
+				case JSONB_KEY_LOOKUP_FALLBACK:
+					break;	/* fall through to existing full-detoast path */
 			}
-			/* not handled — fall through to existing full-detoast path */
 		}
 	}
 
