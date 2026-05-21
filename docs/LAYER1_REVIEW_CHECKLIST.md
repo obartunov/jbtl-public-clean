@@ -4,20 +4,34 @@
 
   Branch: r2d2/layer1-sliced-read
   Base:   r1-relocation-aware-read (commit ba5ea1eaf6 on Postgres master)
-  Tip:    019cd8abc2
+  Tip:    b088abdafd
 
   Commit range for review:
     git log --oneline r1-relocation-aware-read..r2d2/layer1-sliced-read
 
   Commit series:
+    b088abdafd  test/jsonb: Layer 1 sliced read regression coverage (D3)
+    b4a8f043df  jsonb: Layer 1 sliced read — enum return + memory-ownership contract (D1+D2+S2)
+    87454c3ffb  docs: independent code review of Layer 1
+    be63dd92cd  docs: Layer 1 internal review checklist
     019cd8abc2  docs: Layer 1 cover letter + finalise subscripting deferral wording
     84122504c7  docs: subscripting scope decision — FOLLOW_UP_ACCEPTABLE
     684b11bf5e  docs: Layer 1 review package — three-case acceptance split + cover
     b8e3c6f922  docs: fix size-vs-id calibration in SLICED_JSONB_READ_RESULT §4
     079e0b382d  jbtl: audit comment on latent fetch_len pad over-fetch
     47e738f66f  docs: Layer 1 sliced read — implementation result
-    28c8b7fa5c  jsonb: sliced read for jb -> 'key' on external bodies (Layer 1)  ← only code commit
+    28c8b7fa5c  jsonb: sliced read for jb -> 'key' on external bodies (Layer 1)  ← original code commit
     417a6cff97  docs: sliced jsonb read — Layer 1 specification
+
+  Fix-cycle post independent review:
+    D1+D2+S2  → b4a8f043df  enum signature, header memory-ownership
+                            contract, StaticAssertDecl on
+                            JSONB_SLICED_READ_INITIAL_PREFIX
+    D3        → b088abdafd  jsonb_layer1.sql regression suite +
+                            parallel_schedule entry
+    S1, M1-M7 → queued as a follow-up cleanup commit
+    S3        → partially fell out of D1+D2 (the void-cast idiom
+                was dropped; memory-ownership note relocated)
 
   Push delivery: branch could not be pushed from the dev sandbox
   (no GitHub credentials). Bundle delivered:

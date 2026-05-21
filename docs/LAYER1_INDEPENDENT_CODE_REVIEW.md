@@ -8,6 +8,17 @@ Author of review: @r2d2, wearing the upstream-reviewer hat
 Code under review: commit 28c8b7fa5c, plus the JBTL audit in
                    079e0b382d.
 
+**Status update (post fix-cycle):**
+  - D1 — **fixed** in commit b4a8f043df (header-doc contract).
+  - D2 — **fixed** in commit b4a8f043df (enum signature).
+  - D3 — **fixed** in commit b088abdafd (regression suite).
+  - S2 — **fixed** in commit b4a8f043df (StaticAssertDecl).
+  - S3 — **partially fixed** in commit b4a8f043df (the void-cast
+    idiom was removed as a fall-out of the D1+D2 cleanup; the
+    memory-ownership note was relocated above the allocation
+    site as recommended).
+  - S1, M1-M7 — **deferred** to a follow-up cleanup commit.
+
 Scope: code only. Documentation review is a separate exercise
        and the docs read well — that does not relax code
        standards.
