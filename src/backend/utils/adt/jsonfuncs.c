@@ -903,6 +903,38 @@ jsonb_object_field(PG_FUNCTION_ARGS)
 		}
 	}
 
+	/*
+	 * Layer-1 sliced read for plain external on-disk jsonb varlenas.
+	 * Returns a definitive answer (scalar found, or proven-missing key)
+	 * without detoasting the whole body. Falls back to the existing
+	 * full-detoast path for inline datums, non-object roots, nested
+	 * container values, compressed bodies whose value sits past the
+	 * structural prefix, and values exceeding the half-body heuristic.
+	 */
+	{
+		Datum		raw = PG_GETARG_DATUM(0);
+
+		if (VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(raw)))
+		{
+			text	   *hkey = PG_GETARG_TEXT_PP(1);
+			JsonbValue	sv;
+			bool		handled = false;
+			JsonbValue *sres;
+
+			sres = getKeyJsonValueFromExternal(raw,
+											   VARDATA_ANY(hkey),
+											   VARSIZE_ANY_EXHDR(hkey),
+											   &sv, &handled);
+			if (handled)
+			{
+				if (sres == NULL)
+					PG_RETURN_NULL();
+				PG_RETURN_JSONB_P(JsonbValueToJsonb(sres));
+			}
+			/* not handled — fall through to existing full-detoast path */
+		}
+	}
+
 	jb = PG_GETARG_JSONB_P(0);
 	key = PG_GETARG_TEXT_PP(1);
 
@@ -939,10 +971,47 @@ json_object_field_text(PG_FUNCTION_ARGS)
 Datum
 jsonb_object_field_text(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
-	text	   *key = PG_GETARG_TEXT_PP(1);
+	Jsonb	   *jb;
+	text	   *key;
 	JsonbValue *v;
 	JsonbValue	vbuf;
+
+	/*
+	 * Layer-1 sliced read for plain external on-disk jsonb varlenas.
+	 * See jsonb_object_field above for the rationale. Result is wrapped
+	 * as text rather than jsonb.
+	 *
+	 * Note: this function does NOT currently have the
+	 * Toastapi_jsonb_object_field_hook gate; that asymmetry pre-dates
+	 * Layer 1 and is left untouched here. Extensions wanting the fast
+	 * path for ->> can install a parallel hook in a separate change.
+	 */
+	{
+		Datum		raw = PG_GETARG_DATUM(0);
+
+		if (VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(raw)))
+		{
+			text	   *hkey = PG_GETARG_TEXT_PP(1);
+			JsonbValue	sv;
+			bool		handled = false;
+			JsonbValue *sres;
+
+			sres = getKeyJsonValueFromExternal(raw,
+											   VARDATA_ANY(hkey),
+											   VARSIZE_ANY_EXHDR(hkey),
+											   &sv, &handled);
+			if (handled)
+			{
+				if (sres == NULL || sres->type == jbvNull)
+					PG_RETURN_NULL();
+				PG_RETURN_TEXT_P(JsonbValueAsText(sres));
+			}
+			/* not handled — fall through to existing full-detoast path */
+		}
+	}
+
+	jb = PG_GETARG_JSONB_P(0);
+	key = PG_GETARG_TEXT_PP(1);
 
 	if (!JB_ROOT_IS_OBJECT(jb))
 		PG_RETURN_NULL();

@@ -498,6 +498,10 @@ extern JsonbValue *findJsonbValueFromContainer(JsonbContainer *container,
 extern JsonbValue *getKeyJsonValueFromContainer(JsonbContainer *container,
 												const char *keyVal, int keyLen,
 												JsonbValue *res);
+extern JsonbValue *getKeyJsonValueFromExternal(Datum raw,
+											   const char *keyVal, int keyLen,
+											   JsonbValue *res,
+											   bool *out_handled);
 extern JsonbValue *getIthJsonbValueFromContainer(JsonbContainer *container,
 												 uint32 i);
 extern void pushJsonbValue(JsonbInState *pstate,
