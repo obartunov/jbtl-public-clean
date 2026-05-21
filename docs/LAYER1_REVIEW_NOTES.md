@@ -220,13 +220,27 @@ No JBTL behavior change is part of this review.
 
 Explicit non-scope:
 
-  - **OQ-B: subscripting / jsonpath integration.** The helper
-    signature is compatible with future `jsonbsubs.c` routing
-    (same Datum-level gate, same `out_handled` contract), but
-    no subscripting code is in this patch. Marked as follow-up
-    in spec §Open Questions. Anticipating the vanilla
-    reviewer's first response ("why doesn't subscripting use
-    this?"): the answer is "next patch," not "no plan."
+  - **Subscripting (`jb['key']`, `jb[0]`, `jb['a']['b']`).**
+    Intentionally deferred to a named follow-up patch,
+    `SLICED_JSONB_SUBSCRIPTING_FOLLOWUP`. The reviewer's first
+    question — "why doesn't subscripting use this?" — has a
+    short answer:
+
+      This patch optimises `->` and `->>`. Subscripting is
+      intentionally deferred to the next patch. The helper
+      signature in `src/include/utils/jsonb.h` and the scope
+      document in `docs/SLICED_JSONB_SUBSCRIPTING_SCOPE.md`
+      make the follow-up mechanical: single-step object-key
+      fetch only, no array subscripting, no multi-step
+      traversal, no assignment path.
+
+    The deferral is intentional, scoped, and non-speculative.
+    The follow-up integration point is named precisely
+    (`jsonb_subscript_fetch` line 247, before `DatumGetJsonbP`),
+    the helper signature is already the one subscripting will
+    call (no refactor), and the conditions for engaging Layer
+    1 from subscripting are enumerated in
+    `SLICED_JSONB_SUBSCRIPTING_SCOPE.md` §3.
 
   - Relocation (Layer 2). Separate design and patch series,
     work in progress in PRODUCTION_RELOCATION_SOURCE_MAPPING.md,
@@ -291,9 +305,10 @@ Suggested order for a reviewer:
 OQ-A. §10.2 wording revision applied in this batch — please
 confirm the three-case split correctly captures spec intent.
 
-OQ-B. Subscripting integration timing: same patch series
-before vanilla submission, or follow-up after Layer 1 lands?
-The vanilla reviewer will almost certainly ask.
+OQ-B. ~~Subscripting integration timing.~~ **Resolved**: yoda
+confirmed FOLLOW_UP_ACCEPTABLE. Subscripting deferred to the
+named follow-up `SLICED_JSONB_SUBSCRIPTING_FOLLOWUP`. See §6
+above for the reviewer-facing wording.
 
 OQ-C. JBTL bug-2 migration trigger condition. The Assert
 remains as a tripwire. Confirm the decision to leave it
