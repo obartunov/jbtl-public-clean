@@ -246,6 +246,86 @@ SELECT jb ->> 'k1' AS sort_on_k1     FROM l1_ext_sort_on WHERE id = 1;
 DROP TABLE l1_ext_sort_on;
 DROP TABLE l1_ext_compr;
 -- ============================================================
+-- Case 10: wide object — Stage 3 refetch.
+-- Helper computes min_prefix = 4 + 2N*sizeof(JEntry) [+ KVMap].
+-- For N around 200, min_prefix is ~1600 bytes, larger than the
+-- 1024-byte initial slice. The helper must refetch a larger
+-- structural prefix and still produce correct results.
+-- This exercises a code path the smaller-N cases (above) miss.
+-- ============================================================
+CREATE TABLE l1_wide (id int PRIMARY KEY, jb jsonb);
+ALTER TABLE l1_wide ALTER COLUMN jb SET STORAGE EXTERNAL;
+INSERT INTO l1_wide
+SELECT 1, jsonb_object_agg('k' || lpad(g::text, 4, '0'), 'v' || g)
+FROM generate_series(1, 200) g;
+SELECT jb -> 'k0001'    AS wide_first FROM l1_wide WHERE id = 1;
+ wide_first 
+------------
+ "v1"
+(1 row)
+
+SELECT jb -> 'k0100'    AS wide_mid   FROM l1_wide WHERE id = 1;
+ wide_mid 
+----------
+ "v100"
+(1 row)
+
+SELECT jb -> 'k0200'    AS wide_last  FROM l1_wide WHERE id = 1;
+ wide_last 
+-----------
+ "v200"
+(1 row)
+
+SELECT jb -> 'k_absent' AS wide_miss  FROM l1_wide WHERE id = 1;
+ wide_miss 
+-----------
+ 
+(1 row)
+
+SELECT jb ->> 'k0050'   AS wide_text  FROM l1_wide WHERE id = 1;
+ wide_text 
+-----------
+ v50
+(1 row)
+
+-- ============================================================
+-- Case 11: wide object with long key names — Stage 4 refetch.
+-- After Stage 3 enlarges the slice to min_prefix + 4096, the
+-- key area may still exceed the slice if individual key names
+-- are long. 200 keys × 24 bytes = 4800 bytes of key data;
+-- combined with min_prefix this pushes past Stage 3's
+-- extension and forces Stage 4 to refetch again.
+-- ============================================================
+INSERT INTO l1_wide
+SELECT 2, jsonb_object_agg('long_key_padding_' || lpad(g::text, 6, '0'),
+                            'v' || g)
+FROM generate_series(1, 200) g;
+SELECT jb -> 'long_key_padding_000001' AS long_first FROM l1_wide WHERE id = 2;
+ long_first 
+------------
+ "v1"
+(1 row)
+
+SELECT jb -> 'long_key_padding_000100' AS long_mid   FROM l1_wide WHERE id = 2;
+ long_mid 
+----------
+ "v100"
+(1 row)
+
+SELECT jb -> 'long_key_padding_000200' AS long_last  FROM l1_wide WHERE id = 2;
+ long_last 
+-----------
+ "v200"
+(1 row)
+
+SELECT jb -> 'long_key_padding_999999' AS long_miss  FROM l1_wide WHERE id = 2;
+ long_miss 
+-----------
+ 
+(1 row)
+
+DROP TABLE l1_wide;
+-- ============================================================
 -- Corruption case: skipped here intentionally.
 --
 -- The helper raises ERRCODE_DATA_CORRUPTED on physical
@@ -256,9 +336,11 @@ DROP TABLE l1_ext_compr;
 -- or (b) hex-edited heap files, which are not regression-suite
 -- material.
 --
--- The slow path raises ERRCODE_DATA_CORRUPTED on the same
--- bytes, so any production user who hits this case gets the
--- same diagnostic from either path. The helper does not
--- introduce a new error class — it only raises the existing
--- ones earlier in the call chain.
+-- Behaviour change to be aware of: the pre-existing slow path
+-- does NOT perform equivalent bounds checks; on the same
+-- corrupt bytes it may segfault, return undefined data, or
+-- rarely succeed by accident. The fast path tightens
+-- corruption detection. Queries that previously crashed or
+-- returned garbage on already-corrupt jsonb rows may now
+-- raise a clean ERRCODE_DATA_CORRUPTED instead.
 -- ============================================================
