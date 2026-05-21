@@ -565,22 +565,58 @@ Build a "P0" cell (production Layer 1 patch applied, no toaster
 extension bound, no relocation) and run the same workload as the
 v1 dense matrix (15 ids, 4 keys, S1+MM3, 150 reps x 5 runs).
 
-Acceptance: P0 reproduces J00's profile within counter noise:
+Acceptance is **case-dependent** because the spec's §7
+compression policy routes different cases through different
+paths. Splitting into the three cases the helper actually
+distinguishes:
 
-  - latency flat ~0.009 ms (sort off) or ~0.006 ms (sort on) for
-    inline keys at id >= 60;
-  - buffer reads flat ~1053 pages (sort off) or ~603 pages
-    (sort on) for inline keys at id >= 60;
-  - mid-size buffer regression visible at id = 60..70 with sort
-    off, **identical pattern** to J00 (this is the
-    compressed-prefix-and-value-overlap effect, not a Layer 1
-    bug);
-  - cold-payload reads (key2, key4) fall through to full detoast
-    and match F0 within noise (the helper's "not handled" gate
-    must fire on these cases).
+**Case A — prefix-resident scalar (sort on, or naturally short
+value, or short body where the structural prefix already covers
+the value).** Helper serves from prefix; no second fetch.
 
-This measurement matches the asymptotic-shape finding from
-Test 4.
+  Acceptance: P0 reproduces J0 numbers within counter noise.
+  Both production Layer 1 and JBTL-A read the value directly
+  from the structural prefix bytes; the dispatch overhead of
+  JBTL-A's extension wrapper is the only systematic difference,
+  so P0 may be slightly better than J0 (fewer buffer pages per
+  call). Concretely, on the v1 matrix with sort=on at id=100
+  key3, expect P10 ≤ J10 on buffer count.
+
+**Case B — uncompressed external, value past prefix.** Helper
+issues a second `detoast_attr_slice` at the value's byte offset
+to fetch only the value's bytes.
+
+  Acceptance: P0 reproduces J0 numbers within counter noise.
+  Both reach the value through the same mechanism: an arbitrary-
+  range slice into uncompressed TOAST. JBTL's chunked dispatch
+  and production's vanilla `detoast_attr_slice` walk the same
+  toast index; per-call overhead is comparable.
+
+**Case C — compressed external, value past prefix.** Helper
+gives up via the §7 fallback (compressed external supports
+prefix slices only). Caller does the existing full detoast.
+
+  Acceptance: P0 reproduces **F0** within counter noise, NOT J0.
+  JBTL reaches J0 in this case via its own chunked-compression
+  format (per-chunk decompression boundaries), which is a
+  property of the JBTL storage wrapper, not a property of
+  sliced reads in general. Production Layer 1 does not have a
+  comparable mechanism; closing this gap requires a TOAST API
+  change that the spec deferred (see §7 "Optimisation deferred
+  to a later task"). Equality with F0 is the correct acceptance
+  here; equality with J0 is not.
+
+What this measurement validates:
+  - asymptotic shape change at Case A and Case B (O(body) → O(1));
+  - clean fallback at Case C (no regression vs baseline);
+  - cold-payload reads (key2, key4) match F0 within noise — the
+    helper's "not handled" gate must fire on container values
+    and on values exceeding the half-body heuristic.
+
+The split above replaces the earlier wording "P0 reproduces
+J00's profile within counter noise" which was implicitly
+assuming the chunked-compression API; that assumption did not
+match the rest of the spec.
 
 ### 10.3 Mid-size buffer regression boundary
 
