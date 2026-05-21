@@ -1,18 +1,24 @@
 # Layer 1 — cover letter for code review
 
-Branch: `r2d2/layer1-sliced-read-clean`
-Base:   `origin/r1-relocation-aware-read` (commit 39101c17e8, in
-        `github.com/obartunov/jbtl-public-clean`)
-Tip:    b4e20c025e
-Status: LAYER1_READY_FOR_CODE_REVIEW
+Branch: `r2d2/layer1-upstream-prep`
+Base:   `origin/r1-relocation-aware-read`
+        (in `github.com/obartunov/jbtl-public-clean`)
+Status: LAYER1_UPSTREAM_PREP — fix cycle complete; awaiting
+        re-roll against `pgsql-master` for thread submission.
 Scope:  `jsonb -> 'key'` and `jsonb ->> 'key'`
         — subscripting deferred to a named follow-up.
 
+Specific commit SHAs are not pinned in this document; they drift
+on every rebase. See `LAYER1_REVIEW_CHECKLIST.md` for the patch
+layout (0001 / 0002 / 0003).
+
 ## Branch convention
 
-This branch is the Layer-1-only review surface (13 commits). The
-parent branch `origin/r1-relocation-aware-read` carries the
-relocation / Layer 2 design backlog including:
+This branch is the Layer-1-only review surface, in upstream-prep
+shape after the B1/F1/F2/F3/F4/F5/F7/F8 fix cycle (details in
+`LAYER1_UPSTREAM_PREP_FIXES.md`). The parent branch
+`origin/r1-relocation-aware-read` carries the relocation /
+Layer 2 design backlog including:
 
   - `PRODUCTION_RELOCATION_SOURCE_MAPPING.md`
   - `RELOCATION_DELETE_OWNERSHIP.md`
@@ -34,17 +40,30 @@ detoasting the whole body. The existing path is kept intact as
 a fall-through; the helper engages only when it can be honest
 about reducing work.
 
-The helper lives in `src/backend/utils/adt/jsonb_util.c`,
-prototype in `src/include/utils/jsonb.h`, called from two
-sites in `src/backend/utils/adt/jsonfuncs.c`:
-`jsonb_object_field` (line 917) and `jsonb_object_field_text`
-(line 992).
-
-One commit of code (`28c8b7fa5c`); the rest are design docs,
-result evidence, an audit comment in JBTL, and the review
-package.
+The helper `getKeyJsonValueFromExternal` lives in
+`src/backend/utils/adt/jsonb_util.c`, with its prototype in the
+non-public internal header `src/include/utils/jsonb_internal.h`
+(deliberately not in the stable `jsonb.h`). It is called from
+two sites in `src/backend/utils/adt/jsonfuncs.c`:
+`jsonb_object_field` and `jsonb_object_field_text`.
 
 ## Headline performance — cold cache, single call
+
+> Note: the numbers below were obtained on the pre-fix-cycle
+> code path, where the helper left the prefix and value_slice
+> palloc'd in CurrentMemoryContext for the caller's
+> JsonbValueToJsonb to copy out of. After fix F1 (see
+> `LAYER1_UPSTREAM_PREP_FIXES.md`) the helper deep-copies the
+> scalar payload itself and pfrees both slices before
+> returning FOUND. The new path adds one `memcpy` of the
+> scalar (a few bytes for strings/numerics, zero for
+> bool/null) and removes the per-row slice residue in the
+> caller's memory context. The expected effect on the
+> microsecond-scale FOUND latency below is at most low
+> single-digit percent; the disk-read counts cannot change.
+> Cold-cache re-measurement on the upstream-prep branch is
+> pending and tracked as an open item in
+> `LAYER1_UPSTREAM_PREP_FIXES.md`.
 
 Baseline obtained by compile-time disabling the same code on
 the same data (`if (0 && VARATT_IS_EXTERNAL_ONDISK(...))`), so
@@ -158,30 +177,49 @@ Closing Case C is deferred to either:
 
 ## Patch series
 
-  417a6cff97  docs: sliced jsonb read — Layer 1 specification
-  28c8b7fa5c  jsonb: sliced read for jb -> 'key' (Layer 1)
-  47e738f66f  docs: Layer 1 sliced read — implementation result
-  079e0b382d  jbtl: audit comment on latent fetch_len pad over-fetch
-  b8e3c6f922  docs: fix size-vs-id calibration in RESULT §4
-  684b11bf5e  docs: Layer 1 review package — three-case acceptance
-  84122504c7  docs: subscripting scope decision — FOLLOW_UP_ACCEPTABLE
+For upstream-prep submission the branch is squashed/shaped into:
 
-One commit of code (+466 lines), three of design/spec, two of
-result/evidence, one no-behavior-change comment in JBTL, two of
-review-package docs.
+  0001  sliced jsonb read helper + integration
+        - new helper getKeyJsonValueFromExternal in
+          src/backend/utils/adt/jsonb_util.c
+        - non-public declaration in src/include/utils/jsonb_internal.h
+        - gate + caller switch in jsonfuncs.c at jsonb_object_field
+          and jsonb_object_field_text
+        - no change to src/include/utils/jsonb.h beyond a one-line
+          pointer to jsonb_internal.h
+
+  0002  regression coverage
+        - src/test/regress/sql/jsonb_layer1.sql
+        - src/test/regress/expected/jsonb_layer1.out
+        - parallel_schedule entry
+
+  0003  docs (cover letter, checklist, fix log, spec, result)
+        - retained on the fork branch; trimmed for upstream
+          posting (cover letter only)
+
+The internal branch keeps a longer history (the original Layer 1
+implementation commit, the D1+D2+S2 fix-cycle commit, the D3
+tests commit, then the upstream-prep fix-cycle commits). Upstream
+sees the squashed three-patch form.
 
 ## Documents
 
 Read in this order for review:
 
-  1. `docs/LAYER1_REVIEW_NOTES.md` — cover doc (start here);
-  2. `docs/SLICED_JSONB_READ.md` — spec; §4-§7 are the
+  1. `docs/LAYER1_REVIEW_CHECKLIST.md` — patch layout, build /
+     regression / cold-cache instructions, fix-cycle history;
+  2. `docs/LAYER1_UPSTREAM_PREP_FIXES.md` — what changed in the
+     upstream-prep cycle and why;
+  3. `docs/LAYER1_POSTGRES_HACKER_REVIEW.md` — the strict
+     independent-reviewer pass and its disposition;
+  4. `docs/SLICED_JSONB_READ.md` — spec; §4-§7 are the
      algorithmic core, §10 the acceptance criteria;
-  3. `docs/SLICED_JSONB_READ_RESULT.md` — empirical result,
-     factorial matrix data, cold-cache baseline comparison;
-  4. `docs/SLICED_JSONB_SUBSCRIPTING_SCOPE.md` — why
+  5. `docs/SLICED_JSONB_READ_RESULT.md` — empirical result,
+     factorial matrix data, cold-cache baseline comparison
+     (numbers from the pre-F1 path; see headline note above);
+  6. `docs/SLICED_JSONB_SUBSCRIPTING_SCOPE.md` — why
      subscripting is deferred;
-  5. commit `28c8b7fa5c` — the code itself.
+  7. the code itself, via `git log -p` over patch 0001.
 
 ## Explicit non-scope
 
@@ -190,7 +228,7 @@ This patch optimises `->` and `->>`.
 Subscripting (`jb['key']`, `jb[0]`, `jb['a']['b']`) is
 intentionally deferred to the next patch
 (`SLICED_JSONB_SUBSCRIPTING_FOLLOWUP`). The helper signature
-in `jsonb.h` and the scope document in
+in `jsonb_internal.h` and the scope document in
 `SLICED_JSONB_SUBSCRIPTING_SCOPE.md` make the follow-up
 mechanical: single-step object-key fetch only, no array
 subscripting, no multi-step traversal, no assignment path.

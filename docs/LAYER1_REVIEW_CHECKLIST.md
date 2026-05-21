@@ -2,50 +2,63 @@
 
 ## Branch and commits
 
-  Branch: r2d2/layer1-sliced-read-clean
-  Base:   origin/r1-relocation-aware-read (commit 39101c17e8,
-          in github.com/obartunov/jbtl-public-clean)
-  Tip:    b4e20c025e
-  Commits: 13 (Layer 1 only — no preparatory relocation /
-                Layer 2 design docs on this branch)
+  Branch: r2d2/layer1-upstream-prep
+  Base:   origin/r1-relocation-aware-read
+          (in github.com/obartunov/jbtl-public-clean)
 
   Commit range for review:
-    git log --oneline origin/r1-relocation-aware-read..r2d2/layer1-sliced-read-clean
+    git log --oneline origin/r1-relocation-aware-read..r2d2/layer1-upstream-prep
 
-  Commit series (newest first):
-    b4e20c025e  docs: update review docs after D1+D2+D3 fix cycle
-    f9015a62ff  test/jsonb: Layer 1 sliced read regression coverage (D3)
-    c05ddb3182  jsonb: Layer 1 sliced read — enum return + memory-ownership contract (D1+D2+S2)
-    d708facd7f  docs: independent code review of Layer 1
-    0c89c413d3  docs: Layer 1 internal review checklist
-    a0595c605d  docs: Layer 1 cover letter + finalise subscripting deferral wording
-    b2f9e7b7f5  docs: subscripting scope decision — FOLLOW_UP_ACCEPTABLE
-    08cb61d9a4  docs: Layer 1 review package — three-case acceptance split + cover
-    93522413a5  docs: fix size-vs-id calibration in SLICED_JSONB_READ_RESULT §4
-    c02a37a08a  jbtl: audit comment on latent fetch_len pad over-fetch
-    054ba0f181  docs: Layer 1 sliced read — implementation result
-    d3bd1a9d90  jsonb: sliced read for jb -> 'key' on external bodies (Layer 1)
-    38170748ac  docs: sliced jsonb read — Layer 1 specification
+  Reviewer-facing layout (the upstream-prep shape, post fix cycle):
 
-  History note: this branch was constructed from r2d2/layer1-sliced-read
-  by `git rebase --onto origin/r1-relocation-aware-read 8cac4f4f64`,
-  dropping 7 preparatory relocation / Layer 2 / sort-default design
-  doc commits from the prior branch. Commit hashes therefore differ
-  from the prior branch even though the textual diff against the new
-  base is identical to the diff the prior branch carried against its
-  own base. The prior branch (r2d2/layer1-sliced-read) is retained
-  locally as the source-of-truth fork point should we ever want to
-  reconstruct the Layer 2 context together.
+    0001  sliced jsonb read helper + integration (jsonb_util.c,
+          jsonfuncs.c, jsonb.h, new jsonb_internal.h)
+    0002  jsonb_layer1 regression coverage + parallel_schedule entry
+    0003  cover letter, checklist, review notes, this fix log
 
-  Fix-cycle (D1+D2+D3+S2 from the independent code review):
-    D1+D2+S2  → c05ddb3182  enum signature, header memory-ownership
-                            contract, StaticAssertDecl on
-                            JSONB_SLICED_READ_INITIAL_PREFIX
-    D3        → f9015a62ff  jsonb_layer1.sql regression suite +
-                            parallel_schedule entry
-    S1, M1-M7 → queued as a follow-up cleanup commit
-    S3        → partially fell out of D1+D2 (the void-cast idiom
-                was dropped; memory-ownership note relocated)
+  Specific commit SHAs are intentionally NOT pinned here. SHAs drift
+  every time the branch is rebased onto a moving base; pinning them
+  forces every reviewer-facing doc to be re-edited after each rebase
+  and creates "unknown revision" failures when one of the documents
+  has been refreshed but the other hasn't. Refer to commits by what
+  they do (patch number above) and let the reviewer use `git log` to
+  enumerate them.
+
+  Fix cycle history (issue identifier → what changed):
+
+    D1+D2+S2  enum signature, header memory-ownership contract,
+              StaticAssertDecl on JSONB_SLICED_READ_INITIAL_PREFIX
+    D3        jsonb_layer1.sql regression suite + parallel_schedule
+              entry
+    S3        partially fell out of D1+D2 (the void-cast idiom was
+              dropped; memory-ownership note relocated)
+
+  Upstream-prep fix cycle (issue identifier → what changed):
+
+    B1+F8     all size arithmetic in getKeyJsonValueFromExternal
+              widened to int64; corruption check on a forged-N
+              container header can no longer be bypassed via int32
+              wrap (verified numerically and via the regression run)
+    F1        helper now deep-copies the scalar payload and frees
+              the prefix / value_slice buffers before returning
+              FOUND; *res is self-contained on return; per-row
+              memory bloat in CurrentMemoryContext eliminated
+    F2        helper un-exported from public jsonb.h; declared in
+              new src/include/utils/jsonb_internal.h, included from
+              jsonb_util.c and jsonfuncs.c only
+    F3        false claim "the slow path raises the same on the
+              same bytes" replaced in both the function-level
+              comment and the test file's corruption-skip rationale
+              with an accurate statement of the behaviour change
+    F4        new regression cases (Case 10 wide object → Stage 3
+              refetch; Case 11 long key names → Stage 4 refetch)
+    F5        this section (SHA references dropped from
+              reviewer-facing docs in favour of patch numbers)
+    F7        half-body cap comment downgraded from "by chunk
+              overlap analysis" to "conservative empirical cap;
+              finer tuning deferred"
+    S1, M1-M7 deferred from the prior internal cycle; still
+              deferred — none of them block upstream-prep
 
   Cross-branch references: inline doc references to
   PRODUCTION_RELOCATION_SOURCE_MAPPING.md, RELOCATION_DELETE_OWNERSHIP.md,
