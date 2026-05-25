@@ -34,6 +34,7 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "utils/jsonb.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
@@ -1488,3 +1489,57 @@ test_pglz_decompress(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, dlen + VARHDRSZ);
 	PG_RETURN_BYTEA_P(result);
 }
+
+
+/*
+ * U1 read-amplification probe: exercise getKeyJsonValueFromContainerBounded()
+ * with a caller-controlled available_len so a regress test can deterministically
+ * hit FOUND / COLD / NOT_FOUND / NEED_MORE without going through TOAST.
+ *
+ * available_len here is the number of valid bytes at the *container* (root),
+ * i.e. it excludes the varlena header.  Pass avail < 0 for unbounded.
+ */
+PG_FUNCTION_INFO_V1(jsonb_bounded_probe);
+Datum
+jsonb_bounded_probe(PG_FUNCTION_ARGS)
+{
+	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	text	   *keyt = PG_GETARG_TEXT_PP(1);
+	int32		avail = PG_GETARG_INT32(2);
+	JsonbValue	v;
+	JsonbBoundedLookupResult meta;
+	JsonbBoundedLookupStatus st;
+	StringInfoData buf;
+	Size		available_len = (avail < 0) ? JSONB_AVAIL_UNBOUNDED : (Size) avail;
+
+	st = getKeyJsonValueFromContainerBounded(&jb->root, available_len,
+											 VARDATA_ANY(keyt),
+											 (int) VARSIZE_ANY_EXHDR(keyt),
+											 &v, &meta);
+
+	initStringInfo(&buf);
+	switch (st)
+	{
+		case JSONB_BLOOKUP_FOUND:
+			{
+				Jsonb	   *jv = JsonbValueToJsonb(&v);
+
+				appendStringInfo(&buf, "FOUND %s",
+								 JsonbToCString(NULL, &jv->root, VARSIZE(jv)));
+				break;
+			}
+		case JSONB_BLOOKUP_COLD:
+			appendStringInfo(&buf, "COLD off=%u len=%u",
+							 meta.cold_offset, meta.cold_len);
+			break;
+		case JSONB_BLOOKUP_NOT_FOUND:
+			appendStringInfoString(&buf, "NOT_FOUND");
+			break;
+		case JSONB_BLOOKUP_NEED_MORE:
+			appendStringInfo(&buf, "NEED_MORE req=" UINT64_FORMAT,
+							 (uint64) meta.required_len);
+			break;
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+

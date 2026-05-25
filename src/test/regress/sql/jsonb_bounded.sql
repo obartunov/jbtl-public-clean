@@ -1,0 +1,64 @@
+--
+-- U1: bounded jsonb object-field lookup (read-amplification path)
+--
+-- Probe: jsonb_bounded_probe(jsonb, key, avail) where avail is the number of
+-- valid bytes AT THE CONTAINER (excludes varlena header); avail < 0 = unbounded.
+-- Source: src/test/regress/regress.c.
+--
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+\set regresslib :libdir '/regress' :dlsuffix
+CREATE FUNCTION jsonb_bounded_probe(jsonb, text, int)
+    RETURNS text AS :'regresslib' LANGUAGE C STRICT;
+
+SET jsonb_sort_field_values = on;
+
+-- Canonical 4-key shape: key3 is metadata logically AFTER payload key2.
+-- size-sort + KVMap keep small key1/key3 physically before large key2/key4.
+CREATE TEMP TABLE t AS
+SELECT jsonb_build_object('key1', 123,
+                          'key2', repeat('x', 4000),
+                          'key3', 456,
+                          'key4', repeat('y', 4000)) AS j;
+
+-- Unbounded: stock semantics preserved, every present key FOUND, absent NOT_FOUND.
+SELECT jsonb_bounded_probe(j,'key1',-1)        AS k1,
+       left(jsonb_bounded_probe(j,'key2',-1),5) AS k2_kind,  -- large payload: kind only
+       jsonb_bounded_probe(j,'key3',-1)        AS k3,
+       left(jsonb_bounded_probe(j,'key4',-1),5) AS k4_kind,  -- large payload: kind only
+       jsonb_bounded_probe(j,'nope',-1)        AS absent
+FROM t;
+
+-- NEED_MORE staircase (N=4, es=1): header=4, structural_end=4+8*4+INTALIGN(4)=40,
+-- key area = 4 keys * 4 bytes = 16, key_area_end=56. Deterministic required_len.
+SELECT jsonb_bounded_probe(j,'key1',0)  AS avail0,
+       jsonb_bounded_probe(j,'key1',4)  AS avail4,
+       jsonb_bounded_probe(j,'key1',40) AS avail40
+FROM t;
+
+-- Warm-prefix slice (avail covers structural+keys+small metadata values, not payload):
+-- metadata key1/key3 FOUND; payload key2/key4 COLD (decided from JEntries only).
+SELECT jsonb_bounded_probe(j,'key1',120) AS k1,
+       jsonb_bounded_probe(j,'key3',120) AS k3,
+       jsonb_bounded_probe(j,'key2',120) AS k2_cold,
+       jsonb_bounded_probe(j,'key4',120) AS k4_cold
+FROM t;
+
+-- Bounded NOT_FOUND: key area fully present, absent key concluded safely.
+SELECT jsonb_bounded_probe(j,'nope',120) AS absent_bounded FROM t;
+
+-- D3: a zero-length body (empty string) must be FOUND, never COLD, even when its
+-- physical slot offset is beyond avail.  Stock layout places "z" after big "a".
+SET jsonb_sort_field_values = off;
+CREATE TEMP TABLE z AS
+SELECT jsonb_build_object('a', repeat('x', 4000), 'z', '') AS j;
+SELECT jsonb_bounded_probe(j,'z',60)   AS z_empty_found,   -- val_len=0 -> FOUND, not COLD
+       left(jsonb_bounded_probe(j,'a',60),4) AS a_cold     -- big body beyond avail -> COLD
+FROM z;
+
+-- Stock (no KVMap) object must work identically through the same reader.
+SET jsonb_sort_field_values = off;
+SELECT jsonb_bounded_probe('{"a":1,"b":"hi","c":true}'::jsonb,'b',-1) AS stock_found,
+       jsonb_bounded_probe('{"a":1,"b":"hi","c":true}'::jsonb,'z',-1) AS stock_absent;
+
+DROP FUNCTION jsonb_bounded_probe(jsonb, text, int);
