@@ -1,0 +1,41 @@
+--
+-- U2: sliced-TOAST warm metadata lookup over the U1 bounded reader.
+-- Correctness only (block-read evidence lives in the U2 result note, since
+-- buffer counts are environment-specific).  The caller jsonb_warm_get_probe
+-- contains no jsonb binary search / KVMap decoder / key comparator: all format
+-- reasoning goes through getKeyJsonValueFromContainerBounded() (U1).
+--
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+\set regresslib :libdir '/regress' :dlsuffix
+CREATE FUNCTION jsonb_warm_get_probe(jsonb, text, int)
+    RETURNS text AS :'regresslib' LANGUAGE C STRICT;
+
+SET jsonb_sort_field_values = on;
+
+CREATE TABLE doc (jb jsonb);
+ALTER TABLE doc ALTER COLUMN jb SET STORAGE EXTERNAL;
+INSERT INTO doc
+SELECT jsonb_build_object(
+    'key1', 123,
+    'key2', (SELECT string_agg(md5(g::text),'') FROM generate_series(1,400) g),
+    'key3', 456,
+    'key4', (SELECT string_agg(md5((g+1)::text),'') FROM generate_series(1,400) g));
+
+-- R1/R2/R3: warm metadata + absent resolve from a small prefix slice.
+-- mode tag before '|' shows FOUND/<fetches>, NOTFOUND/<fetches>, COLD_FALLBACK/<fetches>.
+SELECT split_part(jsonb_warm_get_probe(jb,'key1',512),'|',1) AS k1_mode,
+       split_part(jsonb_warm_get_probe(jb,'key1',512),'|',2) = (jb->'key1')::text AS k1_ok,
+       split_part(jsonb_warm_get_probe(jb,'key3',512),'|',1) AS k3_mode,
+       split_part(jsonb_warm_get_probe(jb,'key3',512),'|',2) = (jb->'key3')::text AS k3_ok,
+       split_part(jsonb_warm_get_probe(jb,'nope',512),'|',1) AS absent_mode,
+       (jb->'nope') IS NULL AS absent_ok
+FROM doc;
+
+-- R4: cold payload falls back, but must still be byte-correct.
+SELECT split_part(jsonb_warm_get_probe(jb,'key2',512),'|',1) AS k2_mode,
+       split_part(jsonb_warm_get_probe(jb,'key2',512),'|',2) = (jb->'key2')::text AS k2_ok
+FROM doc;
+
+DROP TABLE doc;
+DROP FUNCTION jsonb_warm_get_probe(jsonb, text, int);
