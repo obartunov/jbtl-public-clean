@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
+
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
@@ -623,6 +625,92 @@ getIthJsonbValueFromContainer(JsonbContainer *container, uint32 i)
  * A nested array or object will be returned as jbvBinary, ie. it won't be
  * expanded.
  */
+/*
+ * materializeToastedValue
+ *
+ * W2.1: given the value bytes of a JENTRY_ISTOASTED field (a JsonbToastedDatum
+ * followed by a varatt_external), fetch the out-of-line ordinary TOAST value and
+ * rebuild the original JsonbValue.  The materialized bytes are palloc'd in the
+ * current memory context so they outlive the temporary detoast buffer.  This is
+ * the single point where a toasted descriptor becomes a normal value; no
+ * consumer above fillJsonbValue ever sees the descriptor.
+ */
+static void
+materializeToastedValue(const char *desc_addr, JsonbValue *result)
+{
+	JsonbToastedDatum hdr;
+	struct varatt_external toast_ptr;
+	struct varlena *reconstructed;
+	char		ref[VARHDRSZ_EXTERNAL + sizeof(struct varatt_external)];
+	Jsonb	   *child;
+
+	/* copy header + pointer out for aligned access */
+	memcpy(&hdr, desc_addr, sizeof(JsonbToastedDatum));
+	memcpy(&toast_ptr,
+		   desc_addr + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+		   sizeof(struct varatt_external));
+
+	/* build a proper external TOAST reference varlena to hand to detoast */
+	SET_VARTAG_EXTERNAL(ref, VARTAG_ONDISK);
+	memcpy(VARDATA_EXTERNAL(ref), &toast_ptr, sizeof(struct varatt_external));
+
+	/*
+	 * The out-of-line value was stored by the writer as an ordinary standalone
+	 * jsonb datum (scalars are wrapped as a single-element rawScalar array, as
+	 * JsonbValueToJsonb does).  Detoast it and decode uniformly: a rawScalar
+	 * array yields its single element; any other container is returned as
+	 * jbvBinary.  This keeps reader and writer on one representation and needs
+	 * no per-type bytes interpretation.
+	 */
+	/* detoast_attr handles external fetch AND decompression (external_attr does
+	 * not decompress). */
+	reconstructed = detoast_attr((struct varlena *) ref);
+	child = (Jsonb *) reconstructed;
+
+	if (JsonContainerIsScalar(&child->root))
+	{
+		/* rawScalar array of one element: extract element 0 into result */
+		JsonbValue *elem = getIthJsonbValueFromContainer(&child->root, 0);
+
+		*result = *elem;
+		pfree(elem);
+
+		/*
+		 * String/numeric bodies point into the detoasted buffer; copy them so
+		 * they outlive it.  (Container elements cannot occur inside a rawScalar
+		 * wrapper.)
+		 */
+		if (result->type == jbvString)
+		{
+			char	   *buf = palloc(result->val.string.len);
+
+			memcpy(buf, result->val.string.val, result->val.string.len);
+			result->val.string.val = buf;
+		}
+		else if (result->type == jbvNumeric)
+		{
+			int			nlen = VARSIZE(result->val.numeric);
+			Numeric		buf = (Numeric) palloc(nlen);
+
+			memcpy(buf, result->val.numeric, nlen);
+			result->val.numeric = buf;
+		}
+	}
+	else
+	{
+		/* nested object/array: hand back a binary view, copied to outlive buf */
+		int			len = VARSIZE_ANY_EXHDR(reconstructed);
+		char	   *buf = palloc(len);
+
+		memcpy(buf, VARDATA_ANY(reconstructed), len);
+		result->type = jbvBinary;
+		result->val.binary.data = (JsonbContainer *) buf;
+		result->val.binary.len = len;
+	}
+
+	(void) hdr;					/* orig_jbe_type retained for diagnostics only */
+}
+
 static void
 fillJsonbValue(JsonbContainer *container, int index,
 			   char *base_addr, uint32 offset,
@@ -655,6 +743,11 @@ fillJsonbValue(JsonbContainer *container, int index,
 	{
 		result->type = jbvBool;
 		result->val.boolean = false;
+	}
+	else if (JBE_ISTOASTED(entry))
+	{
+		/* W2.1: out-of-line cold payload; materialize lazily, invisibly. */
+		materializeToastedValue(base_addr + INTALIGN(offset), result);
 	}
 	else
 	{
@@ -710,7 +803,7 @@ pushJsonbValue(JsonbInState *pstate, JsonbIteratorToken seq,
 	 * pushJsonbValueScalar handles all cases not involving pushing a
 	 * container object as an ELEM or VALUE.
 	 */
-	if (!jbval || IsAJsonbScalar(jbval) ||
+	if (!jbval || IsAJsonbScalar(jbval) || jbval->type == jbvToasted ||
 		(seq != WJB_ELEM && seq != WJB_VALUE))
 	{
 		pushJsonbValueScalar(pstate, seq, jbval);
@@ -1008,6 +1101,15 @@ copyScalarSubstructure(JsonbValue *v, MemoryContext outcontext)
 
 				memcpy(buf, v->val.string.val, v->val.string.len);
 				v->val.string.val = buf;
+			}
+			break;
+		case jbvToasted:
+			{
+				char	   *buf = MemoryContextAlloc(outcontext,
+													 v->val.toasted.len);
+
+				memcpy(buf, v->val.toasted.data, v->val.toasted.len);
+				v->val.toasted.data = buf;
 			}
 			break;
 		case jbvNumeric:
@@ -1921,6 +2023,10 @@ estimateJsonbValueSize(const JsonbValue *jbv)
 			 */
 			return sizeof(JEntry) + jbv->val.binary.len;
 
+		case jbvToasted:
+			/* JEntry + up to 3 bytes INTALIGN pad + descriptor bytes */
+			return sizeof(JEntry) + 3 + jbv->val.toasted.len;
+
 		default:
 			elog(ERROR, "unrecognized jsonb value type: %d", (int) jbv->type);
 			return 0;
@@ -2040,7 +2146,7 @@ convertJsonbValue(StringInfo buffer, JEntry *header, JsonbValue *val, int level)
 	 * not be passed back to this function as an argument.
 	 */
 
-	if (IsAJsonbScalar(val))
+	if (val->type == jbvToasted || IsAJsonbScalar(val))
 		convertJsonbScalar(buffer, header, val);
 	else if (val->type == jbvArray)
 		convertJsonbArray(buffer, header, val, level);
@@ -2382,6 +2488,14 @@ convertJsonbScalar(StringInfo buffer, JEntry *header, JsonbValue *scalarVal)
 		case jbvBool:
 			*header = (scalarVal->val.boolean) ?
 				JENTRY_ISBOOL_TRUE : JENTRY_ISBOOL_FALSE;
+			break;
+
+		case jbvToasted:
+			/* cold-payload descriptor: INTALIGN like numeric, then bytes */
+			padlen = padBufferToInt(buffer);
+			appendToBuffer(buffer, scalarVal->val.toasted.data,
+						   scalarVal->val.toasted.len);
+			*header = JENTRY_ISTOASTED | (padlen + scalarVal->val.toasted.len);
 			break;
 
 		case jbvDatetime:

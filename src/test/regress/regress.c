@@ -20,6 +20,8 @@
 #include <signal.h>
 
 #include "access/detoast.h"
+#include "access/table.h"
+#include "access/toast_internals.h"
 #include "access/htup_details.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
@@ -1543,3 +1545,219 @@ jsonb_bounded_probe(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
+
+
+/*
+ * U2 sliced-TOAST warm metadata reader.
+ *
+ * jsonb_warm_get_probe(jb, key, boot) -- thin sliced-TOAST caller over the U1
+ * bounded reader.  Contains NO jsonb binary search, KVMap decoder, key
+ * comparator, or value-offset logic: all jsonb format reasoning goes through
+ * getKeyJsonValueFromContainerBounded().
+ *
+ * Strategy:
+ *   - take the raw (possibly on-disk external) datum WITHOUT detoasting;
+ *   - if not external on-disk, just run the bounded reader unbounded;
+ *   - else fetch a small prefix slice [0, boot), call the bounded reader,
+ *     and follow NEED_MORE.required_len (never guess) until decided;
+ *   - FOUND  -> return value from the prefix, no full detoast;
+ *   - NOT_FOUND -> return NULL marker, no full detoast;
+ *   - COLD   -> fall back to full detoast (correctness over win).
+ *
+ * Returns text "MODE|value" so the test can see how each lookup resolved:
+ *   FOUND|<jsonb>, NOTFOUND|, COLD|<jsonb>, where MODE also encodes the number
+ *   of slice fetches as FOUND/n.
+ */
+PG_FUNCTION_INFO_V1(jsonb_warm_get_probe);
+Datum
+jsonb_warm_get_probe(PG_FUNCTION_ARGS)
+{
+	Datum		raw = PG_GETARG_DATUM(0);
+	text	   *keyt = PG_GETARG_TEXT_PP(1);
+	int32		boot = PG_GETARG_INT32(2);
+	const char *kv = VARDATA_ANY(keyt);
+	int			kl = (int) VARSIZE_ANY_EXHDR(keyt);
+	StringInfoData buf;
+	JsonbValue	v;
+	JsonbBoundedLookupResult meta;
+	JsonbBoundedLookupStatus st;
+	int			fetches = 0;
+
+	initStringInfo(&buf);
+
+	/* Non-external (inline / already-detoasted): unbounded reader, no slicing. */
+	if (!VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(raw)))
+	{
+		Jsonb	   *jb = DatumGetJsonbP(raw);
+
+		st = getKeyJsonValueFromContainerBounded(&jb->root,
+												 JSONB_AVAIL_UNBOUNDED,
+												 kv, kl, &v, &meta);
+		if (st == JSONB_BLOOKUP_FOUND)
+		{
+			Jsonb	   *jv = JsonbValueToJsonb(&v);
+
+			appendStringInfo(&buf, "INLINE_FOUND|%s",
+							 JsonbToCString(NULL, &jv->root, VARSIZE(jv)));
+		}
+		else
+			appendStringInfoString(&buf, "INLINE_NOTFOUND|");
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+
+	/* External on-disk: fetch a bounded prefix and follow required_len. */
+	{
+		varlena    *attr = (varlena *) DatumGetPointer(raw);
+		int32		slicelen = boot;
+		varlena    *slice;
+		JsonbContainer *cont;
+		Size		avail;
+
+		for (;;)
+		{
+			slice = detoast_attr_slice(attr, 0, slicelen);
+			fetches++;
+			/* bytes available at the container (exclude varlena header) */
+			avail = (Size) (VARSIZE_ANY_EXHDR(slice));
+			cont = (JsonbContainer *) VARDATA_ANY(slice);
+
+			st = getKeyJsonValueFromContainerBounded(cont, avail, kv, kl,
+													 &v, &meta);
+
+			if (st == JSONB_BLOOKUP_NEED_MORE)
+			{
+				/* follow U1's required_len exactly; +VARHDRSZ for the slice */
+				int32		need = (int32) (meta.required_len + VARHDRSZ);
+
+				if (need <= slicelen)	/* safety: avoid infinite loop */
+					need = slicelen * 2;
+				slicelen = need;
+				continue;
+			}
+			break;
+		}
+
+		if (st == JSONB_BLOOKUP_FOUND)
+		{
+			Jsonb	   *jv = JsonbValueToJsonb(&v);
+
+			appendStringInfo(&buf, "FOUND/%d|%s", fetches,
+							 JsonbToCString(NULL, &jv->root, VARSIZE(jv)));
+		}
+		else if (st == JSONB_BLOOKUP_NOT_FOUND)
+			appendStringInfo(&buf, "NOTFOUND/%d|", fetches);
+		else						/* COLD: fall back to full detoast */
+		{
+			Jsonb	   *full = DatumGetJsonbP(raw);
+			JsonbValue *fv = getKeyJsonValueFromContainer(&full->root, kv, kl, NULL);
+
+			if (fv)
+			{
+				Jsonb	   *jv = JsonbValueToJsonb(fv);
+
+				appendStringInfo(&buf, "COLD_FALLBACK/%d|%s", fetches,
+								 JsonbToCString(NULL, &jv->root, VARSIZE(jv)));
+			}
+			else
+				appendStringInfo(&buf, "COLD_FALLBACK_NULL/%d|", fetches);
+		}
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * W2.1 test producer (structural writer, direction A):
+ * jsonb_make_toasted(jb, key, relid)
+ *
+ * Rebuilds a top-level object jsonb through the stock structural writer
+ * (pushJsonbValue / JsonbValueToJsonb), replacing field `key`'s value with a
+ * jbvToasted placeholder whose bytes are a JsonbToastedDatum + varatt_external.
+ * The out-of-line value is stored as an ordinary TOAST value of relid's toast
+ * relation.  No byte surgery: alignment / JEntry stride / KVMap all follow stock
+ * writer rules because emission goes through convertJsonbScalar.
+ */
+PG_FUNCTION_INFO_V1(jsonb_make_toasted);
+Datum
+jsonb_make_toasted(PG_FUNCTION_ARGS)
+{
+	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	text	   *keyt = PG_GETARG_TEXT_PP(1);
+	Oid			relid = PG_GETARG_OID(2);
+	const char *target = VARDATA_ANY(keyt);
+	int			targetlen = VARSIZE_ANY_EXHDR(keyt);
+	JsonbIterator *it;
+	JsonbValue	v;
+	JsonbIteratorToken tok;
+	JsonbInState pstate = {0};
+	Relation	rel;
+	Jsonb	   *out;
+	bool		at_target = false;
+
+	if (!JB_ROOT_IS_OBJECT(jb))
+		elog(ERROR, "jsonb_make_toasted: not an object");
+
+	rel = table_open(relid, AccessShareLock);
+	if (!OidIsValid(rel->rd_rel->reltoastrelid))
+	{
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "jsonb_make_toasted: relation has no toast table");
+	}
+
+	it = JsonbIteratorInit(&jb->root);
+	while ((tok = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+	{
+		switch (tok)
+		{
+			case WJB_BEGIN_OBJECT:
+				pushJsonbValue(&pstate, WJB_BEGIN_OBJECT, &v);
+				break;
+			case WJB_END_OBJECT:
+				pushJsonbValue(&pstate, WJB_END_OBJECT, NULL);
+				break;
+			case WJB_KEY:
+				at_target = (v.type == jbvString &&
+							 v.val.string.len == targetlen &&
+							 memcmp(v.val.string.val, target, targetlen) == 0);
+				pushJsonbValue(&pstate, WJB_KEY, &v);
+				break;
+			case WJB_VALUE:
+				if (at_target)
+				{
+					Jsonb	   *child = JsonbValueToJsonb(&v);
+					Datum		toasted = toast_save_datum(rel,
+														   PointerGetDatum(child),
+														   NULL, 0);
+					struct varlena *tptr = (struct varlena *) DatumGetPointer(toasted);
+					char	   *descbuf = palloc0(JSONB_TOASTED_DATUM_SIZE);
+					JsonbValue	tv;
+
+					if (!VARATT_IS_EXTERNAL_ONDISK(tptr))
+						elog(ERROR, "jsonb_make_toasted: expected on-disk pointer");
+
+					((JsonbToastedDatum *) descbuf)->orig_jbe_type =
+						(v.type == jbvBinary) ? JBE_TOASTED_ORIG_CONTAINER :
+						(v.type == jbvNumeric) ? JBE_TOASTED_ORIG_NUMERIC :
+						JBE_TOASTED_ORIG_STRING;
+					memcpy(descbuf + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+						   VARDATA_EXTERNAL(tptr), sizeof(struct varatt_external));
+
+					tv.type = jbvToasted;
+					tv.val.toasted.data = descbuf;
+					tv.val.toasted.len = JSONB_TOASTED_DATUM_SIZE;
+					pushJsonbValue(&pstate, WJB_VALUE, &tv);
+				}
+				else
+					pushJsonbValue(&pstate, WJB_VALUE, &v);
+				at_target = false;
+				break;
+			default:
+				elog(ERROR, "jsonb_make_toasted: unexpected token %d", tok);
+		}
+	}
+
+	table_close(rel, AccessShareLock);
+
+	out = JsonbValueToJsonb(pstate.result);
+	PG_RETURN_JSONB_P(out);
+}

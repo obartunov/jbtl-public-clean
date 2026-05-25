@@ -148,6 +148,12 @@ typedef uint32 JEntry;
 #define JENTRY_ISBOOL_TRUE		0x30000000
 #define JENTRY_ISNULL			0x40000000
 #define JENTRY_ISCONTAINER		0x50000000	/* array or object */
+#define JENTRY_ISTOASTED		0x60000000	/* W2.1: cold payload descriptor.
+											 * value bytes are a JsonbToastedDatum:
+											 * the original value lives out-of-line as
+											 * an ordinary TOAST value; materialized
+											 * lazily in fillJsonbValue. Logically
+											 * invisible: never surfaces to SQL. */
 
 /* Access macros.  Note possible multiple evaluations */
 #define JBE_OFFLENFLD(je_)		((je_) & JENTRY_OFFLENMASK)
@@ -155,6 +161,7 @@ typedef uint32 JEntry;
 #define JBE_ISSTRING(je_)		(((je_) & JENTRY_TYPEMASK) == JENTRY_ISSTRING)
 #define JBE_ISNUMERIC(je_)		(((je_) & JENTRY_TYPEMASK) == JENTRY_ISNUMERIC)
 #define JBE_ISCONTAINER(je_)	(((je_) & JENTRY_TYPEMASK) == JENTRY_ISCONTAINER)
+#define JBE_ISTOASTED(je_)		(((je_) & JENTRY_TYPEMASK) == JENTRY_ISTOASTED)
 #define JBE_ISNULL(je_)			(((je_) & JENTRY_TYPEMASK) == JENTRY_ISNULL)
 #define JBE_ISBOOL_TRUE(je_)	(((je_) & JENTRY_TYPEMASK) == JENTRY_ISBOOL_TRUE)
 #define JBE_ISBOOL_FALSE(je_)	(((je_) & JENTRY_TYPEMASK) == JENTRY_ISBOOL_FALSE)
@@ -305,6 +312,15 @@ enum jbvType
 	 * into JSON strings when outputted to json/jsonb.
 	 */
 	jbvDatetime = 0x20,
+
+	/*
+	 * W2.1 producer-only virtual type: a value that should be emitted as a
+	 * JENTRY_ISTOASTED cold-payload descriptor.  Carries ready descriptor
+	 * bytes (JsonbToastedDatum + varatt_external); the structural writer emits
+	 * it through convertJsonbScalar so alignment/stride/KVMap follow stock
+	 * rules.  Never produced by parsing; only injected by the split writer.
+	 */
+	jbvToasted = 0x21,
 };
 
 /*
@@ -354,6 +370,12 @@ struct JsonbValue
 			int			tz;		/* Numeric time zone, in seconds, for
 								 * TimestampTz data type */
 		}			datetime;
+
+		struct
+		{
+			int			len;	/* JSONB_TOASTED_DATUM_SIZE */
+			char	   *data;	/* descriptor bytes */
+		}			toasted;	/* jbvToasted: cold-payload descriptor */
 	}			val;
 };
 
@@ -520,6 +542,37 @@ typedef struct JsonbBoundedLookupResult
 	uint32		cold_len;		/* iff COLD: value body length */
 	Size		required_len;	/* iff NEED_MORE: bytes needed at container to proceed */
 } JsonbBoundedLookupResult;
+
+/*
+ * W2.1 cold-payload descriptor (JENTRY_ISTOASTED value body).
+ *
+ * Stored at the value-data position of an object field whose JEntry type is
+ * JENTRY_ISTOASTED.  The original jsonb value (string / numeric / nested
+ * container) has been written out-of-line as an ordinary TOAST value; the
+ * parent keeps only this fixed-size descriptor:
+ *
+ *   [ uint8 orig_jbe_type ][ uint8 flags ][ uint16 reserved ]
+ *   [ varatt_external (18 bytes, the ordinary on-disk TOAST pointer) ]
+ *
+ * orig_jbe_type records which JEntry type the out-of-line value materializes
+ * to (so fillJsonbValue can rebuild the correct JsonbValue without parsing).
+ * The descriptor is INTALIGN'd like any other value; its JEntry length is
+ * JSONB_TOASTED_DATUM_SIZE.  The descriptor never surfaces to SQL: it is
+ * materialized in fillJsonbValue before any consumer sees the value.
+ */
+typedef struct JsonbToastedDatum
+{
+	uint8		orig_jbe_type;	/* JBE_TOASTED_ORIG_* */
+	uint8		flags;			/* reserved, 0 in v1 */
+	uint16		reserved;
+	/* followed by a varatt_external (copied in via memcpy for alignment) */
+} JsonbToastedDatum;
+
+#define JBE_TOASTED_ORIG_STRING		0
+#define JBE_TOASTED_ORIG_NUMERIC	1
+#define JBE_TOASTED_ORIG_CONTAINER	2
+
+#define JSONB_TOASTED_DATUM_SIZE	(offsetof(JsonbToastedDatum, reserved) + sizeof(uint16) + 18)
 
 /* Support functions */
 extern uint32 getJsonbOffset(const JsonbContainer *jc, int index);

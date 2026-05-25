@@ -1,0 +1,39 @@
+--
+-- W2.1: cold-payload descriptor (JENTRY_ISTOASTED) materialization.
+-- Producer jsonb_make_toasted (regress.c) emits a descriptor-bearing jsonb
+-- through the stock structural writer (jbvToasted -> convertJsonbScalar), with
+-- the payload stored as an ordinary TOAST value.  Materialization is lazy, in
+-- fillJsonbValue, and the descriptor is invisible at the SQL jsonb level.
+--
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+\set regresslib :libdir '/regress' :dlsuffix
+CREATE FUNCTION jsonb_make_toasted(jsonb, text, oid)
+    RETURNS jsonb AS :'regresslib','jsonb_make_toasted' LANGUAGE C STRICT;
+SET jsonb_sort_field_values = on;
+CREATE TABLE doc (jb jsonb);
+ALTER TABLE doc ALTER COLUMN jb SET STORAGE EXTERNAL;
+INSERT INTO doc SELECT jsonb_build_object(
+  'key1', 123,
+  'key2', (SELECT string_agg(md5(g::text),'') FROM generate_series(1,200) g),
+  'key3', 456,
+  'key4', (SELECT string_agg(md5((g+9)::text),'') FROM generate_series(1,200) g));
+-- Split out both large payloads; verify logical equivalence to stock.
+WITH s AS (SELECT jb AS orig FROM doc),
+     t AS (SELECT jsonb_make_toasted(jsonb_make_toasted(jb,'key2','doc'::regclass),
+                                     'key4','doc'::regclass) AS split FROM doc)
+SELECT
+  (SELECT md5(orig::text) FROM s) = (SELECT md5(split::text) FROM t) AS whole_equal,
+  (SELECT split->'key1' FROM t) AS k1,
+  (SELECT split->'key3' FROM t) AS k3,
+  (SELECT md5(split->>'key2') = (SELECT md5(orig->>'key2') FROM s) FROM t) AS k2_eq,
+  (SELECT md5(split->>'key4') = (SELECT md5(orig->>'key4') FROM s) FROM t) AS k4_eq,
+  (SELECT array_agg(k ORDER BY o) FROM
+     (SELECT row_number() OVER () o, jsonb_object_keys(split) k FROM t) z) AS key_order;
+ whole_equal | k1  | k3  | k2_eq | k4_eq |       key_order       
+-------------+-----+-----+-------+-------+-----------------------
+ t           | 123 | 456 | t     | t     | {key1,key2,key3,key4}
+(1 row)
+
+DROP TABLE doc;
+DROP FUNCTION jsonb_make_toasted(jsonb, text, oid);

@@ -107,7 +107,7 @@ test: select_views portals_p2 foreign_key dependency guc bitmapops combocid tsea
 # ----------
 # Another group of parallel tests (JSON related)
 # ----------
-test: json jsonb json_encoding jsonpath jsonpath_encoding jsonb_jsonpath jsonb_kvmap jsonb_bounded sqljson sqljson_queryfuncs sqljson_jsontable
+test: json jsonb json_encoding jsonpath jsonpath_encoding jsonb_jsonpath jsonb_kvmap jsonb_bounded jsonb_warm_get jsonb_toasted_desc sqljson sqljson_queryfuncs sqljson_jsontable
 
 # ----------
 # Another group of parallel tests
