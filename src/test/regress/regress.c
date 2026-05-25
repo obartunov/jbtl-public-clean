@@ -1710,7 +1710,7 @@ jsonb_make_toasted(PG_FUNCTION_ARGS)
 		switch (tok)
 		{
 			case WJB_BEGIN_OBJECT:
-				pushJsonbValue(&pstate, WJB_BEGIN_OBJECT, &v);
+				pushJsonbValue(&pstate, WJB_BEGIN_OBJECT, NULL);
 				break;
 			case WJB_END_OBJECT:
 				pushJsonbValue(&pstate, WJB_END_OBJECT, NULL);

@@ -574,7 +574,32 @@ typedef struct JsonbToastedDatum
 
 #define JSONB_TOASTED_DATUM_SIZE	(offsetof(JsonbToastedDatum, reserved) + sizeof(uint16) + 18)
 
+/*
+ * W2.2 toast-time split policy floor.
+ *
+ * A top-level scalar value is treated as cold payload (moved out of line as an
+ * ordinary TOAST value, replaced by a JENTRY_ISTOASTED descriptor) only when
+ * its body is at least this many bytes.  This sits comfortably above ordinary
+ * warm metadata (ids, flags, short labels, timestamps) and far above the inline
+ * descriptor cost (JSONB_TOASTED_DATUM_SIZE), so small fields stay warm in the
+ * parent.  v1 policy floor, deliberately not a GUC.
+ */
+#define JSONB_TOAST_SPLIT_VALUE_MIN		256
+
 /* Support functions */
+struct RelationData;			/* avoid pulling utils/rel.h into this header */
+
+/*
+ * W2.2 toast-time split (create only).  Move each large top-level scalar
+ * payload of a KVMap-bearing jsonb object out of line as an ordinary TOAST
+ * value, returning a compact parent that keeps warm values inline and a
+ * JENTRY_ISTOASTED descriptor in place of each moved value.  Returns the
+ * original datum unchanged (and *did_split = false) when nothing is eligible.
+ */
+extern Datum jsonb_toast_split_datum(struct RelationData *rel, Datum value,
+									 Size value_min, uint32 options,
+									 bool *did_split);
+
 extern uint32 getJsonbOffset(const JsonbContainer *jc, int index);
 extern uint32 getJsonbLength(const JsonbContainer *jc, int index);
 extern int	compareJsonbContainers(JsonbContainer *a, JsonbContainer *b);

@@ -32,7 +32,9 @@
 #include "access/toast_hook.h"
 #include "access/toast_internals.h"
 #include "access/toasterapi.h"
+#include "catalog/pg_type.h"
 #include "utils/fmgroids.h"
+#include "utils/jsonb.h"
 
 
 /* ----------
@@ -248,6 +250,55 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	hoff = MAXALIGN(hoff);
 	/* now convert to a limit on the tuple data size */
 	maxDataLen = RelationGetToastTupleTarget(rel, TOAST_TUPLE_TARGET) - hoff;
+
+	/* ----------
+	 * W2.2 jsonb cold-payload pre-pass (create only).
+	 *
+	 * Before the ordinary compress/externalize loop, give each large jsonb
+	 * attribute a chance to move its large top-level scalar payload values out
+	 * of line as ordinary TOAST values, leaving a small parent (warm values +
+	 * JENTRY_ISTOASTED descriptors).  This runs here -- after toast_tuple_init
+	 * (which zeroes ttc_flags and records tai_size / colflags) but before any
+	 * compression or externalization -- so the split sees the raw jsonb
+	 * structure and so the loop below sees the already-small parent and need
+	 * not externalize it as a whole.
+	 *
+	 * We touch only attributes that would be toasted anyway (tai_size >
+	 * maxDataLen); the split is otherwise a no-op.  When a value is replaced we
+	 * must refresh tai_size (find_biggest_attribute reads it) and raise
+	 * TOAST_NEEDS_CHANGE ourselves, since the loop may now leave the small
+	 * parent untouched and the tuple is rebuilt from toast_values[] only when
+	 * that flag is set.
+	 * ----------
+	 */
+	if (oldtup == NULL && rel->rd_rel->reltoastrelid != InvalidOid)
+	{
+		int			i;
+
+		for (i = 0; i < numAttrs; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+			bool		did_split;
+			Datum		newval;
+
+			if ((toast_attr[i].tai_colflags & TOASTCOL_IGNORE) != 0)
+				continue;		/* NULL / PLAIN / non-varlena / reused */
+			if (att->attlen != -1 || att->atttypid != JSONBOID)
+				continue;
+			if (toast_attr[i].tai_size <= maxDataLen)
+				continue;		/* would not be toasted; nothing to gain */
+
+			newval = jsonb_toast_split_datum(rel, toast_values[i],
+											 JSONB_TOAST_SPLIT_VALUE_MIN,
+											 options, &did_split);
+			if (did_split)
+			{
+				toast_values[i] = newval;
+				toast_attr[i].tai_size = VARSIZE_ANY(DatumGetPointer(newval));
+				ttc.ttc_flags |= TOAST_NEEDS_CHANGE;
+			}
+		}
+	}
 
 	/*
 	 * Look for attributes with attstorage EXTENDED to compress.  Also find

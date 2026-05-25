@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/toast_internals.h"
 
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
@@ -27,6 +28,7 @@
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/varlena.h"
 
 /*
@@ -284,6 +286,16 @@ compareJsonbContainers(JsonbContainer *a, JsonbContainer *b)
 						break;
 					case jbvDatetime:
 						elog(ERROR, "unexpected jbvDatetime value");
+						break;
+					case jbvToasted:
+						/*
+						 * Unreachable: JENTRY_ISTOASTED fields are materialized
+						 * to their original scalar/binary value in fillJsonbValue
+						 * before the iterator hands them to comparison.  Guarded
+						 * defensively so a stray producer-only value can never
+						 * silently mis-sort.
+						 */
+						elog(ERROR, "unexpected jbvToasted value");
 						break;
 				}
 			}
@@ -920,11 +932,11 @@ pushJsonbValueScalar(JsonbInState *pstate, JsonbIteratorToken seq,
 			appendKey(pstate, scalarVal, true);
 			break;
 		case WJB_VALUE:
-			Assert(IsAJsonbScalar(scalarVal));
+			Assert(IsAJsonbScalar(scalarVal) || scalarVal->type == jbvToasted);
 			appendValue(pstate, scalarVal, true);
 			break;
 		case WJB_ELEM:
-			Assert(IsAJsonbScalar(scalarVal));
+			Assert(IsAJsonbScalar(scalarVal) || scalarVal->type == jbvToasted);
 			appendElement(pstate, scalarVal, true);
 			break;
 		case WJB_END_OBJECT:
@@ -2841,4 +2853,129 @@ jsonb_kvmap_debug(PG_FUNCTION_ARGS)
 
 	pushJsonbValue(&out, WJB_END_OBJECT, NULL);
 	PG_RETURN_POINTER(JsonbValueToJsonb(out.result));
+}
+
+/*
+ * jsonb_toast_split_datum
+ *
+ * W2.2 toast-time split (create only).  Given a jsonb attribute value that is
+ * large enough to be toasted, move each large top-level scalar payload out of
+ * line as an ordinary TOAST value and return a compact parent that keeps the
+ * small (warm) values inline and a JENTRY_ISTOASTED descriptor in place of each
+ * moved value.
+ *
+ * The parent is rebuilt through the stock structural writer (pushJsonbValue /
+ * JsonbValueToJsonb); the moved value is emitted as a jbvToasted scalar, so
+ * alignment, JEntry stride and KVMap placement all follow stock rules with no
+ * byte surgery.  This is the same producer path proven by W2.1; the only change
+ * is that the split decision is now driven by value size at toast time rather
+ * than by an explicit key argument.
+ *
+ * Eligibility (anything else returns the original datum unchanged):
+ *   - the value's root is a top-level object carrying a KVMap;
+ *   - only top-level *scalar* (string / numeric) values are considered, and
+ *     only when their body is at least value_min bytes.  Nested containers and
+ *     small metadata pass through untouched (no nested paths -- a W2.2 non-goal).
+ *
+ * The input is fully detoasted (external assembled, decompressed) via
+ * DatumGetJsonbP before its structure is inspected, so a compressed/external
+ * incoming datum is split on its raw form.
+ *
+ * Create only: no old-parent inspection, no descriptor reuse.  *did_split is
+ * set true iff at least one value was moved out of line.
+ */
+Datum
+jsonb_toast_split_datum(Relation rel, Datum value, Size value_min,
+						uint32 options, bool *did_split)
+{
+	Jsonb	   *jb;
+	JsonbIterator *it;
+	JsonbValue	v;
+	JsonbIteratorToken tok;
+	JsonbInState pstate = {0};
+	bool		split_any = false;
+
+	*did_split = false;
+
+	/* Need a toast relation to move payload into. */
+	if (!OidIsValid(rel->rd_rel->reltoastrelid))
+		return value;
+
+	/* Detoast fully so we inspect raw jsonb structure (handles compressed). */
+	jb = DatumGetJsonbP(value);
+
+	/* Only top-level objects that carry a KVMap are eligible. */
+	if (!JB_ROOT_IS_OBJECT(jb) || !JsonContainerHasKVMap(&jb->root))
+		return value;
+
+	/*
+	 * skipNested = true: each top-level value arrives as a single JsonbValue
+	 * (scalar, or jbvBinary for a nested container).  We therefore only ever
+	 * see direct children of the root object -- "top-level only" holds by
+	 * construction, with no depth bookkeeping.
+	 */
+	it = JsonbIteratorInit(&jb->root);
+	while ((tok = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
+	{
+		switch (tok)
+		{
+			case WJB_BEGIN_OBJECT:
+				pushJsonbValue(&pstate, WJB_BEGIN_OBJECT, NULL);
+				break;
+			case WJB_END_OBJECT:
+				pushJsonbValue(&pstate, WJB_END_OBJECT, NULL);
+				break;
+			case WJB_KEY:
+				pushJsonbValue(&pstate, WJB_KEY, &v);
+				break;
+			case WJB_VALUE:
+				{
+					bool		splitthis = false;
+
+					/* Only large top-level scalar payloads are moved out. */
+					if (v.type == jbvString)
+						splitthis = ((Size) v.val.string.len >= value_min);
+					else if (v.type == jbvNumeric)
+						splitthis = ((Size) VARSIZE(v.val.numeric) >= value_min);
+
+					if (splitthis)
+					{
+						Jsonb	   *child = JsonbValueToJsonb(&v);
+						Datum		toasted = toast_save_datum(rel,
+															   PointerGetDatum(child),
+															   NULL, options);
+						struct varlena *tptr = (struct varlena *) DatumGetPointer(toasted);
+						char	   *descbuf;
+						JsonbValue	tv;
+
+						if (!VARATT_IS_EXTERNAL_ONDISK(tptr))
+							elog(ERROR, "jsonb_toast_split_datum: expected on-disk pointer");
+
+						descbuf = palloc0(JSONB_TOASTED_DATUM_SIZE);
+						((JsonbToastedDatum *) descbuf)->orig_jbe_type =
+							(v.type == jbvNumeric) ? JBE_TOASTED_ORIG_NUMERIC :
+							JBE_TOASTED_ORIG_STRING;
+						memcpy(descbuf + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+							   VARDATA_EXTERNAL(tptr), sizeof(struct varatt_external));
+
+						tv.type = jbvToasted;
+						tv.val.toasted.data = descbuf;
+						tv.val.toasted.len = JSONB_TOASTED_DATUM_SIZE;
+						pushJsonbValue(&pstate, WJB_VALUE, &tv);
+						split_any = true;
+					}
+					else
+						pushJsonbValue(&pstate, WJB_VALUE, &v);
+					break;
+				}
+			default:
+				elog(ERROR, "jsonb_toast_split_datum: unexpected token %d", tok);
+		}
+	}
+
+	if (!split_any)
+		return value;			/* nothing moved; keep original datum */
+
+	*did_split = true;
+	return PointerGetDatum(JsonbValueToJsonb(pstate.result));
 }
