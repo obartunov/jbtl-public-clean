@@ -488,6 +488,39 @@ JsonbPGetDatum(const Jsonb *p)
 #define PG_GETARG_JSONB_P_COPY(x)	DatumGetJsonbPCopy(PG_GETARG_DATUM(x))
 #define PG_RETURN_JSONB_P(x)	PG_RETURN_POINTER(x)
 
+/*
+ * Bounded object-field lookup (read-amplification path).
+ *
+ * getKeyJsonValueFromContainerBounded() resolves a single object-field lookup
+ * using only the first `available_len` bytes of a (possibly truncated) jsonb
+ * container, e.g. a TOAST prefix slice.  It never dereferences bytes at or
+ * beyond available_len, and never treats a truncated container as complete.
+ *
+ * Pass JSONB_AVAIL_UNBOUNDED when the whole container is present; in that mode
+ * all bound checks are skipped and the result is always FOUND or NOT_FOUND
+ * (COLD / NEED_MORE cannot occur).  This is the single KVMap-aware object-field
+ * reader; getKeyJsonValueFromContainer() is a thin unbounded wrapper over it.
+ */
+#define JSONB_AVAIL_UNBOUNDED	((Size) -1)
+
+typedef enum JsonbBoundedLookupStatus
+{
+	JSONB_BLOOKUP_FOUND,		/* key found; value body within available_len */
+	JSONB_BLOOKUP_COLD,			/* key found; value body beyond available_len */
+	JSONB_BLOOKUP_NOT_FOUND,	/* key absent; valid using available bytes */
+	JSONB_BLOOKUP_NEED_MORE		/* available_len too small to decide safely */
+} JsonbBoundedLookupStatus;
+
+typedef struct JsonbBoundedLookupResult
+{
+	uint32		cold_offset;	/* iff COLD: RAW slot offset from container start;
+								 * body of alignment-sensitive types starts at
+								 * INTALIGN(cold_offset).  [cold_offset, +cold_len)
+								 * is a safe fetch envelope. */
+	uint32		cold_len;		/* iff COLD: value body length */
+	Size		required_len;	/* iff NEED_MORE: bytes needed at container to proceed */
+} JsonbBoundedLookupResult;
+
 /* Support functions */
 extern uint32 getJsonbOffset(const JsonbContainer *jc, int index);
 extern uint32 getJsonbLength(const JsonbContainer *jc, int index);
@@ -498,6 +531,11 @@ extern JsonbValue *findJsonbValueFromContainer(JsonbContainer *container,
 extern JsonbValue *getKeyJsonValueFromContainer(JsonbContainer *container,
 												const char *keyVal, int keyLen,
 												JsonbValue *res);
+extern JsonbBoundedLookupStatus getKeyJsonValueFromContainerBounded(const JsonbContainer *container,
+												Size available_len,
+												const char *keyVal, int keyLen,
+												JsonbValue *res,
+												JsonbBoundedLookupResult *meta);
 extern JsonbValue *getIthJsonbValueFromContainer(JsonbContainer *container,
 												 uint32 i);
 extern void pushJsonbValue(JsonbInState *pstate,

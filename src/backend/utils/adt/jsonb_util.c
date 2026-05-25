@@ -412,35 +412,82 @@ findJsonbValueFromContainer(JsonbContainer *container, uint32 flags,
  *
  * 'res' can be passed in as NULL, in which case it's newly palloc'ed here.
  */
-JsonbValue *
-getKeyJsonValueFromContainer(JsonbContainer *container,
-							 const char *keyVal, int keyLen, JsonbValue *res)
+JsonbBoundedLookupStatus
+getKeyJsonValueFromContainerBounded(const JsonbContainer *container,
+									Size available_len,
+									const char *keyVal, int keyLen,
+									JsonbValue *res,
+									JsonbBoundedLookupResult *meta)
 {
-	JEntry	   *children = container->children;
-	int			count = JsonContainerSize(container);
+	JsonbContainer *cont = unconstify(JsonbContainer *, container);
+	JEntry	   *children = cont->children;
+	int			count;
 	char	   *baseAddr;
-	bool		has_kvmap = JsonContainerHasKVMap(container);
+	bool		has_kvmap;
+	int			kvmap_entry_size;
 	JsonbKVMap	kvmap;
+	Size		structural_end;
 	uint32		stopLow,
 				stopHigh;
+	bool		bounded = (available_len != JSONB_AVAIL_UNBOUNDED);
+
+	/* Need at least the container header to learn count/flags. */
+	if (bounded && available_len < offsetof(JsonbContainer, children))
+	{
+		if (meta)
+			meta->required_len = offsetof(JsonbContainer, children);
+		return JSONB_BLOOKUP_NEED_MORE;
+	}
 
 	Assert(JsonContainerIsObject(container));
+	count = JsonContainerSize(container);
 
-	/* Quick out without a palloc cycle if object is empty */
+	/* Empty object: conclusion valid from the header alone. */
 	if (count <= 0)
-		return NULL;
+		return JSONB_BLOOKUP_NOT_FOUND;
+
+	has_kvmap = JsonContainerHasKVMap(container);
+	kvmap_entry_size = has_kvmap ? JSONB_KVMAP_ENTRY_SIZE(count) : 0;
 
 	/*
-	 * Binary search the container.  Since we know this is an object, account
-	 * for *Pairs* of Jentrys, plus the KVMap region if present.
-	 *
-	 * When has_kvmap is false, initKVMap leaves baseAddr at &children[2N]
-	 * and the value index for logical key i is simply i + N (identity
-	 * mapping); when true, baseAddr advances past the KVMap and the value
-	 * index is JSONB_KVMAP_ENTRY(&kvmap, i) + N.
+	 * Bound checks run only for a bounded (sliced) container.  On the unbounded
+	 * hot path we add no offset walks at all: structural_end stays 0 and the
+	 * NEED_MORE staircase is skipped, so the cost matches the original lookup
+	 * (getJsonbOffset(count) in particular is NOT computed when unbounded).
 	 */
+	structural_end = 0;
+	if (bounded)
+	{
+		Size		key_area_end;
+
+		/* header + 2N JEntries + optional INTALIGN'd KVMap (JEntries only) */
+		structural_end = offsetof(JsonbContainer, children) +
+			(Size) count * 2 * sizeof(JEntry) +
+			(has_kvmap ? INTALIGN((Size) count * kvmap_entry_size) : 0);
+		if (available_len < structural_end)
+		{
+			if (meta)
+				meta->required_len = structural_end;
+			return JSONB_BLOOKUP_NEED_MORE;
+		}
+
+		/*
+		 * Keys occupy [structural_end, structural_end + key_area_len).  The
+		 * binary search may probe any key, so the whole key area must be present
+		 * before comparing key bytes or concluding NOT_FOUND.
+		 */
+		key_area_end = structural_end + getJsonbOffset(container, count);
+		if (available_len < key_area_end)
+		{
+			if (meta)
+				meta->required_len = key_area_end;
+			return JSONB_BLOOKUP_NEED_MORE;
+		}
+	}
+
 	baseAddr = initKVMap(&kvmap, (char *) (children + count * 2),
 						 count, has_kvmap);
+
 	stopLow = 0;
 	stopHigh = count;
 	while (stopLow < stopHigh)
@@ -460,17 +507,40 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
 
 		if (difference == 0)
 		{
-			/* Found our key, return corresponding value */
+			/* Found our key; resolve the corresponding value's physical slot. */
 			int			index = JSONB_KVMAP_ENTRY(&kvmap, stopMiddle) + count;
+			uint32		val_off = getJsonbOffset(container, index);
+			uint32		val_len = getJsonbLength(container, index);
 
-			if (!res)
-				res = palloc_object(JsonbValue);
+			/*
+			 * A value is COLD only if it has body bytes that fall outside the
+			 * slice.  val_len is the JEntry-derived body length, so the COLD
+			 * decision needs no value bytes at all.  Zero-length bodies (null,
+			 * bool, empty string) read nothing and are therefore always
+			 * resolvable once the metadata (keys/KVMap) is available -- hence the
+			 * val_len > 0 guard (D3).
+			 *
+			 * cold_offset is the RAW slot offset from the container start (D4).
+			 * For alignment-sensitive types (numeric, nested container) the
+			 * actual body begins at INTALIGN(slot_offset); the returned
+			 * [cold_offset, cold_offset + cold_len) range is a safe fetch
+			 * envelope (it includes any leading alignment padding).  No separate
+			 * aligned_offset is exposed: the intended COLD action is a full
+			 * detoast fallback, for which the envelope is sufficient.
+			 */
+			if (bounded && val_len > 0 &&
+				available_len < structural_end + val_off + val_len)
+			{
+				if (meta)
+				{
+					meta->cold_offset = (uint32) structural_end + val_off;
+					meta->cold_len = val_len;
+				}
+				return JSONB_BLOOKUP_COLD;
+			}
 
-			fillJsonbValue(container, index, baseAddr,
-						   getJsonbOffset(container, index),
-						   res);
-
-			return res;
+			fillJsonbValue(cont, index, baseAddr, val_off, res);
+			return JSONB_BLOOKUP_FOUND;
 		}
 		else
 		{
@@ -481,7 +551,33 @@ getKeyJsonValueFromContainer(JsonbContainer *container,
 		}
 	}
 
-	/* Not found */
+	return JSONB_BLOOKUP_NOT_FOUND;
+}
+
+/*
+ * Find value by key in Jsonb object and fetch it into 'res', which is also
+ * returned.
+ *
+ * 'res' can be passed in as NULL, in which case it's newly palloc'ed here.
+ *
+ * Thin unbounded wrapper over getKeyJsonValueFromContainerBounded(): the whole
+ * container is present, so the result is FOUND or NOT_FOUND only.
+ */
+JsonbValue *
+getKeyJsonValueFromContainer(JsonbContainer *container,
+							 const char *keyVal, int keyLen, JsonbValue *res)
+{
+	JsonbValue *target = res ? res : palloc_object(JsonbValue);
+	JsonbBoundedLookupStatus st;
+
+	st = getKeyJsonValueFromContainerBounded(container, JSONB_AVAIL_UNBOUNDED,
+											 keyVal, keyLen, target, NULL);
+
+	if (st == JSONB_BLOOKUP_FOUND)
+		return target;
+
+	if (!res)
+		pfree(target);
 	return NULL;
 }
 
