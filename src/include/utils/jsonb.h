@@ -13,6 +13,7 @@
 #define __JSONB_H__
 
 #include "lib/stringinfo.h"
+#include "nodes/pg_list.h"
 #include "utils/array.h"
 #include "utils/numeric.h"
 
@@ -206,7 +207,14 @@ typedef struct JsonbContainer
 } JsonbContainer;
 
 /* flags for the header-field in JsonbContainer */
-#define JB_CMASK				0x0FFFFFFF	/* mask for count field */
+#define JB_CMASK				0x07FFFFFF	/* mask for count field */
+#define JB_FHAS_TOASTED			0x08000000	/* W2.3a: container has >=1
+											 * JENTRY_ISTOASTED top-level entry.
+											 * Reserved from the high bit of the
+											 * former 0x0FFFFFFF count field; the
+											 * remaining 27-bit count (max
+											 * 134217727 entries) is far above any
+											 * practical jsonb container. */
 #define JB_FSCALAR				0x10000000	/* flag bits */
 #define JB_FOBJECT				0x20000000
 #define JB_FARRAY				0x40000000
@@ -234,6 +242,7 @@ typedef struct JsonbContainer
 
 /* convenience macros for accessing a JsonbContainer struct */
 #define JsonContainerSize(jc)		((jc)->header & JB_CMASK)
+#define JsonContainerHasToasted(jc)	(((jc)->header & JB_FHAS_TOASTED) != 0)
 #define JsonContainerIsScalar(jc)	(((jc)->header & JB_FSCALAR) != 0)
 #define JsonContainerIsObject(jc)	(((jc)->header & JB_FOBJECT) != 0)
 #define JsonContainerIsArray(jc)	(((jc)->header & JB_FARRAY) != 0)
@@ -286,6 +295,7 @@ typedef struct
 
 /* convenience macros for accessing the root container in a Jsonb datum */
 #define JB_ROOT_COUNT(jbp_)		(*(uint32 *) VARDATA(jbp_) & JB_CMASK)
+#define JB_ROOT_HAS_TOASTED(jbp_) ((*(uint32 *) VARDATA(jbp_) & JB_FHAS_TOASTED) != 0)
 #define JB_ROOT_IS_SCALAR(jbp_) ((*(uint32 *) VARDATA(jbp_) & JB_FSCALAR) != 0)
 #define JB_ROOT_IS_OBJECT(jbp_) ((*(uint32 *) VARDATA(jbp_) & JB_FOBJECT) != 0)
 #define JB_ROOT_IS_ARRAY(jbp_)	((*(uint32 *) VARDATA(jbp_) & JB_FARRAY) != 0)
@@ -599,6 +609,15 @@ struct RelationData;			/* avoid pulling utils/rel.h into this header */
 extern Datum jsonb_toast_split_datum(struct RelationData *rel, Datum value,
 									 Size value_min, uint32 options,
 									 bool *did_split);
+
+/*
+ * W2.3a delete-lifecycle walker.  jsonb_datum_has_toasted is the cheap delete
+ * gate (top-level JEntry scan, no detoast/materialization).
+ * jsonb_collect_external_refs returns, by value, an on-disk EXTERNAL varlena for
+ * every nested cold-payload descriptor, suitable for stock toast_delete_datum.
+ */
+extern bool jsonb_datum_has_toasted(Datum jsonbval);
+extern List *jsonb_collect_external_refs(Datum jsonbval);
 
 extern uint32 getJsonbOffset(const JsonbContainer *jc, int index);
 extern uint32 getJsonbLength(const JsonbContainer *jc, int index);

@@ -2264,6 +2264,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 	int			reserved_size;
 	int			kvmap_entry_size = 0;
 	bool		sorted_values = jsonb_sort_field_values && nPairs > 1;
+	bool		object_has_toasted = false;
 	struct
 	{
 		int			size;
@@ -2310,13 +2311,34 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 	padBufferToInt(buffer);
 
 	/*
+	 * W2.3a: record in the container header whether any value is a cold-payload
+	 * descriptor (jbvToasted -> JENTRY_ISTOASTED).  This lets the delete-side
+	 * gate detect split parents in O(1) without scanning JEntries.  Checked
+	 * over the logical pairs here, before values are serialized.
+	 */
+	{
+		bool		has_toasted = false;
+
+		for (i = 0; i < nPairs; i++)
+		{
+			if (val->val.object.pairs[i].value.type == jbvToasted)
+			{
+				has_toasted = true;
+				break;
+			}
+		}
+		object_has_toasted = has_toasted;
+	}
+
+	/*
 	 * Construct the header Jentry and store it in the beginning of the
 	 * variable-length payload.  Set JB_FOBJECT_KVMAP iff we are about
 	 * to emit a KVMap; the JB_FOBJECT bit is preserved unconditionally
 	 * so existing readers that only check JB_FOBJECT keep working.
 	 */
 	containerheader = nPairs | JB_FOBJECT |
-		(sorted_values ? JB_FOBJECT_KVMAP : 0);
+		(sorted_values ? JB_FOBJECT_KVMAP : 0) |
+		(object_has_toasted ? JB_FHAS_TOASTED : 0);
 	appendToBuffer(buffer, &containerheader, sizeof(uint32));
 
 	/*
@@ -2978,4 +3000,131 @@ jsonb_toast_split_datum(Relation rel, Datum value, Size value_min,
 
 	*did_split = true;
 	return PointerGetDatum(JsonbValueToJsonb(pstate.result));
+}
+
+/*
+ * jsonb_container_has_toasted
+ *
+ * O(1) predicate: does this jsonb root container carry the JB_FHAS_TOASTED
+ * flag, i.e. did the split producer emit at least one JENTRY_ISTOASTED
+ * descriptor among its top-level entries?  The flag is set in convertJsonbObject
+ * when any value is jbvToasted, so the delete gate need not scan JEntries.
+ *
+ * Design note (W2.3a): the flag occupies the high bit of the former count field
+ * (JB_CMASK narrowed 0x0FFFFFFF -> 0x07FFFFFF).  The remaining 27-bit count
+ * (max 134217727 entries per container) is far above any practical jsonb value,
+ * and no reader uses the header outside the JB_CMASK / JsonContainer* macros, so
+ * narrowing the mask is safe.  Existing on-disk jsonb keeps reading correctly:
+ * the reclaimed bit could only have been set by a container with >= 134M
+ * entries, which does not occur in practice.
+ */
+static bool
+jsonb_container_has_toasted(const JsonbContainer *jc)
+{
+	return JsonContainerHasToasted(jc);
+}
+
+/*
+ * jsonb_datum_has_toasted
+ *
+ * Cheap entry point over a raw jsonb Datum: returns true iff the value is a
+ * split form carrying nested cold-payload descriptors.  Does NOT detoast the
+ * datum's own external storage and does NOT materialize any descriptor; it only
+ * reads the root header + top-level JEntries, which are present in the leading
+ * bytes of the value.  Callers on the delete path use this as the gate.
+ */
+bool
+jsonb_datum_has_toasted(Datum jsonbval)
+{
+	Jsonb	   *jb = DatumGetJsonbP(jsonbval);
+	bool		result = jsonb_container_has_toasted(&jb->root);
+
+	/* DatumGetJsonbP may detoast-copy; free if it returned a new chunk. */
+	if ((Pointer) jb != DatumGetPointer(jsonbval))
+		pfree(jb);
+	return result;
+}
+
+/*
+ * jsonb_collect_external_refs
+ *
+ * Walk the top-level JEntries of a split jsonb value and return, by value, the
+ * varatt_external descriptor of every JENTRY_ISTOASTED field -- i.e. every cold
+ * payload that lives out of line as an ordinary TOAST value.  Returns NIL when
+ * the value carries no descriptors.
+ *
+ * The returned pointers are the ordinary on-disk TOAST pointers originally
+ * produced by toast_save_datum in W2.2; each can be handed straight to the
+ * stock toast_delete_datum.  No materialization, no detoast of cold values, no
+ * recursion (W2.2 only toasts top-level scalars).
+ */
+List *
+jsonb_collect_external_refs(Datum jsonbval)
+{
+	Jsonb	   *jb = DatumGetJsonbP(jsonbval);
+	const JsonbContainer *jc;
+	uint32		nentries;
+	uint32		count;
+	char	   *baseAddr;
+	int			i;
+	List	   *result = NIL;
+
+	jc = &jb->root;
+
+	if (JsonContainerIsObject(jc))
+	{
+		count = JsonContainerSize(jc);
+		nentries = 2 * count;
+	}
+	else if (JsonContainerIsArray(jc))
+	{
+		count = JsonContainerSize(jc);
+		nentries = count;
+	}
+	else
+	{
+		if ((Pointer) jb != DatumGetPointer(jsonbval))
+			pfree(jb);
+		return NIL;
+	}
+
+	/*
+	 * Data area start: after the JEntry array, plus the INTALIGN'd KVMap block
+	 * when present (same arithmetic the reader uses in getKeyJsonValue paths).
+	 * Per-entry data offsets then come from the canonical getJsonbOffset(), so
+	 * we never re-derive the stride/HAS_OFF hybrid by hand.
+	 */
+	baseAddr = (char *) (jc->children + nentries);
+	if (JsonContainerIsObject(jc) && (jc->header & JB_FOBJECT_KVMAP))
+		baseAddr += INTALIGN((Size) count * JSONB_KVMAP_ENTRY_SIZE(count));
+
+	for (i = 0; i < (int) nentries; i++)
+	{
+		JEntry		entry = jc->children[i];
+
+		if (JBE_ISTOASTED(entry))
+		{
+			uint32		thisoff = getJsonbOffset(jc, i);
+			const JsonbToastedDatum *desc =
+				(const JsonbToastedDatum *) (baseAddr + INTALIGN(thisoff));
+			struct varlena *fake;
+
+			/*
+			 * Rebuild an on-disk EXTERNAL varlena from the descriptor's stored
+			 * varatt_external so we can hand it to stock toast_delete_datum.
+			 */
+			fake = (struct varlena *)
+				palloc(VARHDRSZ_EXTERNAL + sizeof(struct varatt_external));
+			SET_VARTAG_EXTERNAL(fake, VARTAG_ONDISK);
+			memcpy(VARDATA_EXTERNAL(fake),
+				   (const char *) desc + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+				   sizeof(struct varatt_external));
+
+			result = lappend(result, fake);
+		}
+	}
+
+	if ((Pointer) jb != DatumGetPointer(jsonbval))
+		pfree(jb);
+	return result;
 }

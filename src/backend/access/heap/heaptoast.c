@@ -75,6 +75,72 @@ heap_toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative)
 
 	/* Do the real work. */
 	toast_delete_external(rel, toast_values, toast_isnull, is_speculative);
+
+	/*
+	 * W2.3a: stock toast_delete_external only frees attribute-level external
+	 * datums.  A split jsonb parent is physically inline, so its nested cold
+	 * payload (ordinary TOAST values referenced by JENTRY_ISTOASTED descriptors)
+	 * is invisible to that pass.  Walk each jsonb attribute and delete any nested
+	 * payload here, on the same execution-time path as the stock deletion, using
+	 * the stock toast_delete_datum so MVCC/visibility of the child TOAST values
+	 * follows ordinary rules.
+	 */
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+		List	   *refs;
+		ListCell   *lc;
+
+		if (toast_isnull[i] || att->attlen != -1 || att->atttypid != JSONBOID)
+			continue;
+		if (VARATT_IS_EXTERNAL(DatumGetPointer(toast_values[i])))
+			continue;			/* parent itself external: not a split parent */
+		if (!jsonb_datum_has_toasted(toast_values[i]))
+			continue;
+
+		refs = jsonb_collect_external_refs(toast_values[i]);
+		foreach(lc, refs)
+		{
+			struct varlena *ref = (struct varlena *) lfirst(lc);
+
+			toast_delete_datum(rel, PointerGetDatum(ref), is_speculative);
+			pfree(ref);
+		}
+		list_free(refs);
+	}
+}
+
+/*
+ * HeapTupleHasNestedExternal
+ *
+ * W2.3a delete gate.  Cheap check: deform only varlena jsonb attributes and ask
+ * the jsonb walker's O(top-level) predicate whether any carries nested
+ * descriptors.  Returns false fast for the common (non-split) case.
+ */
+bool
+HeapTupleHasNestedExternal(Relation rel, HeapTuple tup)
+{
+	TupleDesc	tupleDesc = rel->rd_att;
+	int			numAttrs = tupleDesc->natts;
+
+	for (int i = 0; i < numAttrs; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+		Datum		val;
+		bool		isnull;
+
+		if (att->attlen != -1 || att->atttypid != JSONBOID)
+			continue;
+
+		val = heap_getattr(tup, i + 1, tupleDesc, &isnull);
+		if (isnull)
+			continue;
+		if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
+			continue;			/* external parent is not a split parent */
+		if (jsonb_datum_has_toasted(val))
+			return true;
+	}
+	return false;
 }
 
 /*

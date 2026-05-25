@@ -107,6 +107,17 @@ extern void heap_toast_delete(Relation rel, HeapTuple oldtup,
 							  bool is_speculative);
 
 /* ----------
+ * HeapTupleHasNestedExternal -
+ *
+ *	W2.3a delete gate: true if the tuple carries a jsonb attribute whose inline
+ *	value embeds nested cold-payload descriptors (JENTRY_ISTOASTED).  Such a
+ *	parent is physically inline, so HeapTupleHasExternal() is false and the
+ *	stock toast delete path would otherwise be skipped, orphaning the children.
+ * ----------
+ */
+extern bool HeapTupleHasNestedExternal(Relation rel, HeapTuple tup);
+
+/* ----------
  * toast_flatten_tuple -
  *
  *	"Flatten" a tuple to contain no out-of-line toasted fields.

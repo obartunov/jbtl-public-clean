@@ -3114,7 +3114,8 @@ l1:
 		/* toast table entries should never be recursively toasted */
 		Assert(!HeapTupleHasExternal(&tp));
 	}
-	else if (HeapTupleHasExternal(&tp))
+	else if (HeapTupleHasExternal(&tp) ||
+			 HeapTupleHasNestedExternal(relation, &tp))
 		heap_toast_delete(relation, &tp, false);
 
 	/*
@@ -6266,7 +6267,8 @@ heap_abort_speculative(Relation relation, const ItemPointerData *tid)
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-	if (HeapTupleHasExternal(&tp))
+	if (HeapTupleHasExternal(&tp) ||
+		HeapTupleHasNestedExternal(relation, &tp))
 	{
 		Assert(!IsToastRelation(relation));
 		heap_toast_delete(relation, &tp, true);
