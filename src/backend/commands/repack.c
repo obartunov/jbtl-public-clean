@@ -34,6 +34,7 @@
 
 #include "access/amapi.h"
 #include "access/heapam.h"
+#include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -650,6 +651,15 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	 */
 	if (!concurrent)
 		TransferPredicateLocksToHeapRelation(OldHeap);
+
+	/*
+	 * W2.3b safe refusal: heap rewrite renumbers TOAST chunks without firing a
+	 * toast callback for inline split-jsonb parents, which would dangle their
+	 * nested descriptors.  Refuse on live split rows (OldHeap is already under
+	 * AccessExclusiveLock here).  Skip for toast relations themselves.
+	 */
+	if (OldHeap->rd_rel->relkind != RELKIND_TOASTVALUE)
+		heap_check_no_split_jsonb_for_rewrite(OldHeap);
 
 	/* rebuild_relation does all the dirty work */
 	PG_TRY();

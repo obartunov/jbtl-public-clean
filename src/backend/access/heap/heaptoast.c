@@ -28,12 +28,15 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
+#include "access/tableam.h"
 #include "access/toast_helper.h"
 #include "access/toast_hook.h"
 #include "access/toast_internals.h"
 #include "access/toasterapi.h"
 #include "catalog/pg_type.h"
+#include "executor/tuptable.h"
 #include "utils/fmgroids.h"
+#include "utils/snapmgr.h"
 #include "utils/jsonb.h"
 
 
@@ -141,6 +144,185 @@ HeapTupleHasNestedExternal(Relation rel, HeapTuple tup)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * heap_toast_update_nested_cleanup
+ *
+ * W2.3b ordinary-UPDATE nested lifecycle.  Called from the UPDATE path of
+ * heap_toast_insert_or_update (oldtup != NULL), after the new tuple is formed
+ * and while both old and new attribute values are visible in the ttc.
+ *
+ * For each jsonb attribute that carries split cold payload (JB_FHAS_TOASTED) in
+ * the old and/or new value, compute the nested external refs of each side and
+ * delete (old \ new) by va_valueid through the stock toast_delete_datum.  This
+ * is exactly the lifecycle the stock attribute-level path performs for changed
+ * external datums (toast_helper.c TOASTCOL_NEEDS_DELETE_OLD), but for our inline
+ * split parent the stock path does not see the nested descriptors, so we do it
+ * here on the same execution-time path with the same stock deletion primitive.
+ *
+ * MVCC: toast_delete_datum uses simple_heap_delete, an MVCC delete (sets xmax);
+ * the old child chunks remain visible to any snapshot that can still see the old
+ * heap version and are physically reclaimed by ordinary toast-rel autovacuum
+ * once no snapshot needs them.  Rollback restores them with the old heap row.
+ *
+ * old \ new only: refs present on both sides (reuse, same valueid) are kept;
+ * refs new-only are freshly created payload and kept.  No reuse is *created*
+ * here -- without W2.4 the new producer emits fresh valueids, so in practice
+ * the intersection is empty and all old children are deleted, which is the
+ * correct no-orphan behaviour.
+ */
+static void
+heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
+{
+	Relation	rel = ttc->ttc_rel;
+	TupleDesc	tupleDesc = rel->rd_att;
+	int			numAttrs = tupleDesc->natts;
+
+	/* UPDATE only: caller guarantees ttc_oldvalues != NULL */
+	for (int i = 0; i < numAttrs; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+		Datum		oldval,
+					newval;
+		List	   *old_refs,
+				   *new_refs;
+		ListCell   *lc;
+
+		if (att->attlen != -1 || att->atttypid != JSONBOID)
+			continue;
+		if (ttc->ttc_oldisnull[i])
+			continue;
+
+		oldval = ttc->ttc_oldvalues[i];
+		if (VARATT_IS_EXTERNAL(DatumGetPointer(oldval)))
+			continue;			/* external parent is not a split parent */
+		if (!jsonb_datum_has_toasted(oldval))
+			continue;			/* old side carries no nested cold payload */
+
+		old_refs = jsonb_collect_external_refs(oldval);
+
+		/*
+		 * Collect new-side refs only when the new value is a non-null,
+		 * non-external split parent; otherwise new_refs stays NIL and every old
+		 * ref is deleted (covers metadata UPDATE with fresh valueids, payload
+		 * replace, and split -> non-split fallback).
+		 */
+		new_refs = NIL;
+		if (!ttc->ttc_isnull[i])
+		{
+			newval = ttc->ttc_values[i];
+			if (!VARATT_IS_EXTERNAL(DatumGetPointer(newval)) &&
+				jsonb_datum_has_toasted(newval))
+				new_refs = jsonb_collect_external_refs(newval);
+		}
+
+		/* Delete old \ new, comparing by va_valueid within this toast rel. */
+		foreach(lc, old_refs)
+		{
+			struct varlena *oref = (struct varlena *) lfirst(lc);
+			struct varatt_external oext;
+			bool		kept = false;
+			ListCell   *lc2;
+
+			VARATT_EXTERNAL_GET_POINTER(oext, oref);
+
+			foreach(lc2, new_refs)
+			{
+				struct varlena *nref = (struct varlena *) lfirst(lc2);
+				struct varatt_external next;
+
+				VARATT_EXTERNAL_GET_POINTER(next, nref);
+				if (next.va_valueid == oext.va_valueid &&
+					next.va_toastrelid == oext.va_toastrelid)
+				{
+					kept = true;	/* reused: present on both sides */
+					break;
+				}
+			}
+
+			if (!kept)
+				toast_delete_datum(rel, PointerGetDatum(oref), false);
+			pfree(oref);
+		}
+		list_free(old_refs);
+
+		foreach(lc, new_refs)
+			pfree(lfirst(lc));
+		list_free(new_refs);
+	}
+}
+
+/*
+ * heap_check_no_split_jsonb_for_rewrite
+ *
+ * See header comment.  Implementation: a plain MVCC table scan of live rows.
+ * On the first row whose jsonb attribute carries JB_FHAS_TOASTED, raise.  The
+ * caller (cluster_rel, before rebuild_relation) already holds
+ * AccessExclusiveLock, so no new split row can slip in between this check and
+ * the rewrite.
+ */
+void
+heap_check_no_split_jsonb_for_rewrite(Relation rel)
+{
+	TupleDesc	tupleDesc = RelationGetDescr(rel);
+	bool		has_jsonb = false;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	Snapshot	snapshot;
+
+	/* Fast out: nothing to do unless the relation actually has a jsonb column. */
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+
+		if (att->attlen == -1 && att->atttypid == JSONBOID)
+		{
+			has_jsonb = true;
+			break;
+		}
+	}
+	if (!has_jsonb)
+		return;
+
+	snapshot = GetActiveSnapshot();
+	slot = table_slot_create(rel, NULL);
+	scan = table_beginscan(rel, snapshot, 0, NULL, 0);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		for (int i = 0; i < tupleDesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+			Datum		val;
+			bool		isnull;
+
+			if (att->attlen != -1 || att->atttypid != JSONBOID)
+				continue;
+
+			val = slot_getattr(slot, i + 1, &isnull);
+			if (isnull)
+				continue;
+			if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
+				continue;
+			if (jsonb_datum_has_toasted(val))
+			{
+				/* Clean up scan state before erroring. */
+				table_endscan(scan);
+				ExecDropSingleTupleTableSlot(slot);
+				ereport(ERROR,
+						errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cannot rewrite table \"%s\" containing split jsonb values",
+							   RelationGetRelationName(rel)),
+						errdetail("Heap rewrite (VACUUM FULL / CLUSTER / REPACK) would renumber TOAST chunks without updating the nested descriptors embedded in inline split jsonb parents, orphaning the cold payload."),
+						errhint("Normalize the affected rows out of split form first, e.g.: SET jsonb_sort_field_values = off; UPDATE \"%s\" SET <col> = <col>::text::jsonb; then retry.",
+							   RelationGetRelationName(rel)));
+			}
+		}
+	}
+
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
 }
 
 /*
@@ -519,6 +701,15 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	}
 	else
 		result_tuple = newtup;
+
+	/*
+	 * W2.3b: on UPDATE, delete nested cold payload that the old split parent
+	 * referenced but the new one does not (old \ new).  Stock cleanup below
+	 * only handles attribute-level external; our inline split parent needs this
+	 * nested pass.  UPDATE only -- oldtup carries the prior values.
+	 */
+	if (oldtup != NULL)
+		heap_toast_update_nested_cleanup(&ttc);
 
 	toast_tuple_cleanup(&ttc);
 
