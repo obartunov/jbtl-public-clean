@@ -315,8 +315,7 @@ heap_check_no_split_jsonb_for_rewrite(Relation rel)
 						errmsg("cannot rewrite table \"%s\" containing split jsonb values",
 							   RelationGetRelationName(rel)),
 						errdetail("Heap rewrite (VACUUM FULL / CLUSTER / REPACK) would renumber TOAST chunks without updating the nested descriptors embedded in inline split jsonb parents, orphaning the cold payload."),
-						errhint("Normalize the affected rows out of split form first, e.g.: SET jsonb_sort_field_values = off; UPDATE \"%s\" SET <col> = <col>::text::jsonb; then retry.",
-							   RelationGetRelationName(rel)));
+						errhint("Rewrite is not supported while the table holds split jsonb rows. Re-store the affected rows so their large top-level values are no longer relocated out of line (set the column STORAGE to PLAIN or MAIN, or reduce the oversized values below the relocation threshold), then retry."));
 			}
 		}
 	}
@@ -519,7 +518,7 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	 * that flag is set.
 	 * ----------
 	 */
-	if (oldtup == NULL && rel->rd_rel->reltoastrelid != InvalidOid)
+	if (rel->rd_rel->reltoastrelid != InvalidOid)
 	{
 		int			i;
 
@@ -528,6 +527,8 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 			Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 			bool		did_split;
 			Datum		newval;
+			Datum		oldval = (Datum) 0;
+			bool		old_isnull = true;
 
 			if ((toast_attr[i].tai_colflags & TOASTCOL_IGNORE) != 0)
 				continue;		/* NULL / PLAIN / non-varlena / reused */
@@ -536,7 +537,16 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 			if (toast_attr[i].tai_size <= maxDataLen)
 				continue;		/* would not be toasted; nothing to gain */
 
+			/* W2.4: on UPDATE, pass the old value so unchanged cold children
+			 * can be reused (key-based, byte-exact) instead of re-saved. */
+			if (oldtup != NULL)
+			{
+				oldval = toast_oldvalues[i];
+				old_isnull = toast_oldisnull[i];
+			}
+
 			newval = jsonb_toast_split_datum(rel, toast_values[i],
+											 oldval, old_isnull,
 											 JSONB_TOAST_SPLIT_VALUE_MIN,
 											 options, &did_split);
 			if (did_split)

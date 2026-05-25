@@ -607,8 +607,27 @@ struct RelationData;			/* avoid pulling utils/rel.h into this header */
  * original datum unchanged (and *did_split = false) when nothing is eligible.
  */
 extern Datum jsonb_toast_split_datum(struct RelationData *rel, Datum value,
+									 Datum oldvalue, bool old_isnull,
 									 Size value_min, uint32 options,
 									 bool *did_split);
+
+/*
+ * W2.4 reuse: key-based lookup of an OLD top-level JENTRY_ISTOASTED descriptor,
+ * without materialization.  Returns true and fills *ext_out on hit.
+ */
+extern bool jsonb_find_old_toasted_ref(const JsonbContainer *container,
+									   const char *keyVal, int keyLen,
+									   struct varatt_external *ext_out);
+
+/*
+ * W2.4 instrumentation counters (developer scaffold; not product telemetry).
+ * Exposed for regression assertions via jsonb_reuse_stats().
+ */
+extern PGDLLIMPORT uint64 jsonb_reuse_attempts;
+extern PGDLLIMPORT uint64 jsonb_reuse_size_mismatch;
+extern PGDLLIMPORT uint64 jsonb_reuse_memcmp_match;
+extern PGDLLIMPORT uint64 jsonb_reuse_memcmp_mismatch;
+extern PGDLLIMPORT uint64 jsonb_reuse_toast_saves;
 
 /*
  * W2.3a delete-lifecycle walker.  jsonb_datum_has_toasted is the cheap delete

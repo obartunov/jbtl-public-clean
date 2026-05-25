@@ -1761,3 +1761,36 @@ jsonb_make_toasted(PG_FUNCTION_ARGS)
 	out = JsonbValueToJsonb(pstate.result);
 	PG_RETURN_JSONB_P(out);
 }
+
+/*
+ * jsonb_reuse_stats(reset bool) -> text
+ *
+ * W2.4 instrumentation read-out for regression tests.  Returns the five reuse
+ * counters as "attempts:size_mismatch:memcmp_match:memcmp_mismatch:toast_saves".
+ * When reset is true, zeroes them after reading (so a test can measure a single
+ * UPDATE in isolation).
+ */
+PG_FUNCTION_INFO_V1(jsonb_reuse_stats);
+Datum
+jsonb_reuse_stats(PG_FUNCTION_ARGS)
+{
+	bool		reset = PG_GETARG_BOOL(0);
+	char		buf[128];
+
+	snprintf(buf, sizeof(buf), UINT64_FORMAT ":" UINT64_FORMAT ":" UINT64_FORMAT
+			 ":" UINT64_FORMAT ":" UINT64_FORMAT,
+			 jsonb_reuse_attempts, jsonb_reuse_size_mismatch,
+			 jsonb_reuse_memcmp_match, jsonb_reuse_memcmp_mismatch,
+			 jsonb_reuse_toast_saves);
+
+	if (reset)
+	{
+		jsonb_reuse_attempts = 0;
+		jsonb_reuse_size_mismatch = 0;
+		jsonb_reuse_memcmp_match = 0;
+		jsonb_reuse_memcmp_mismatch = 0;
+		jsonb_reuse_toast_saves = 0;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf));
+}

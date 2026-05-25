@@ -73,6 +73,13 @@ static int	int_pair_size_cmp(const void *a, const void *b);
  */
 bool		jsonb_sort_field_values = false;
 
+/* W2.4 reuse instrumentation (developer scaffold; see jsonb_reuse_stats()). */
+uint64		jsonb_reuse_attempts = 0;
+uint64		jsonb_reuse_size_mismatch = 0;
+uint64		jsonb_reuse_memcmp_match = 0;
+uint64		jsonb_reuse_memcmp_mismatch = 0;
+uint64		jsonb_reuse_toast_saves = 0;
+
 static JsonbIterator *iteratorFromContainer(JsonbContainer *container, JsonbIterator *parent);
 static JsonbIterator *freeAndGetParent(JsonbIterator *it);
 static JsonbParseState *pushState(JsonbInState *pstate);
@@ -2888,13 +2895,14 @@ jsonb_kvmap_debug(PG_FUNCTION_ARGS)
  *
  * The parent is rebuilt through the stock structural writer (pushJsonbValue /
  * JsonbValueToJsonb); the moved value is emitted as a jbvToasted scalar, so
- * alignment, JEntry stride and KVMap placement all follow stock rules with no
- * byte surgery.  This is the same producer path proven by W2.1; the only change
- * is that the split decision is now driven by value size at toast time rather
- * than by an explicit key argument.
+ * alignment and JEntry stride follow stock rules with no byte surgery.  This is
+ * the same producer path proven by W2.1; the only change is that the split
+ * decision is now driven by value size at toast time rather than by an explicit
+ * key argument.  W2.x operates on stock jsonb layout only -- no KVMap, no value
+ * sorting, no jsonb_sort_field_values dependency.
  *
  * Eligibility (anything else returns the original datum unchanged):
- *   - the value's root is a top-level object carrying a KVMap;
+ *   - the value's root is a top-level object (stock layout; KVMap not required);
  *   - only top-level *scalar* (string / numeric) values are considered, and
  *     only when their body is at least value_min bytes.  Nested containers and
  *     small metadata pass through untouched (no nested paths -- a W2.2 non-goal).
@@ -2907,15 +2915,20 @@ jsonb_kvmap_debug(PG_FUNCTION_ARGS)
  * set true iff at least one value was moved out of line.
  */
 Datum
-jsonb_toast_split_datum(Relation rel, Datum value, Size value_min,
+jsonb_toast_split_datum(Relation rel, Datum value, Datum oldvalue,
+						bool old_isnull, Size value_min,
 						uint32 options, bool *did_split)
 {
 	Jsonb	   *jb;
+	Jsonb	   *oldjb = NULL;
+	JsonbContainer *oldroot = NULL;
 	JsonbIterator *it;
 	JsonbValue	v;
 	JsonbIteratorToken tok;
 	JsonbInState pstate = {0};
 	bool		split_any = false;
+	const char *curkey = NULL;	/* W2.4: key of the value currently emitted */
+	int			curkeylen = 0;
 
 	*did_split = false;
 
@@ -2926,9 +2939,22 @@ jsonb_toast_split_datum(Relation rel, Datum value, Size value_min,
 	/* Detoast fully so we inspect raw jsonb structure (handles compressed). */
 	jb = DatumGetJsonbP(value);
 
-	/* Only top-level objects that carry a KVMap are eligible. */
-	if (!JB_ROOT_IS_OBJECT(jb) || !JsonContainerHasKVMap(&jb->root))
+	/* Eligible: any top-level jsonb object (stock layout; no KVMap dependency). */
+	if (!JB_ROOT_IS_OBJECT(jb))
 		return value;
+
+	/*
+	 * W2.4 reuse: on UPDATE, the old value lets us preserve unchanged cold
+	 * children.  Detoast the old parent (it is inline/small) so we can read its
+	 * descriptors by key without materializing the cold payload.  Reuse is only
+	 * attempted when the old value is itself a split object.
+	 */
+	if (!old_isnull && DatumGetPointer(oldvalue) != (Pointer) 0)
+	{
+		oldjb = DatumGetJsonbP(oldvalue);
+		if (JB_ROOT_IS_OBJECT(oldjb) && JB_ROOT_HAS_TOASTED(oldjb))
+			oldroot = &oldjb->root;
+	}
 
 	/*
 	 * skipNested = true: each top-level value arrives as a single JsonbValue
@@ -2948,6 +2974,8 @@ jsonb_toast_split_datum(Relation rel, Datum value, Size value_min,
 				pushJsonbValue(&pstate, WJB_END_OBJECT, NULL);
 				break;
 			case WJB_KEY:
+				curkey = v.val.string.val;
+				curkeylen = v.val.string.len;
 				pushJsonbValue(&pstate, WJB_KEY, &v);
 				break;
 			case WJB_VALUE:
@@ -2963,22 +2991,86 @@ jsonb_toast_split_datum(Relation rel, Datum value, Size value_min,
 					if (splitthis)
 					{
 						Jsonb	   *child = JsonbValueToJsonb(&v);
-						Datum		toasted = toast_save_datum(rel,
-															   PointerGetDatum(child),
-															   NULL, options);
-						struct varlena *tptr = (struct varlena *) DatumGetPointer(toasted);
+						struct varatt_external old_ext;
+						bool		reused = false;
 						char	   *descbuf;
 						JsonbValue	tv;
+						struct varatt_external new_ext;
 
-						if (!VARATT_IS_EXTERNAL_ONDISK(tptr))
-							elog(ERROR, "jsonb_toast_split_datum: expected on-disk pointer");
+						/*
+						 * W2.4 reuse: if the old object had this same key as a
+						 * JENTRY_ISTOASTED child, and the new child is byte-exact
+						 * equal to the old cold payload, reuse the old valueid
+						 * instead of writing a fresh TOAST value.  Comparison is
+						 * key-based and byte-exact (no false positive); a cheap
+						 * size pre-check avoids the detoast when clearly changed.
+						 */
+						if (oldroot != NULL && curkey != NULL)
+						{
+							jsonb_reuse_attempts++;
+							if (jsonb_find_old_toasted_ref(oldroot, curkey,
+														   curkeylen, &old_ext))
+							{
+								if (old_ext.va_rawsize != (int32) VARSIZE(child))
+								{
+									jsonb_reuse_size_mismatch++;
+								}
+								else
+								{
+									struct varlena *oldref;
+									struct varlena *oldfull;
+
+									/* Reconstruct an on-disk ref to detoast old. */
+									oldref = (struct varlena *)
+										palloc(VARHDRSZ_EXTERNAL +
+											   sizeof(struct varatt_external));
+									SET_VARTAG_EXTERNAL(oldref, VARTAG_ONDISK);
+									memcpy(VARDATA_EXTERNAL(oldref), &old_ext,
+										   sizeof(struct varatt_external));
+									oldfull = detoast_external_attr(oldref);
+
+									if (VARSIZE(oldfull) == VARSIZE(child) &&
+										memcmp(oldfull, child, VARSIZE(child)) == 0)
+									{
+										jsonb_reuse_memcmp_match++;
+										reused = true;
+									}
+									else
+										jsonb_reuse_memcmp_mismatch++;
+
+									pfree(oldref);
+									if ((Pointer) oldfull != (Pointer) NULL)
+										pfree(oldfull);
+								}
+							}
+						}
+
+						if (reused)
+						{
+							/* Reuse old descriptor verbatim (same valueid). */
+							memcpy(&new_ext, &old_ext, sizeof(struct varatt_external));
+						}
+						else
+						{
+							Datum		toasted = toast_save_datum(rel,
+																   PointerGetDatum(child),
+																   NULL, options);
+							struct varlena *tptr =
+								(struct varlena *) DatumGetPointer(toasted);
+
+							jsonb_reuse_toast_saves++;
+							if (!VARATT_IS_EXTERNAL_ONDISK(tptr))
+								elog(ERROR, "jsonb_toast_split_datum: expected on-disk pointer");
+							memcpy(&new_ext, VARDATA_EXTERNAL(tptr),
+								   sizeof(struct varatt_external));
+						}
 
 						descbuf = palloc0(JSONB_TOASTED_DATUM_SIZE);
 						((JsonbToastedDatum *) descbuf)->orig_jbe_type =
 							(v.type == jbvNumeric) ? JBE_TOASTED_ORIG_NUMERIC :
 							JBE_TOASTED_ORIG_STRING;
 						memcpy(descbuf + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
-							   VARDATA_EXTERNAL(tptr), sizeof(struct varatt_external));
+							   &new_ext, sizeof(struct varatt_external));
 
 						tv.type = jbvToasted;
 						tv.val.toasted.data = descbuf;
@@ -3089,14 +3181,11 @@ jsonb_collect_external_refs(Datum jsonbval)
 	}
 
 	/*
-	 * Data area start: after the JEntry array, plus the INTALIGN'd KVMap block
-	 * when present (same arithmetic the reader uses in getKeyJsonValue paths).
-	 * Per-entry data offsets then come from the canonical getJsonbOffset(), so
-	 * we never re-derive the stride/HAS_OFF hybrid by hand.
+	 * Data area starts directly after the JEntry array (stock jsonb layout;
+	 * no KVMap block).  Per-entry data offsets come from the canonical
+	 * getJsonbOffset(), so we never re-derive the stride/HAS_OFF hybrid by hand.
 	 */
 	baseAddr = (char *) (jc->children + nentries);
-	if (JsonContainerIsObject(jc) && (jc->header & JB_FOBJECT_KVMAP))
-		baseAddr += INTALIGN((Size) count * JSONB_KVMAP_ENTRY_SIZE(count));
 
 	for (i = 0; i < (int) nentries; i++)
 	{
@@ -3127,4 +3216,81 @@ jsonb_collect_external_refs(Datum jsonbval)
 	if ((Pointer) jb != DatumGetPointer(jsonbval))
 		pfree(jb);
 	return result;
+}
+
+/*
+ * jsonb_find_old_toasted_ref
+ *
+ * W2.4 reuse helper.  Key-based lookup in an OLD jsonb root container: if key
+ * [keyVal,keyLen) exists and its value is a JENTRY_ISTOASTED descriptor, copy
+ * the embedded on-disk varatt_external into *ext_out and return true.  Does NOT
+ * materialize (no detoast): only the descriptor bytes are read.  Reuse must be
+ * key-based, so the value slot is resolved through the KVMap exactly as the
+ * stock reader does, never by ordinal position.
+ *
+ * Returns false if the container is not a top-level object, the key is absent,
+ * or the value for that key is not JENTRY_ISTOASTED.
+ */
+bool
+jsonb_find_old_toasted_ref(const JsonbContainer *container,
+						   const char *keyVal, int keyLen,
+						   struct varatt_external *ext_out)
+{
+	JsonbContainer *cont = unconstify(JsonbContainer *, container);
+	JEntry	   *children = cont->children;
+	int			count;
+	char	   *baseAddr;
+	uint32		stopLow,
+				stopHigh;
+
+	if (!JsonContainerIsObject(container))
+		return false;
+	count = JsonContainerSize(container);
+	if (count <= 0)
+		return false;
+
+	/*
+	 * Stock jsonb object layout: keys occupy JEntry slots [0..count-1], values
+	 * slots [count..2*count-1]; the value for key i lives at slot i + count.
+	 * Data follows the 2N JEntries directly.  No KVMap, no value reordering --
+	 * W2.x operates on stock layout only.
+	 */
+	baseAddr = (char *) (children + count * 2);
+
+	stopLow = 0;
+	stopHigh = count;
+	while (stopLow < stopHigh)
+	{
+		uint32		stopMiddle = stopLow + (stopHigh - stopLow) / 2;
+		const char *candidateVal = baseAddr + getJsonbOffset(container, stopMiddle);
+		int			candidateLen = getJsonbLength(container, stopMiddle);
+		int			difference = lengthCompareJsonbString(candidateVal, candidateLen,
+														  keyVal, keyLen);
+
+		if (difference == 0)
+		{
+			int			index = stopMiddle + count;
+			JEntry		ventry = children[index];
+
+			if (!JBE_ISTOASTED(ventry))
+				return false;	/* key found but value is not toasted */
+
+			{
+				uint32		val_off = getJsonbOffset(container, index);
+				const JsonbToastedDatum *desc =
+					(const JsonbToastedDatum *) (baseAddr + INTALIGN(val_off));
+
+				memcpy(ext_out,
+					   (const char *) desc +
+					   offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+					   sizeof(struct varatt_external));
+				return true;
+			}
+		}
+		else if (difference < 0)
+			stopLow = stopMiddle + 1;
+		else
+			stopHigh = stopMiddle;
+	}
+	return false;
 }
