@@ -616,7 +616,8 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 		Assert(!HeapTupleHasExternal(tup));
 		heaptup = tup;
 	}
-	else if (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD)
+	else if (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD ||
+			 HeapTupleHasNestedExternal(state->rs_new_rel, tup))
 	{
 		uint32		options = HEAP_INSERT_SKIP_FSM;
 

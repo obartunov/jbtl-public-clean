@@ -62,13 +62,25 @@ jsonb_lifecycle_toast_or_split(Datum value, Datum old_value,
  * update_or_reuse and copy_or_relocate are reserved for later milestones
  * (update parity / rewrite relocation).
  */
+static Datum
+jsonb_lifecycle_copy_or_relocate(Datum value, const TypeLifecycleContext *ctx)
+{
+	/*
+	 * Physical descriptor-walking relocation into the new toast relation
+	 * (ctx->rel).  No JsonbIterator on cold values; raw compressed fetch +
+	 * save with oldexternal so rd_toastoid reuse avoids decompress/recompress.
+	 * Returns the original Datum unchanged when nothing needed relocating.
+	 */
+	return jsonb_rewrite_relocate_split(ctx->rel, value);
+}
+
 static const TypeLifecycleRoutine jsonb_lifecycle_routine =
 {
 	.has_external_refs = jsonb_lifecycle_has_external_refs,
 	.collect_external_refs = jsonb_lifecycle_collect_external_refs,
 	.toast_or_split = jsonb_lifecycle_toast_or_split,
 	.update_or_reuse = NULL,
-	.copy_or_relocate = NULL,
+	.copy_or_relocate = jsonb_lifecycle_copy_or_relocate,
 };
 
 /*

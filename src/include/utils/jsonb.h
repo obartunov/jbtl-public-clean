@@ -647,6 +647,7 @@ extern PGDLLIMPORT uint64 jsonb_cold_materializations;
  * every nested cold-payload descriptor, suitable for stock toast_delete_datum.
  */
 extern void jsonb_register_lifecycle_routine(void);
+extern Datum jsonb_rewrite_relocate_split(struct RelationData *rel, Datum value);
 extern bool jsonb_datum_has_toasted(Datum jsonbval);
 extern List *jsonb_collect_external_refs(Datum jsonbval);
 

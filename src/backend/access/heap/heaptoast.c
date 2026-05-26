@@ -565,6 +565,35 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 			if (routine == NULL || routine->toast_or_split == NULL)
 				continue;
 
+			/*
+			 * Rewrite relocation: a value that is ALREADY split (small inline
+			 * parent whose cold refs point at the old toast relation) must have
+			 * those refs relocated into the new toast relation, regardless of
+			 * size.  Detect by has_external_refs on a non-external parent and
+			 * dispatch to copy_or_relocate (physical, no logical detoast).  The
+			 * ordinary producer below only fires for not-yet-split values.
+			 */
+			if (routine->copy_or_relocate != NULL &&
+				routine->has_external_refs != NULL &&
+				!VARATT_IS_EXTERNAL(DatumGetPointer(toast_values[i])) &&
+				routine->has_external_refs(toast_values[i]))
+			{
+				Datum		relocated;
+
+				lctx.rel = rel;
+				lctx.attnum = i + 1;
+				lctx.options = options;
+				lctx.max_inline_size = maxDataLen;
+				relocated = routine->copy_or_relocate(toast_values[i], &lctx);
+				if (DatumGetPointer(relocated) != DatumGetPointer(toast_values[i]))
+				{
+					toast_values[i] = relocated;
+					toast_attr[i].tai_size = VARSIZE_ANY(DatumGetPointer(relocated));
+					ttc.ttc_flags |= TOAST_NEEDS_CHANGE;
+				}
+				continue;		/* relocated; not a create-time split */
+			}
+
 			if (toast_attr[i].tai_size <= maxDataLen)
 				continue;		/* would not be toasted; nothing to gain */
 

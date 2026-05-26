@@ -3379,3 +3379,102 @@ jsonb_find_old_toasted_ref(const JsonbContainer *container,
 	}
 	return false;
 }
+
+/*
+ * jsonb_rewrite_relocate_split
+ *		Physical rewrite-time relocation of an inline-stock split jsonb parent
+ *		into a new toast relation (M1.3; mechanism proven by the W3 P5 spike).
+ *
+ * Used as the jsonb copy_or_relocate lifecycle callback during a heap rewrite
+ * (VACUUM FULL / non-concurrent CLUSTER) when the new heap reuses the old toast
+ * relation by content (rd_toastoid set).  The split parent is a small inline
+ * varlena whose cold children are JENTRY_ISTOASTED descriptors pointing at the
+ * old toast relation; the stock rewrite gate would skip it (small, not
+ * external), dangling those refs.
+ *
+ * This walks the top-level object value descriptors DIRECTLY (no JsonbIterator,
+ * so cold children are never materialized / decompressed), and for each cold
+ * descriptor: extracts the embedded varatt_external, fetches the RAW compressed
+ * payload (detoast_external_attr assembles chunks without decompressing),
+ * re-saves it into the new toast relation (toast_save_datum with oldexternal so
+ * rd_toastoid reuse preserves the value id and writes the bytes as-is, no
+ * recompress), and overwrites the descriptor's varatt_external in place.
+ *
+ * Returns a rewritten parent value, or the original Datum unchanged if no
+ * relocation was needed (so callers can detect a no-op by pointer identity).
+ */
+Datum
+jsonb_rewrite_relocate_split(Relation rel, Datum value)
+{
+	Jsonb	   *jb = DatumGetJsonbP(value);
+	JsonbContainer *jc;
+	int			count;
+	char	   *base;
+	Jsonb	   *newjb;
+	bool		any = false;
+
+	if (!JsonContainerHasToasted(&jb->root) || !JsonContainerIsObject(&jb->root))
+		return value;
+
+	/* work on a writable copy */
+	newjb = (Jsonb *) palloc(VARSIZE(jb));
+	memcpy(newjb, jb, VARSIZE(jb));
+	jc = &newjb->root;
+	count = JsonContainerSize(jc);
+	/* STOCK object: keys [0..count-1], values [count..2count-1] */
+	base = (char *) jc->children + (2 * count) * sizeof(JEntry);
+
+	for (int i = count; i < 2 * count; i++)
+	{
+		JEntry		je = jc->children[i];
+		uint32		off;
+		char	   *desc_addr;
+		struct varlena *oldref;
+		struct varlena *raw;
+		struct varatt_external old_ext;
+		Datum		toasted;
+		struct varlena *tptr;
+
+		if (!JBE_ISTOASTED(je))
+			continue;
+
+		/* descriptor lives at INTALIGN(offset) past the data area */
+		off = getJsonbOffset(jc, i);
+		desc_addr = base + INTALIGN(off);
+
+		/* pull the embedded on-disk pointer out of the descriptor */
+		memcpy(&old_ext,
+			   desc_addr + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+			   sizeof(struct varatt_external));
+
+		/* reconstruct an on-disk TOAST reference to the OLD payload */
+		oldref = (struct varlena *) palloc(VARHDRSZ_EXTERNAL + sizeof(struct varatt_external));
+		SET_VARTAG_EXTERNAL(oldref, VARTAG_ONDISK);
+		memcpy(VARDATA_EXTERNAL(oldref), &old_ext, sizeof(struct varatt_external));
+
+		/* assemble raw (still-compressed) payload; no decompress */
+		raw = detoast_external_attr(oldref);
+
+		/*
+		 * Save raw payload into the new toast relation.  oldref as oldexternal
+		 * lets toast_save_datum reuse the value id via rd_toastoid and write the
+		 * compressed bytes unchanged (no recompress).
+		 */
+		toasted = toast_save_datum(rel, PointerGetDatum(raw), oldref, 0);
+		tptr = (struct varlena *) DatumGetPointer(toasted);
+		if (!VARATT_IS_EXTERNAL_ONDISK(tptr))
+			elog(ERROR, "jsonb_rewrite_relocate_split: expected on-disk pointer");
+
+		/* overwrite the descriptor's varatt_external in place with the new ref */
+		memcpy(desc_addr + offsetof(JsonbToastedDatum, reserved) + sizeof(uint16),
+			   VARDATA_EXTERNAL(tptr), sizeof(struct varatt_external));
+		any = true;
+	}
+
+	if (!any)
+	{
+		pfree(newjb);
+		return value;
+	}
+	return PointerGetDatum(newjb);
+}

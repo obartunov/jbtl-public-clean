@@ -653,12 +653,16 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 		TransferPredicateLocksToHeapRelation(OldHeap);
 
 	/*
-	 * W2.3b safe refusal: heap rewrite renumbers TOAST chunks without firing a
-	 * toast callback for inline split parents, which would dangle their nested
-	 * descriptors.  Refuse on live split rows (OldHeap is already under
-	 * AccessExclusiveLock here).  Skip toast relations themselves.
+	 * Split values (type-owned external refs in an inline parent) need their
+	 * cold payload relocated into the new toast relation during rewrite.
+	 * Non-concurrent rewrite swaps the toast relation by content (rd_toastoid),
+	 * so copy_or_relocate (driven from heap_toast_insert_or_update) handles
+	 * them and no refusal is needed.  The concurrent / by-links path does not
+	 * set rd_toastoid and the proven relocate mechanism does not apply there,
+	 * so refuse explicitly rather than risk orphaning cold payload.  Skip toast
+	 * relations themselves.
 	 */
-	if (OldHeap->rd_rel->relkind != RELKIND_TOASTVALUE)
+	if (concurrent && OldHeap->rd_rel->relkind != RELKIND_TOASTVALUE)
 		heap_check_no_split_values_for_rewrite(OldHeap);
 
 	/* rebuild_relation does all the dirty work */
