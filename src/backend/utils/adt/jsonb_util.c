@@ -84,6 +84,15 @@ bool		jsonb_sort_field_values = false;
  */
 static bool jsonb_force_stock_layout = false;
 
+/*
+ * R0 instrumentation (developer scaffold; not product telemetry).  Counts how
+ * many times a cold (relocated, JENTRY_ISTOASTED) child value is actually
+ * materialized via materializeToastedValue().  A warm-key read path that never
+ * touches cold payload leaves this counter unchanged; a cold-key / full-scan
+ * path increments it.  Read/reset via jsonb_cold_materializations() in regress.
+ */
+uint64		jsonb_cold_materializations = 0;
+
 /* W2.4 reuse instrumentation (developer scaffold; see jsonb_reuse_stats()). */
 uint64		jsonb_reuse_attempts = 0;
 uint64		jsonb_reuse_size_mismatch = 0;
@@ -694,6 +703,7 @@ materializeToastedValue(const char *desc_addr, JsonbValue *result)
 	 */
 	/* detoast_attr handles external fetch AND decompression (external_attr does
 	 * not decompress). */
+	jsonb_cold_materializations++;
 	reconstructed = detoast_attr((struct varlena *) ref);
 	child = (Jsonb *) reconstructed;
 
@@ -1188,6 +1198,21 @@ JsonbIteratorInit(JsonbContainer *container)
 }
 
 /*
+ * Like JsonbIteratorInit, but opts into lazy-toasted mode: cold
+ * JENTRY_ISTOASTED values are returned as jbvToasted descriptors without
+ * detoasting.  For consumers that do not read values (e.g. jsonb_object_keys).
+ * Child iterators created during recursion inherit the flag.
+ */
+JsonbIterator *
+JsonbIteratorInitLazy(JsonbContainer *container, bool lazyToasted)
+{
+	JsonbIterator *it = iteratorFromContainer(container, NULL);
+
+	it->lazyToasted = lazyToasted;
+	return it;
+}
+
+/*
  * Get next JsonbValue while iterating
  *
  * Caller should initially pass their own, original iterator.  They may get
@@ -1370,9 +1395,25 @@ recurse:
 				else
 					value_offset = (*it)->curValueOffset;
 
-				fillJsonbValue((*it)->container, value_index,
-							   (*it)->dataProper, value_offset,
-							   val);
+				/*
+				 * W2.x lazy mode: for a cold JENTRY_ISTOASTED value, hand back
+				 * the descriptor as jbvToasted WITHOUT detoasting.  Only when the
+				 * caller opted in (jsonb_object_keys); default path materializes
+				 * below as usual.  This is the read-avoidance optimization, not a
+				 * change to default iterator semantics.
+				 */
+				if ((*it)->lazyToasted &&
+					JBE_ISTOASTED((*it)->children[value_index]))
+				{
+					val->type = jbvToasted;
+					val->val.toasted.len = JSONB_TOASTED_DATUM_SIZE;
+					val->val.toasted.data =
+						(*it)->dataProper + INTALIGN(value_offset);
+				}
+				else
+					fillJsonbValue((*it)->container, value_index,
+								   (*it)->dataProper, value_offset,
+								   val);
 
 				JBE_ADVANCE_OFFSET((*it)->curDataOffset,
 								   (*it)->children[(*it)->curIndex]);
@@ -1384,9 +1425,11 @@ recurse:
 				/*
 				 * Value may be a container, in which case we recurse with new,
 				 * child iterator (unless the caller asked not to, by passing
-				 * skipNested).
+				 * skipNested).  A lazy jbvToasted descriptor is never a container
+				 * and must never be recursed into, regardless of skipNested.
 				 */
-				if (!IsAJsonbScalar(val) && !skipNested)
+				if (val->type != jbvToasted &&
+					!IsAJsonbScalar(val) && !skipNested)
 				{
 					*it = iteratorFromContainer(val->val.binary.data, *it);
 					goto recurse;
@@ -1413,6 +1456,7 @@ iteratorFromContainer(JsonbContainer *container, JsonbIterator *parent)
 	it = palloc0_object(JsonbIterator);
 	it->container = container;
 	it->parent = parent;
+	it->lazyToasted = (parent != NULL) ? parent->lazyToasted : false;
 	it->nElems = JsonContainerSize(container);
 
 	/* Array starts just after header */
@@ -2545,6 +2589,15 @@ convertJsonbScalar(StringInfo buffer, JEntry *header, JsonbValue *scalarVal)
 
 		case jbvToasted:
 			/* cold-payload descriptor: INTALIGN like numeric, then bytes */
+			/*
+			 * A jbvToasted here is either a producer-built relocation descriptor
+			 * or a lazy descriptor handed back by the lazy iterator; both carry
+			 * the on-disk descriptor bytes and are serialized back as
+			 * JENTRY_ISTOASTED (relocation preserved, same valueid).  Guard
+			 * against a malformed/empty descriptor escaping here in debug builds.
+			 */
+			Assert(scalarVal->val.toasted.data != NULL &&
+				   scalarVal->val.toasted.len == JSONB_TOASTED_DATUM_SIZE);
 			padlen = padBufferToInt(buffer);
 			appendToBuffer(buffer, scalarVal->val.toasted.data,
 						   scalarVal->val.toasted.len);

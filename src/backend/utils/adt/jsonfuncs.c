@@ -604,7 +604,12 @@ jsonb_object_keys(PG_FUNCTION_ARGS)
 		state->sent_count = 0;
 		state->result = palloc_array(char *, state->result_size);
 
-		it = JsonbIteratorInit(&jb->root);
+		/*
+		 * W2.x lazy mode: jsonb_object_keys reads only keys, never values, so
+		 * cold JENTRY_ISTOASTED payload must not be detoasted during traversal.
+		 * Opt into lazy-toasted iteration (the sole v0 consumer of this mode).
+		 */
+		it = JsonbIteratorInitLazy(&jb->root, true);
 
 		while ((r = JsonbIteratorNext(&it, &v, skipNested)) != WJB_DONE)
 		{

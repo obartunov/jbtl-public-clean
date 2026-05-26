@@ -493,6 +493,16 @@ typedef struct JsonbIterator
 	/* Private state */
 	JsonbIterState state;
 
+	/*
+	 * W2.x lazy mode (opt-in via JsonbIteratorInitLazy).  When true, a cold
+	 * JENTRY_ISTOASTED value is returned as a jbvToasted descriptor WITHOUT
+	 * detoasting, for consumers that do not read values (e.g. jsonb_object_keys).
+	 * Default false: the iterator materializes cold payload exactly as before.
+	 * This is a read-avoidance optimization, NOT a change to the default jsonb
+	 * iterator contract.  Inherited by child iterators on recursion.
+	 */
+	bool		lazyToasted;
+
 	struct JsonbIterator *parent;
 } JsonbIterator;
 
@@ -628,6 +638,7 @@ extern PGDLLIMPORT uint64 jsonb_reuse_size_mismatch;
 extern PGDLLIMPORT uint64 jsonb_reuse_memcmp_match;
 extern PGDLLIMPORT uint64 jsonb_reuse_memcmp_mismatch;
 extern PGDLLIMPORT uint64 jsonb_reuse_toast_saves;
+extern PGDLLIMPORT uint64 jsonb_cold_materializations;
 
 /*
  * W2.3a delete-lifecycle walker.  jsonb_datum_has_toasted is the cheap delete
@@ -657,6 +668,8 @@ extern JsonbValue *getIthJsonbValueFromContainer(JsonbContainer *container,
 extern void pushJsonbValue(JsonbInState *pstate,
 						   JsonbIteratorToken seq, JsonbValue *jbval);
 extern JsonbIterator *JsonbIteratorInit(JsonbContainer *container);
+extern JsonbIterator *JsonbIteratorInitLazy(JsonbContainer *container,
+											bool lazyToasted);
 extern JsonbIteratorToken JsonbIteratorNext(JsonbIterator **it, JsonbValue *val,
 											bool skipNested);
 extern void JsonbToJsonbValue(Jsonb *jsonb, JsonbValue *val);

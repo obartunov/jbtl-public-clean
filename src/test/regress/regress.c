@@ -1794,3 +1794,19 @@ jsonb_reuse_stats(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf));
 }
+
+/*
+ * jsonb_cold_materializations(reset bool) -> int8
+ * R0 read-path proof: number of cold (relocated) child materializations so far.
+ */
+PG_FUNCTION_INFO_V1(jsonb_cold_mat_count);
+Datum
+jsonb_cold_mat_count(PG_FUNCTION_ARGS)
+{
+	bool		reset = PG_GETARG_BOOL(0);
+	uint64		v = jsonb_cold_materializations;
+
+	if (reset)
+		jsonb_cold_materializations = 0;
+	PG_RETURN_INT64((int64) v);
+}
