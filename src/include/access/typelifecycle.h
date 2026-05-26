@@ -69,6 +69,12 @@ typedef struct TypeLifecycleRoutine
 	/*
 	 * Create the split representation if needed (toast-time create).  May
 	 * ignore old_value.
+	 *
+	 * CONTRACT: when nothing is split, return the input value unchanged (same
+	 * pointer); when split, return a new value.  Generic code detects whether
+	 * a split happened by pointer identity (result != input), not by an
+	 * out-param.  A routine that rebuilds an identical value on a no-op would
+	 * break this and must not.
 	 */
 	Datum		(*toast_or_split) (Datum value, Datum old_value,
 								   const TypeLifecycleContext *ctx);
