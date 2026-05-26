@@ -37,7 +37,7 @@
 #include "executor/tuptable.h"
 #include "utils/fmgroids.h"
 #include "utils/snapmgr.h"
-#include "utils/jsonb.h"
+#include "access/typelifecycle.h"
 
 
 /* ----------
@@ -81,27 +81,34 @@ heap_toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative)
 
 	/*
 	 * W2.3a: stock toast_delete_external only frees attribute-level external
-	 * datums.  A split jsonb parent is physically inline, so its nested cold
-	 * payload (ordinary TOAST values referenced by JENTRY_ISTOASTED descriptors)
-	 * is invisible to that pass.  Walk each jsonb attribute and delete any nested
-	 * payload here, on the same execution-time path as the stock deletion, using
-	 * the stock toast_delete_datum so MVCC/visibility of the child TOAST values
-	 * follows ordinary rules.
+	 * datums.  A split parent (a value of a type with a registered lifecycle
+	 * routine; currently jsonb) is physically inline, so its nested cold payload
+	 * (ordinary TOAST values referenced by type-owned descriptors) is invisible
+	 * to that pass.  Ask each such attribute's routine for the embedded refs and
+	 * delete them here, on the same execution-time path as the stock deletion,
+	 * using the stock toast_delete_datum so MVCC/visibility of the child TOAST
+	 * values follows ordinary rules.
 	 */
 	for (int i = 0; i < tupleDesc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+		const TypeLifecycleRoutine *routine;
 		List	   *refs;
 		ListCell   *lc;
 
-		if (toast_isnull[i] || att->attlen != -1 || att->atttypid != JSONBOID)
+		if (toast_isnull[i] || att->attlen != -1)
 			continue;
+		routine = lookup_type_lifecycle_routine(att->atttypid);
+		if (routine == NULL || routine->collect_external_refs == NULL)
+			continue;
+		/* generic guard: an external parent is not an inline split parent */
 		if (VARATT_IS_EXTERNAL(DatumGetPointer(toast_values[i])))
-			continue;			/* parent itself external: not a split parent */
-		if (!jsonb_datum_has_toasted(toast_values[i]))
+			continue;
+		if (routine->has_external_refs == NULL ||
+			!routine->has_external_refs(toast_values[i]))
 			continue;
 
-		refs = jsonb_collect_external_refs(toast_values[i]);
+		refs = routine->collect_external_refs(toast_values[i]);
 		foreach(lc, refs)
 		{
 			struct varlena *ref = (struct varlena *) lfirst(lc);
@@ -116,8 +123,9 @@ heap_toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative)
 /*
  * HeapTupleHasNestedExternal
  *
- * W2.3a delete gate.  Cheap check: deform only varlena jsonb attributes and ask
- * the jsonb walker's O(top-level) predicate whether any carries nested
+ * W2.3a delete gate.  Cheap check: deform only varlena attributes of a type
+ * with a registered lifecycle routine (currently jsonb) and ask the routine's
+ * O(top-level) has_external_refs predicate whether any carries nested
  * descriptors.  Returns false fast for the common (non-split) case.
  */
 bool
@@ -131,8 +139,12 @@ HeapTupleHasNestedExternal(Relation rel, HeapTuple tup)
 		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 		Datum		val;
 		bool		isnull;
+		const TypeLifecycleRoutine *routine;
 
-		if (att->attlen != -1 || att->atttypid != JSONBOID)
+		if (att->attlen != -1)
+			continue;
+		routine = lookup_type_lifecycle_routine(att->atttypid);
+		if (routine == NULL || routine->has_external_refs == NULL)
 			continue;
 
 		val = heap_getattr(tup, i + 1, tupleDesc, &isnull);
@@ -140,7 +152,7 @@ HeapTupleHasNestedExternal(Relation rel, HeapTuple tup)
 			continue;
 		if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
 			continue;			/* external parent is not a split parent */
-		if (jsonb_datum_has_toasted(val))
+		if (routine->has_external_refs(val))
 			return true;
 	}
 	return false;
@@ -153,8 +165,9 @@ HeapTupleHasNestedExternal(Relation rel, HeapTuple tup)
  * heap_toast_insert_or_update (oldtup != NULL), after the new tuple is formed
  * and while both old and new attribute values are visible in the ttc.
  *
- * For each jsonb attribute that carries split cold payload (JB_FHAS_TOASTED) in
- * the old and/or new value, compute the nested external refs of each side and
+ * For each lifecycle-managed attribute (currently jsonb) that carries split
+ * cold payload in the old and/or new value, compute the nested external refs
+ * of each side and
  * delete (old \ new) by va_valueid through the stock toast_delete_datum.  This
  * is exactly the lifecycle the stock attribute-level path performs for changed
  * external datums (toast_helper.c TOASTCOL_NEEDS_DELETE_OLD), but for our inline
@@ -188,8 +201,13 @@ heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
 		List	   *old_refs,
 				   *new_refs;
 		ListCell   *lc;
+		const TypeLifecycleRoutine *routine;
 
-		if (att->attlen != -1 || att->atttypid != JSONBOID)
+		if (att->attlen != -1)
+			continue;
+		routine = lookup_type_lifecycle_routine(att->atttypid);
+		if (routine == NULL || routine->collect_external_refs == NULL ||
+			routine->has_external_refs == NULL)
 			continue;
 		if (ttc->ttc_oldisnull[i])
 			continue;
@@ -197,10 +215,10 @@ heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
 		oldval = ttc->ttc_oldvalues[i];
 		if (VARATT_IS_EXTERNAL(DatumGetPointer(oldval)))
 			continue;			/* external parent is not a split parent */
-		if (!jsonb_datum_has_toasted(oldval))
+		if (!routine->has_external_refs(oldval))
 			continue;			/* old side carries no nested cold payload */
 
-		old_refs = jsonb_collect_external_refs(oldval);
+		old_refs = routine->collect_external_refs(oldval);
 
 		/*
 		 * Collect new-side refs only when the new value is a non-null,
@@ -213,8 +231,8 @@ heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
 		{
 			newval = ttc->ttc_values[i];
 			if (!VARATT_IS_EXTERNAL(DatumGetPointer(newval)) &&
-				jsonb_datum_has_toasted(newval))
-				new_refs = jsonb_collect_external_refs(newval);
+				routine->has_external_refs(newval))
+				new_refs = routine->collect_external_refs(newval);
 		}
 
 		/* Delete old \ new, comparing by va_valueid within this toast rel. */
@@ -254,35 +272,37 @@ heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
 }
 
 /*
- * heap_check_no_split_jsonb_for_rewrite
+ * heap_check_no_split_values_for_rewrite
  *
  * See header comment.  Implementation: a plain MVCC table scan of live rows.
- * On the first row whose jsonb attribute carries JB_FHAS_TOASTED, raise.  The
+ * On the first row whose attribute (of a type with a registered lifecycle
+ * routine; currently jsonb) reports embedded split refs, raise.  The
  * caller (cluster_rel, before rebuild_relation) already holds
  * AccessExclusiveLock, so no new split row can slip in between this check and
  * the rewrite.
  */
 void
-heap_check_no_split_jsonb_for_rewrite(Relation rel)
+heap_check_no_split_values_for_rewrite(Relation rel)
 {
 	TupleDesc	tupleDesc = RelationGetDescr(rel);
-	bool		has_jsonb = false;
+	bool		has_split_type = false;
 	TableScanDesc scan;
 	TupleTableSlot *slot;
 	Snapshot	snapshot;
 
-	/* Fast out: nothing to do unless the relation actually has a jsonb column. */
+	/* Fast out: nothing to do unless the relation has a lifecycle-managed column. */
 	for (int i = 0; i < tupleDesc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 
-		if (att->attlen == -1 && att->atttypid == JSONBOID)
+		if (att->attlen == -1 &&
+			lookup_type_lifecycle_routine(att->atttypid) != NULL)
 		{
-			has_jsonb = true;
+			has_split_type = true;
 			break;
 		}
 	}
-	if (!has_jsonb)
+	if (!has_split_type)
 		return;
 
 	snapshot = GetActiveSnapshot();
@@ -296,8 +316,12 @@ heap_check_no_split_jsonb_for_rewrite(Relation rel)
 			Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
 			Datum		val;
 			bool		isnull;
+			const TypeLifecycleRoutine *routine;
 
-			if (att->attlen != -1 || att->atttypid != JSONBOID)
+			if (att->attlen != -1)
+				continue;
+			routine = lookup_type_lifecycle_routine(att->atttypid);
+			if (routine == NULL || routine->has_external_refs == NULL)
 				continue;
 
 			val = slot_getattr(slot, i + 1, &isnull);
@@ -305,17 +329,17 @@ heap_check_no_split_jsonb_for_rewrite(Relation rel)
 				continue;
 			if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
 				continue;
-			if (jsonb_datum_has_toasted(val))
+			if (routine->has_external_refs(val))
 			{
 				/* Clean up scan state before erroring. */
 				table_endscan(scan);
 				ExecDropSingleTupleTableSlot(slot);
 				ereport(ERROR,
 						errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("cannot rewrite table \"%s\" containing split jsonb values",
+						errmsg("cannot rewrite table \"%s\" containing split values that block rewrite",
 							   RelationGetRelationName(rel)),
-						errdetail("Heap rewrite (VACUUM FULL / CLUSTER / REPACK) would renumber TOAST chunks without updating the nested descriptors embedded in inline split jsonb parents, orphaning the cold payload."),
-						errhint("Rewrite is not supported while the table holds split jsonb rows. Re-store the affected rows so their large top-level values are no longer relocated out of line (set the column STORAGE to PLAIN or MAIN, or reduce the oversized values below the relocation threshold), then retry."));
+						errdetail("Heap rewrite (VACUUM FULL / CLUSTER / REPACK) would renumber TOAST chunks without updating the nested descriptors embedded in inline split parents, orphaning the cold payload."),
+						errhint("Rewrite is not supported while the table holds split rows. Re-store the affected rows so their large top-level values are no longer relocated out of line (set the column STORAGE to PLAIN or MAIN, or reduce the oversized values below the relocation threshold), then retry."));
 			}
 		}
 	}
@@ -499,14 +523,15 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	maxDataLen = RelationGetToastTupleTarget(rel, TOAST_TUPLE_TARGET) - hoff;
 
 	/* ----------
-	 * W2.2 jsonb cold-payload pre-pass (create only).
+	 * W2.2 cold-payload pre-pass (create only) for lifecycle-managed types
+	 * (currently jsonb).
 	 *
-	 * Before the ordinary compress/externalize loop, give each large jsonb
-	 * attribute a chance to move its large top-level scalar payload values out
-	 * of line as ordinary TOAST values, leaving a small parent (warm values +
-	 * JENTRY_ISTOASTED descriptors).  This runs here -- after toast_tuple_init
-	 * (which zeroes ttc_flags and records tai_size / colflags) but before any
-	 * compression or externalization -- so the split sees the raw jsonb
+	 * Before the ordinary compress/externalize loop, give each large
+	 * lifecycle-managed attribute a chance (via toast_or_split) to move its
+	 * large payload out of line as ordinary TOAST values, leaving a small parent
+	 * (warm values + type-owned descriptors).  This runs here -- after
+	 * toast_tuple_init (which zeroes ttc_flags and records tai_size / colflags)
+	 * but before any compression or externalization -- so the split sees the raw
 	 * structure and so the loop below sees the already-small parent and need
 	 * not externalize it as a whole.
 	 *
@@ -529,11 +554,17 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 			Datum		newval;
 			Datum		oldval = (Datum) 0;
 			bool		old_isnull = true;
+			const TypeLifecycleRoutine *routine;
+			TypeLifecycleContext lctx;
 
 			if ((toast_attr[i].tai_colflags & TOASTCOL_IGNORE) != 0)
 				continue;		/* NULL / PLAIN / non-varlena / reused */
-			if (att->attlen != -1 || att->atttypid != JSONBOID)
+			if (att->attlen != -1)
 				continue;
+			routine = lookup_type_lifecycle_routine(att->atttypid);
+			if (routine == NULL || routine->toast_or_split == NULL)
+				continue;
+
 			if (toast_attr[i].tai_size <= maxDataLen)
 				continue;		/* would not be toasted; nothing to gain */
 
@@ -545,10 +576,15 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 				old_isnull = toast_oldisnull[i];
 			}
 
-			newval = jsonb_toast_split_datum(rel, toast_values[i],
-											 oldval, old_isnull,
-											 JSONB_TOAST_SPLIT_VALUE_MIN,
-											 options, &did_split);
+			lctx.rel = rel;
+			lctx.attnum = i + 1;
+			lctx.options = options;
+			lctx.max_inline_size = maxDataLen;
+			newval = routine->toast_or_split(toast_values[i],
+											 old_isnull ? (Datum) 0 : oldval,
+											 &lctx);
+			/* did_split: routine returned a different (rewritten) value */
+			did_split = (DatumGetPointer(newval) != DatumGetPointer(toast_values[i]));
 			if (did_split)
 			{
 				toast_values[i] = newval;

@@ -654,12 +654,12 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 
 	/*
 	 * W2.3b safe refusal: heap rewrite renumbers TOAST chunks without firing a
-	 * toast callback for inline split-jsonb parents, which would dangle their
-	 * nested descriptors.  Refuse on live split rows (OldHeap is already under
-	 * AccessExclusiveLock here).  Skip for toast relations themselves.
+	 * toast callback for inline split parents, which would dangle their nested
+	 * descriptors.  Refuse on live split rows (OldHeap is already under
+	 * AccessExclusiveLock here).  Skip toast relations themselves.
 	 */
 	if (OldHeap->rd_rel->relkind != RELKIND_TOASTVALUE)
-		heap_check_no_split_jsonb_for_rewrite(OldHeap);
+		heap_check_no_split_values_for_rewrite(OldHeap);
 
 	/* rebuild_relation does all the dirty work */
 	PG_TRY();

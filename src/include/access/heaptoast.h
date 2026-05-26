@@ -118,7 +118,7 @@ extern void heap_toast_delete(Relation rel, HeapTuple oldtup,
 extern bool HeapTupleHasNestedExternal(Relation rel, HeapTuple tup);
 
 /* ----------
- * heap_check_no_split_jsonb_for_rewrite -
+ * heap_check_no_split_values_for_rewrite -
  *
  *	W2.3b rewrite-path safe refusal.  Scans live rows of rel under the active
  *	snapshot; if any row carries a split-jsonb value (JB_FHAS_TOASTED), raises
@@ -129,7 +129,7 @@ extern bool HeapTupleHasNestedExternal(Relation rel, HeapTuple tup);
  *	hold AccessExclusiveLock on rel.
  * ----------
  */
-extern void heap_check_no_split_jsonb_for_rewrite(Relation rel);
+extern void heap_check_no_split_values_for_rewrite(Relation rel);
 
 /* ----------
  * toast_flatten_tuple -
