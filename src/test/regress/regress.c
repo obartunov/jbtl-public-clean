@@ -1810,3 +1810,29 @@ jsonb_cold_mat_count(PG_FUNCTION_ARGS)
 		jsonb_cold_materializations = 0;
 	PG_RETURN_INT64((int64) v);
 }
+
+/*
+ * jsonb_key_valueid(jsonb, text) -> int8
+ * W2.4 acceptance helper: returns the TOAST va_valueid of the cold (relocated)
+ * top-level value for the given key, or NULL if the key is absent or its value
+ * is not relocated.  Lets a test assert per-key valueid identity precisely
+ * (rather than only via aggregate DISTINCT chunk_id).  Developer scaffold.
+ */
+PG_FUNCTION_INFO_V1(jsonb_key_valueid);
+Datum
+jsonb_key_valueid(PG_FUNCTION_ARGS)
+{
+	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	text	   *key = PG_GETARG_TEXT_PP(1);
+	struct varatt_external ext;
+
+	if (!JB_ROOT_IS_OBJECT(jb))
+		PG_RETURN_NULL();
+
+	if (jsonb_find_old_toasted_ref(&jb->root,
+								   VARDATA_ANY(key), VARSIZE_ANY_EXHDR(key),
+								   &ext))
+		PG_RETURN_INT64((int64) ext.va_valueid);
+
+	PG_RETURN_NULL();
+}
