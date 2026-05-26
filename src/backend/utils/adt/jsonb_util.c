@@ -73,6 +73,17 @@ static int	int_pair_size_cmp(const void *a, const void *b);
  */
 bool		jsonb_sort_field_values = false;
 
+/*
+ * Internal (non-GUC) override used only by the W2.x split producer.  When the
+ * producer assembles its stock-layout parent it sets this for the duration of
+ * that single JsonbValueToJsonb() call, so convertJsonbObject() never emits a
+ * KVMap regardless of the session jsonb_sort_field_values setting.  This keeps
+ * W2.x independent of the legacy K1 writer policy by construction, not merely
+ * "while the GUC happens to be off".  It is always restored (PG_TRY) and is
+ * never exposed to users.
+ */
+static bool jsonb_force_stock_layout = false;
+
 /* W2.4 reuse instrumentation (developer scaffold; see jsonb_reuse_stats()). */
 uint64		jsonb_reuse_attempts = 0;
 uint64		jsonb_reuse_size_mismatch = 0;
@@ -2270,7 +2281,8 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 	int			nPairs = val->val.object.nPairs;
 	int			reserved_size;
 	int			kvmap_entry_size = 0;
-	bool		sorted_values = jsonb_sort_field_values && nPairs > 1;
+	bool		sorted_values = jsonb_sort_field_values &&
+		!jsonb_force_stock_layout && nPairs > 1;
 	bool		object_has_toasted = false;
 	struct
 	{
@@ -3091,7 +3103,27 @@ jsonb_toast_split_datum(Relation rel, Datum value, Datum oldvalue,
 		return value;			/* nothing moved; keep original datum */
 
 	*did_split = true;
-	return PointerGetDatum(JsonbValueToJsonb(pstate.result));
+	/*
+	 * Assemble the parent with KVMap creation forced off for this build only,
+	 * so the W2.x parent is stock layout even if jsonb_sort_field_values=on
+	 * globally.  Restore the flag unconditionally.
+	 */
+	{
+		Jsonb	   *parent;
+
+		jsonb_force_stock_layout = true;
+		PG_TRY();
+		{
+			parent = JsonbValueToJsonb(pstate.result);
+		}
+		PG_FINALLY();
+		{
+			jsonb_force_stock_layout = false;
+		}
+		PG_END_TRY();
+
+		return PointerGetDatum(parent);
+	}
 }
 
 /*
