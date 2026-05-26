@@ -58,6 +58,7 @@
 #include "storage/sync.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
+#include "access/typelifecycle.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -1212,6 +1213,14 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * least the minimum set of "nailed-in" cache entries.
 	 */
 	RelationCacheInitializePhase3();
+
+	/*
+	 * Register in-core type lifecycle routines (type-owned external refs).
+	 * Done here, after the relcache is ready and before any DML can reach a
+	 * lifecycle path.  One aggregate entry point keeps postinit type-agnostic;
+	 * the in-core type list lives in typelifecycle_builtins.c.
+	 */
+	RegisterAllInCoreTypeLifecycleRoutines();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();

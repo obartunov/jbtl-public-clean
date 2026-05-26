@@ -29,6 +29,8 @@ OBJS = \
 	toast_compression.o \
 	toast_internals.o \
 	toasterapi.o \
+	typelifecycle.o \
+	typelifecycle_builtins.o \
 	tupconvert.o \
 	tupdesc.o
 

@@ -54,6 +54,7 @@ OBJS = \
 	jsonb_gin.o \
 	jsonb_op.o \
 	jsonb_util.o \
+	jsonbtoast.o \
 	jsonfuncs.o \
 	jsonbsubs.o \
 	jsonpath.o \

@@ -17,6 +17,8 @@ backend_sources += files(
   'toast_compression.c',
   'toast_internals.c',
   'toasterapi.c',
+  'typelifecycle.c',
+  'typelifecycle_builtins.c',
   'tupconvert.c',
   'tupdesc.c',
 )
