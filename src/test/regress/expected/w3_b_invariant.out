@@ -1,0 +1,157 @@
+-- suppress DROP IF EXISTS notices so output is order-independent
+SET client_min_messages = warning;
+--
+-- W3 B-invariant negative producer test.
+--
+-- W3 v1 is hot/cold split only.  The parent contains hot metadata, small
+-- residual values, and cold descriptors.  There is no separate warm physical
+-- layer in W3 v1 (warm is reserved for a future KVMap-based compact companion
+-- layer).
+--
+-- B invariant: if the parent after split (residual parent: inline metadata +
+-- small values + cold descriptors) would exceed the parent budget, the
+-- producer must fall back to ordinary whole-toast / no-split.  An external
+-- split-parent (the residual parent itself externalized while still carrying
+-- nested cold descriptors) must NOT be a producer output.
+--
+-- Observable signature (portable, no C probe):
+--   * whole-toast / no-split : the value is one toast value (the document);
+--     there is no separately stored cold child value.
+--   * split with INLINE parent (intended) : parent stays inline; exactly one
+--     external cold child value exists.
+--   * split with EXTERNAL parent (the forbidden output) : parent is itself
+--     external (pg_column_size > ~2KB) AND a separate cold child value also
+--     exists -> two toast values, one of them the oversized parent.
+--
+-- This test asserts the forbidden output is never produced.  Until B is
+-- implemented it is EXPECTED TO FAIL on the bad shape (red); B turns it green.
+--
+-- returns true iff tbl row 1 is a forbidden external split-parent:
+--   parent attribute is itself externally stored AND >1 toast value exists
+--   (the extra value being the relocated cold child).
+CREATE FUNCTION w3_is_external_split_parent(tbl regclass) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    trn text;
+    nvals bigint;
+    psize int;
+BEGIN
+    SELECT 'pg_toast.' || t.relname INTO trn
+    FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+    WHERE c.oid = tbl;
+    IF trn IS NULL THEN
+        RETURN false;  -- no toast at all: not a split parent
+    END IF;
+    EXECUTE format('SELECT count(DISTINCT chunk_id) FROM %s', trn) INTO nvals;
+    EXECUTE format('SELECT pg_column_size(doc) FROM %s WHERE id=1', tbl) INTO psize;
+    -- forbidden output: the parent itself is large (externalized) AND there is
+    -- more than one toast value (parent + relocated child).
+    RETURN (psize > 2000 AND nvals > 1);
+END$$;
+CREATE FUNCTION w3_mkb(kind text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    DROP TABLE IF EXISTS m;
+    CREATE TABLE m(id int primary key, doc jsonb);
+    IF kind = 'intended' THEN
+        INSERT INTO m VALUES (1, jsonb_build_object('status','run','cold',repeat('Z',5000)));
+    ELSIF kind = 'oversized_parent' THEN
+        -- residual parent (inline metadata + small values) alone exceeds the parent budget
+        INSERT INTO m SELECT 1,
+          (SELECT jsonb_object_agg('k'||g, g) FROM generate_series(1,800) g)
+          || jsonb_build_object('cold', repeat('Z',5000));
+    ELSIF kind = 'oversized_no_cold' THEN
+        -- oversized residual parent, no qualifying cold child: must whole-toast
+        INSERT INTO m SELECT 1,
+          (SELECT jsonb_object_agg('k'||g, repeat('w', 20)) FROM generate_series(1,400) g);
+    END IF;
+END$$;
+-- intended split: parent inline, NOT a forbidden external split-parent
+SELECT w3_mkb('intended');
+ w3_mkb 
+--------
+ 
+(1 row)
+
+SELECT 'intended: external_split_parent' AS check, w3_is_external_split_parent('m') AS got, false AS want;
+              check              | got | want 
+---------------------------------+-----+------
+ intended: external_split_parent | f   | f
+(1 row)
+
+-- and cold must still be readable (split actually happened, intended preserved)
+SELECT 'intended: cold_len' AS check, length(doc->>'cold') AS got, 5000 AS want FROM m WHERE id=1;
+       check        | got  | want 
+--------------------+------+------
+ intended: cold_len | 5000 | 5000
+(1 row)
+
+-- oversized residual parent + cold child: B must NOT produce an external split-parent
+SELECT w3_mkb('oversized_parent');
+ w3_mkb 
+--------
+ 
+(1 row)
+
+SELECT 'oversized_parent: external_split_parent' AS check, w3_is_external_split_parent('m') AS got, false AS want;
+                  check                  | got | want 
+-----------------------------------------+-----+------
+ oversized_parent: external_split_parent | f   | f
+(1 row)
+
+-- whichever fallback B picks, cold must remain readable
+SELECT 'oversized_parent: cold_len' AS check, length(doc->>'cold') AS got, 5000 AS want FROM m WHERE id=1;
+           check            | got  | want 
+----------------------------+------+------
+ oversized_parent: cold_len | 5000 | 5000
+(1 row)
+
+-- oversized residual parent, no cold child: ordinary whole-toast, no split
+SELECT w3_mkb('oversized_no_cold');
+ w3_mkb 
+--------
+ 
+(1 row)
+
+SELECT 'oversized_no_cold: external_split_parent' AS check, w3_is_external_split_parent('m') AS got, false AS want;
+                  check                   | got | want 
+------------------------------------------+-----+------
+ oversized_no_cold: external_split_parent | f   | f
+(1 row)
+
+-- anti-orphan: building the oversized_parent shape must not leave orphan cold values.
+-- After B falls back, deleting the row + vacuum must reclaim everything.
+CREATE FUNCTION w3_surviving(tbl regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE trn text; n bigint;
+BEGIN
+    SELECT 'pg_toast.' || t.relname INTO trn
+    FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+    WHERE c.oid = tbl;
+    IF trn IS NULL THEN RETURN 0; END IF;
+    EXECUTE format('SELECT count(*) FROM %s', trn) INTO n;
+    RETURN n;
+END$$;
+SELECT w3_mkb('oversized_parent');
+ w3_mkb 
+--------
+ 
+(1 row)
+
+SELECT 'pg_toast.' || t.relname AS trn
+FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+WHERE c.oid = 'm'::regclass \gset
+DELETE FROM m WHERE id=1;
+VACUUM m;
+VACUUM :trn;
+SELECT 'oversized_parent anti-orphan: surviving_chunks' AS check,
+       w3_surviving('m') AS got, 0 AS want;
+                     check                      | got | want 
+------------------------------------------------+-----+------
+ oversized_parent anti-orphan: surviving_chunks |   0 |    0
+(1 row)
+
+DROP FUNCTION w3_surviving(regclass);
+-- cleanup
+DROP TABLE IF EXISTS m;
+DROP FUNCTION w3_is_external_split_parent(regclass);
+DROP FUNCTION w3_mkb(text);

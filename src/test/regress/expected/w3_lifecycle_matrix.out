@@ -1,0 +1,278 @@
+-- suppress DROP IF EXISTS notices so output is order-independent
+SET client_min_messages = warning;
+--
+-- W3 lifecycle safety-envelope regression matrix.
+--
+-- Committed evidence for the shape x operation correctness matrix.
+-- Self-contained: orphan detection scans the toast relation directly and
+-- counts surviving distinct toast valueids, so no C probe is needed and the
+-- test is portable.
+--
+-- Invariant under test: physical varlena shape is NOT semantic split state.
+-- An inline split parent whose warm metadata grows can be wholly externalized
+-- by the ordinary toast loop while still carrying nested JENTRY_ISTOASTED
+-- descriptors.  Lifecycle paths must handle that safely (A-fix); concurrent
+-- REPACK must refuse split values (its rewrite mechanism does not relocate
+-- cold split values); non-concurrent rewrite must carry split values.
+--
+-- count of surviving distinct toast valueids for tbl's toast relation
+CREATE FUNCTION w3_live_chunks(tbl regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE trn text; n bigint;
+BEGIN
+  SELECT 'pg_toast.' || t.relname INTO trn
+  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+  WHERE c.oid = tbl;
+  IF trn IS NULL THEN RETURN 0; END IF;
+  EXECUTE format('SELECT count(DISTINCT chunk_id) FROM %s', trn) INTO n;
+  RETURN n;
+END$$;
+-- read cold field length, capturing any error as text so the script never aborts
+CREATE FUNCTION w3_cold(tbl regclass) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE r int;
+BEGIN
+  EXECUTE format('SELECT length(doc->>''cold'') FROM %s WHERE id=1', tbl) INTO r;
+  RETURN coalesce(r::text, 'NULL');
+EXCEPTION WHEN OTHERS THEN RETURN 'ERR';
+END$$;
+-- shape builder
+CREATE FUNCTION w3_mk(kind text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  DROP TABLE IF EXISTS m;
+  CREATE TABLE m(id int primary key, doc jsonb);
+  IF kind = 'ordinary' THEN
+    INSERT INTO m VALUES (1, jsonb_build_object('status','run','n',1));
+  ELSIF kind = 'intended' THEN
+    INSERT INTO m VALUES (1, jsonb_build_object('status','run','cold',repeat('Z',5000)));
+  ELSIF kind = 'bad' THEN
+    INSERT INTO m SELECT 1,
+      (SELECT jsonb_object_agg('k'||g, g) FROM generate_series(1,800) g)
+      || jsonb_build_object('cold', repeat('Z',5000));
+  END IF;
+END$$;
+-- ========================= ORDINARY (non-split) =========================
+SELECT w3_mk('ordinary');
+ w3_mk 
+-------
+ 
+(1 row)
+
+DELETE FROM m WHERE id=1; VACUUM m;
+SELECT 'ordinary/delete' AS cell, w3_live_chunks('m') AS orphan;
+      cell       | orphan 
+-----------------+--------
+ ordinary/delete |      0
+(1 row)
+
+SELECT w3_mk('ordinary');
+ w3_mk 
+-------
+ 
+(1 row)
+
+UPDATE m SET doc=jsonb_set(doc,'{status}','"done"') WHERE id=1; VACUUM m;
+SELECT 'ordinary/update' AS cell, doc->>'status' AS status FROM m WHERE id=1;
+      cell       | status 
+-----------------+--------
+ ordinary/update | done
+(1 row)
+
+-- ===================== INTENDED inline split-parent =====================
+SELECT w3_mk('intended');
+ w3_mk 
+-------
+ 
+(1 row)
+
+DELETE FROM m WHERE id=1; VACUUM m;
+SELECT 'intended/delete' AS cell, w3_live_chunks('m') AS orphan;
+      cell       | orphan 
+-----------------+--------
+ intended/delete |      0
+(1 row)
+
+SELECT w3_mk('intended');
+ w3_mk 
+-------
+ 
+(1 row)
+
+UPDATE m SET doc=jsonb_set(doc,'{status}','"done"') WHERE id=1; VACUUM m;
+SELECT 'intended/update-reuse' AS cell, w3_cold('m') AS cold;
+         cell          | cold 
+-----------------------+------
+ intended/update-reuse | 5000
+(1 row)
+
+SELECT w3_mk('intended');
+ w3_mk 
+-------
+ 
+(1 row)
+
+UPDATE m SET doc=jsonb_set(doc,'{cold}',to_jsonb(repeat('Y',6000))) WHERE id=1; VACUUM m;
+SELECT 'intended/update-cold-change' AS cell, w3_cold('m') AS cold;
+            cell             | cold 
+-----------------------------+------
+ intended/update-cold-change | 6000
+(1 row)
+
+SELECT w3_mk('intended'); VACUUM FULL m;
+ w3_mk 
+-------
+ 
+(1 row)
+
+SELECT 'intended/vacuum-full' AS cell, w3_cold('m') AS cold;
+         cell         | cold 
+----------------------+------
+ intended/vacuum-full | 5000
+(1 row)
+
+SELECT w3_mk('intended'); REPACK m;
+ w3_mk 
+-------
+ 
+(1 row)
+
+SELECT 'intended/repack-nonconcurrent' AS cell, w3_cold('m') AS cold;
+             cell              | cold 
+-------------------------------+------
+ intended/repack-nonconcurrent | 5000
+(1 row)
+
+-- ====================== BAD external split-parent =======================
+-- (defensive: A-fix must keep these safe; B will stop producing them)
+SELECT w3_mk('bad');
+ w3_mk 
+-------
+ 
+(1 row)
+
+DELETE FROM m WHERE id=1; VACUUM m;
+SELECT 'bad/delete' AS cell, w3_live_chunks('m') AS orphan;
+    cell    | orphan 
+------------+--------
+ bad/delete |      0
+(1 row)
+
+SELECT w3_mk('bad');
+ w3_mk 
+-------
+ 
+(1 row)
+
+UPDATE m SET doc=jsonb_set(doc,'{k1}','999') WHERE id=1; VACUUM m;
+SELECT 'bad/update-reuse' AS cell, w3_cold('m') AS cold;
+       cell       | cold 
+------------------+------
+ bad/update-reuse | 5000
+(1 row)
+
+SELECT w3_mk('bad');
+ w3_mk 
+-------
+ 
+(1 row)
+
+UPDATE m SET doc=jsonb_set(doc,'{cold}',to_jsonb(repeat('Y',6000))) WHERE id=1; VACUUM m;
+SELECT 'bad/update-cold-change' AS cell, w3_cold('m') AS cold;
+          cell          | cold 
+------------------------+------
+ bad/update-cold-change | 6000
+(1 row)
+
+SELECT w3_mk('bad'); VACUUM FULL m;
+ w3_mk 
+-------
+ 
+(1 row)
+
+SELECT 'bad/vacuum-full' AS cell, w3_cold('m') AS cold;
+      cell       | cold 
+-----------------+------
+ bad/vacuum-full | 5000
+(1 row)
+
+SELECT w3_mk('bad'); REPACK m;
+ w3_mk 
+-------
+ 
+(1 row)
+
+SELECT 'bad/repack-nonconcurrent' AS cell, w3_cold('m') AS cold;
+           cell           | cold 
+--------------------------+------
+ bad/repack-nonconcurrent | 5000
+(1 row)
+
+-- ============= BOUNDARY: inline -> external on UPDATE ==================
+-- (the premature-free trigger: warm grows past the inline budget while the
+--  cold child is reused)
+SELECT w3_mk('intended');
+ w3_mk 
+-------
+ 
+(1 row)
+
+UPDATE m SET doc =
+  (SELECT jsonb_object_agg('k'||g, g) FROM generate_series(1,800) g)
+  || jsonb_build_object('status','done','cold', repeat('Z',5000))
+  WHERE id=1;
+VACUUM m;
+SELECT 'boundary/inline-to-external' AS cell, w3_cold('m') AS cold;
+            cell             | cold 
+-----------------------------+------
+ boundary/inline-to-external | 5000
+(1 row)
+
+-- ============= concurrent REPACK relocates split cold values ===========
+-- The concurrent insert path now runs the same toast/relocation logic as
+-- non-concurrent rewrite (heap_insert_for_repack -> heap_toast_insert_or_update
+-- on nested-external tuples), so concurrent REPACK preserves split jsonb:
+-- cold values are recreated in the new toast relation and stay readable.
+SELECT w3_mk('intended');
+ w3_mk 
+-------
+ 
+(1 row)
+
+REPACK (concurrently) m;
+SELECT 'intended/repack-concurrent' AS cell, w3_cold('m') AS cold;
+            cell            | cold 
+----------------------------+------
+ intended/repack-concurrent | 5000
+(1 row)
+
+SELECT w3_mk('bad');
+ w3_mk 
+-------
+ 
+(1 row)
+
+REPACK (concurrently) m;
+SELECT 'bad/repack-concurrent' AS cell, w3_cold('m') AS cold;
+         cell          | cold 
+-----------------------+------
+ bad/repack-concurrent | 5000
+(1 row)
+
+SELECT w3_mk('ordinary');
+ w3_mk 
+-------
+ 
+(1 row)
+
+REPACK (concurrently) m;
+SELECT 'ordinary/repack-concurrent' AS cell, w3_cold('m') AS cold;
+            cell            | cold 
+----------------------------+------
+ ordinary/repack-concurrent | NULL
+(1 row)
+
+-- cleanup
+DROP TABLE IF EXISTS m;
+DROP FUNCTION w3_live_chunks(regclass);
+DROP FUNCTION w3_cold(regclass);
+DROP FUNCTION w3_mk(text);
