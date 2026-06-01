@@ -118,20 +118,6 @@ extern void heap_toast_delete(Relation rel, HeapTuple oldtup,
 extern bool HeapTupleHasNestedExternal(Relation rel, HeapTuple tup);
 
 /* ----------
- * heap_check_no_split_values_for_rewrite -
- *
- *	W2.3b rewrite-path safe refusal.  Scans live rows of rel under the active
- *	snapshot; if any row carries a split-jsonb value (JB_FHAS_TOASTED), raises
- *	ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE.  Heap rewrite (VACUUM FULL /
- *	CLUSTER / REPACK) renumbers toast chunk_ids without firing a toast callback
- *	for the inline split parent, which would dangle its nested descriptors; we
- *	refuse rather than create unreachable toast values.  Caller must already
- *	hold AccessExclusiveLock on rel.
- * ----------
- */
-extern void heap_check_no_split_values_for_rewrite(Relation rel);
-
-/* ----------
  * toast_flatten_tuple -
  *
  *	"Flatten" a tuple to contain no out-of-line toasted fields.
