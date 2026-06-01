@@ -618,7 +618,8 @@ struct RelationData;			/* avoid pulling utils/rel.h into this header */
  */
 extern Datum jsonb_toast_split_datum(struct RelationData *rel, Datum value,
 									 Datum oldvalue, bool old_isnull,
-									 Size value_min, uint32 options,
+									 Size value_min, Size parent_budget,
+									 uint32 options,
 									 bool *did_split);
 
 /*

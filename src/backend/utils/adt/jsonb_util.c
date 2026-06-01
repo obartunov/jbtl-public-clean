@@ -2981,7 +2981,7 @@ jsonb_kvmap_debug(PG_FUNCTION_ARGS)
  */
 Datum
 jsonb_toast_split_datum(Relation rel, Datum value, Datum oldvalue,
-						bool old_isnull, Size value_min,
+						bool old_isnull, Size value_min, Size parent_budget,
 						uint32 options, bool *did_split)
 {
 	Jsonb	   *jb;
@@ -3020,6 +3020,65 @@ jsonb_toast_split_datum(Relation rel, Datum value, Datum oldvalue,
 		if (JB_ROOT_IS_OBJECT(oldjb) && JB_ROOT_HAS_TOASTED(oldjb))
 			oldroot = &oldjb->root;
 	}
+
+	/*
+	 * B invariant (residual-parent bound): estimate the size of the parent
+	 * AFTER split BEFORE saving any child, so we never produce an external
+	 * split-parent and never orphan a just-saved child by rolling back.
+	 *
+	 * residual parent = root header + per-entry JEntry + inline bytes of every
+	 * value we will NOT move out + a fixed descriptor for every value we WILL
+	 * move out.  A child is moved iff it is a large top-level string/numeric
+	 * (same test as the save loop below).  If the residual parent would not fit
+	 * the parent budget it would itself be externalized by the ordinary toast
+	 * loop, becoming an external split-parent -- forbidden.  Fall back to plain
+	 * whole-toast (return the input unchanged, *did_split stays false).
+	 *
+	 * parent_budget == 0 means "no bound" (caller opted out); skip the check.
+	 */
+	if (parent_budget > 0 && JsonContainerIsObject(&jb->root))
+	{
+		const JsonbContainer *jc = &jb->root;
+		int			count = JsonContainerSize(jc);
+		Size		residual = offsetof(JsonbContainer, children);
+		bool		any_split = false;
+		int			i;
+
+		/*
+		 * Direct JEntry walk -- read lengths/types straight from the entry
+		 * array instead of JsonbIteratorNext, which would materialize every
+		 * key and value (string copies, numeric VARSIZE) on a path that runs
+		 * for every split INSERT/UPDATE.  Stock object layout: keys occupy
+		 * slots [0..count-1], values [count..2*count-1].  Every entry costs one
+		 * JEntry; a moved value costs a fixed descriptor instead of its bytes.
+		 */
+		residual += (Size) (2 * count) * sizeof(JEntry);
+		for (i = 0; i < count; i++)
+			residual += getJsonbLength(jc, i);		/* keys stay inline */
+		for (i = count; i < 2 * count; i++)
+		{
+			JEntry		je = jc->children[i];
+			Size		vlen = getJsonbLength(jc, i);
+			bool		movethis = (JBE_ISSTRING(je) || JBE_ISNUMERIC(je)) &&
+				vlen >= value_min;
+
+			if (movethis)
+			{
+				residual += JSONB_TOASTED_DATUM_SIZE;
+				any_split = true;
+			}
+			else
+				residual += vlen;				/* value stays inline */
+		}
+
+		/*
+		 * Only bound when we would actually split something; if nothing moves
+		 * out the value goes through plain whole-toast anyway.
+		 */
+		if (any_split && residual > parent_budget)
+			return value;		/* B: residual parent too large -> whole-toast */
+	}
+
 
 	/*
 	 * skipNested = true: each top-level value arrives as a single JsonbValue

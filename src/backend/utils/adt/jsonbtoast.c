@@ -64,6 +64,9 @@ jsonb_lifecycle_toast_or_split(Datum value, Datum old_value,
 	return jsonb_toast_split_datum(ctx->rel, value, old_value,
 								   /* old_isnull */ old_value == (Datum) 0,
 								   JSONB_TOAST_SPLIT_VALUE_MIN,
+								   /* parent_budget (B): residual parent must
+									* stay inline; 0 would disable the bound */
+								   ctx->max_inline_size,
 								   ctx->options, &did_split);
 }
 
