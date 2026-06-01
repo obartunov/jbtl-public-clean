@@ -101,9 +101,12 @@ heap_toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative)
 		routine = lookup_type_lifecycle_routine(att->atttypid);
 		if (routine == NULL || routine->collect_external_refs == NULL)
 			continue;
-		/* generic guard: an external parent is not an inline split parent */
-		if (VARATT_IS_EXTERNAL(DatumGetPointer(toast_values[i])))
-			continue;
+		/*
+		 * A-fix: physical varlena shape is not semantic split state.  An
+		 * externalized split parent still carries nested descriptors;
+		 * has_external_refs normalizes via DatumGetJsonbP.  Do not skip on
+		 * VARATT_IS_EXTERNAL.
+		 */
 		if (routine->has_external_refs == NULL ||
 			!routine->has_external_refs(toast_values[i]))
 			continue;
@@ -150,8 +153,11 @@ HeapTupleHasNestedExternal(Relation rel, HeapTuple tup)
 		val = heap_getattr(tup, i + 1, tupleDesc, &isnull);
 		if (isnull)
 			continue;
-		if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
-			continue;			/* external parent is not a split parent */
+		/*
+		 * A-fix: an externalized split parent still carries nested
+		 * descriptors; skipping it on VARATT_IS_EXTERNAL orphaned cold
+		 * payload on delete.  has_external_refs normalizes external.
+		 */
 		if (routine->has_external_refs(val))
 			return true;
 	}
@@ -213,8 +219,12 @@ heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
 			continue;
 
 		oldval = ttc->ttc_oldvalues[i];
-		if (VARATT_IS_EXTERNAL(DatumGetPointer(oldval)))
-			continue;			/* external parent is not a split parent */
+		/*
+		 * A-fix: do not skip external old parent.  An externalized split
+		 * parent still carries nested descriptors; skipping drops its old
+		 * children from old\new, leaking those the new version no longer
+		 * references.  has_external_refs normalizes external.
+		 */
 		if (!routine->has_external_refs(oldval))
 			continue;			/* old side carries no nested cold payload */
 
@@ -230,8 +240,14 @@ heap_toast_update_nested_cleanup(ToastTupleContext *ttc)
 		if (!ttc->ttc_isnull[i])
 		{
 			newval = ttc->ttc_values[i];
-			if (!VARATT_IS_EXTERNAL(DatumGetPointer(newval)) &&
-				routine->has_external_refs(newval))
+			/*
+			 * A-fix (premature-free site): a new split parent externalized
+			 * by the ordinary toast loop must still have its nested refs
+			 * collected, else a child reused into it falls into old\new and
+			 * is deleted under the live row.  has_external_refs normalizes
+			 * external; do not gate on !VARATT_IS_EXTERNAL.
+			 */
+			if (routine->has_external_refs(newval))
 				new_refs = routine->collect_external_refs(newval);
 		}
 
@@ -327,8 +343,11 @@ heap_check_no_split_values_for_rewrite(Relation rel)
 			val = slot_getattr(slot, i + 1, &isnull);
 			if (isnull)
 				continue;
-			if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
-				continue;
+			/*
+			 * A-fix: an externalized split parent must still block rewrite;
+			 * skipping it on VARATT_IS_EXTERNAL would let rewrite renumber
+			 * TOAST chunks and dangle the nested descriptors.
+			 */
 			if (routine->has_external_refs(val))
 			{
 				/* Clean up scan state before erroring. */
