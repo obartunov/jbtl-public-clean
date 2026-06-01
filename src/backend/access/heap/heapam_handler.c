@@ -2384,12 +2384,40 @@ heap_insert_for_repack(HeapTuple tuple, Relation OldHeap, Relation NewHeap,
 					   Datum *values, bool *isnull, BulkInsertState bistate)
 {
 	HeapTuple	newtuple;
+	HeapTuple	heaptup;
 
 	newtuple = reform_tuple(tuple, OldHeap, NewHeap, values, isnull);
 
-	heap_insert(NewHeap, newtuple, GetCurrentCommandId(true),
+	/*
+	 * Concurrent REPACK inserts via heap_insert(), which only routes a tuple
+	 * through heap_toast_insert_or_update() when the tuple itself is large or
+	 * carries top-level external attributes.  A small inline split parent is
+	 * neither, so its nested cold descriptors would keep pointing at the OLD
+	 * toast relation and dangle after the by-links swap.
+	 *
+	 * Non-concurrent rewrite (rewriteheap.c) handles this by also testing
+	 * HeapTupleHasNestedExternal() before invoking the toaster.  Mirror that
+	 * here so the concurrent path runs the SAME relocation/copy ownership
+	 * logic: heap_toast_insert_or_update() dispatches both the W3 inline-split
+	 * relocation (copy_or_relocate) and the CUSTOM/toaster copy (tsr_copy),
+	 * relocating cold values into NewHeap's toast relation and renumbering the
+	 * descriptors.  rd_toastoid is Invalid here (by-links), so cold values are
+	 * recreated with fresh valueids in the new toast relation.
+	 */
+	if (HeapTupleHasExternal(newtuple) ||
+		newtuple->t_len > TOAST_TUPLE_THRESHOLD ||
+		HeapTupleHasNestedExternal(NewHeap, newtuple))
+		heaptup = heap_toast_insert_or_update(NewHeap, newtuple, NULL,
+											  HEAP_INSERT_NO_LOGICAL |
+											  HEAP_INSERT_SKIP_FSM);
+	else
+		heaptup = newtuple;
+
+	heap_insert(NewHeap, heaptup, GetCurrentCommandId(true),
 				HEAP_INSERT_NO_LOGICAL, bistate);
 
+	if (heaptup != newtuple)
+		heap_freetuple(heaptup);
 	heap_freetuple(newtuple);
 }
 

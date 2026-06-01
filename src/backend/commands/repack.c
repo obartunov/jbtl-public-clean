@@ -176,6 +176,7 @@ static void apply_concurrent_update(Relation rel, TupleTableSlot *spilled_tuple,
 									TupleTableSlot *ondisk_tuple,
 									ChangeContext *chgcxt);
 static void apply_concurrent_delete(Relation rel, TupleTableSlot *slot);
+static void repack_relocate_slot_split_values(Relation rel, TupleTableSlot *slot);
 static void restore_tuple(BufFile *file, Relation relation,
 						  TupleTableSlot *slot);
 static void adjust_toast_pointers(Relation relation, TupleTableSlot *dest,
@@ -654,16 +655,21 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 
 	/*
 	 * Split values (type-owned external refs in an inline parent) need their
-	 * cold payload relocated into the new toast relation during rewrite.
-	 * Non-concurrent rewrite swaps the toast relation by content (rd_toastoid),
-	 * so copy_or_relocate (driven from heap_toast_insert_or_update) handles
-	 * them and no refusal is needed.  The concurrent / by-links path does not
-	 * set rd_toastoid and the proven relocate mechanism does not apply there,
-	 * so refuse explicitly rather than risk orphaning cold payload.  Skip toast
-	 * relations themselves.
+	 * cold payload relocated into the new toast relation during rewrite.  Both
+	 * paths now handle this through the same logic in
+	 * heap_toast_insert_or_update():
+	 *
+	 *   - non-concurrent rewrite swaps the toast relation by content
+	 *     (rd_toastoid) and relocates via rewriteheap.c, which tests
+	 *     HeapTupleHasNestedExternal();
+	 *
+	 *   - the concurrent / by-links path (heap_insert_for_repack) applies the
+	 *     same HeapTupleHasNestedExternal() test before insert, so split cold
+	 *     values are recreated in the new toast relation with fresh valueids.
+	 *
+	 * Neither path orphans cold payload, so the former concurrent-only refusal
+	 * guard is no longer required.
 	 */
-	if (concurrent && OldHeap->rd_rel->relkind != RELKIND_TOASTVALUE)
-		heap_check_no_split_values_for_rewrite(OldHeap);
 
 	/* rebuild_relation does all the dirty work */
 	PG_TRY();
@@ -2594,10 +2600,57 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
  * Apply an insert from the spill of concurrent changes to the new copy of the
  * table.
  */
+/*
+ * repack_relocate_slot_split_values
+ *
+ * Catch-up counterpart of the fix in heap_insert_for_repack.  A change
+ * decoded from WAL and replayed into NewHeap carries split jsonb whose nested
+ * cold descriptors still point at the OLD toast relation.  table_tuple_insert
+ * / table_tuple_update route through heap_insert / heap_update, which only
+ * invoke the toaster for tuples that are themselves large or carry top-level
+ * external attributes -- a small inline split parent is neither, so without
+ * this its cold payload would dangle after the by-links swap.
+ *
+ * Mirror the rewrite path: when the slot's tuple has nested external refs,
+ * run it through heap_toast_insert_or_update() on NewHeap so the same
+ * relocation/copy ownership logic (copy_or_relocate for W3, tsr_copy for
+ * CUSTOM/toaster) recreates the cold values in the new toast relation and
+ * renumbers the descriptors.  Store the relocated tuple back into the slot.
+ */
+static void
+repack_relocate_slot_split_values(Relation rel, TupleTableSlot *slot)
+{
+	HeapTuple	tuple;
+	bool		shouldFree;
+	HeapTuple	relocated;
+
+	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+
+	if (HeapTupleHasExternal(tuple) ||
+		tuple->t_len > TOAST_TUPLE_THRESHOLD ||
+		HeapTupleHasNestedExternal(rel, tuple))
+	{
+		relocated = heap_toast_insert_or_update(rel, tuple, NULL,
+												HEAP_INSERT_NO_LOGICAL |
+												HEAP_INSERT_SKIP_FSM);
+		if (relocated != tuple)
+		{
+			ExecForceStoreHeapTuple(relocated, slot, false);
+			heap_freetuple(relocated);
+		}
+	}
+
+	if (shouldFree)
+		heap_freetuple(tuple);
+}
+
 static void
 apply_concurrent_insert(Relation rel, TupleTableSlot *slot,
 						ChangeContext *chgcxt)
 {
+	/* Relocate split cold values into NewHeap's toast relation first. */
+	repack_relocate_slot_split_values(rel, slot);
+
 	/* Put the tuple in the table, but make sure it won't be decoded */
 	table_tuple_insert(rel, slot, GetCurrentCommandId(true),
 					   TABLE_INSERT_NO_LOGICAL, NULL);
@@ -2624,6 +2677,14 @@ apply_concurrent_update(Relation rel, TupleTableSlot *spilled_tuple,
 	TM_FailureData tmfd;
 	TU_UpdateIndexes update_indexes;
 	TM_Result	res;
+
+	/*
+	 * Relocate split cold values into NewHeap's toast relation.  The caller
+	 * has already run adjust_toast_pointers() to reuse unchanged top-level
+	 * external values; this handles inline split parents whose nested cold
+	 * descriptors still point at the old toast relation.
+	 */
+	repack_relocate_slot_split_values(rel, spilled_tuple);
 
 	/*
 	 * Carry out the update, skipping logical decoding for it.
